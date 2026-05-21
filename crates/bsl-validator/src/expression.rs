@@ -158,6 +158,10 @@ pub fn validate_expression(index: &PlatformIndex, source: &str) -> ExpressionVal
 /// - `level=2` — дополнительно локальный type inference в пределах процедуры
 ///   (Phase 8 MVP): переменные, выведенные из `Х = Новый ТипX`, `Х = ТипY.ЗначениеZ`
 ///   и аннотации `// @type ТипX`. У ложно-срабатываний больше — поэтому отдельный флаг.
+/// - `level=3` — дополнительно return-type tracking (Уровень 2.5): тип переменной
+///   выводится из возвращаемого типа метода/свойства, в т.ч. по цепочке
+///   `Х = Запрос.Выполнить().Выбрать()`. Находки — те же `unknown_type_member`
+///   (confidence Low). Интеграция с метаданными конфигурации — в server-слое.
 pub fn validate_expression_at_level(
     index: &PlatformIndex,
     source: &str,
@@ -166,7 +170,7 @@ pub fn validate_expression_at_level(
     let cleaned = mask_strings_and_comments(source);
     let scope_map = if level >= 2 {
         let annotations = extract_type_annotations(source);
-        Some(extract_scope_map(index, &cleaned, &annotations))
+        Some(extract_scope_map(index, &cleaned, &annotations, level))
     } else {
         None
     };
@@ -367,6 +371,16 @@ fn check_type_dot_members(
                     Vec::new(),
                 ));
             }
+        } else if is_dynamic_member_type(&ty.name_ru) {
+            // Типы с динамическими членами: поля задаются в runtime (колонки
+            // выборки запроса / таблицы значений / дерева, произвольные ключи
+            // структуры) и в hbk отсутствуют. Проверка членов для них даёт
+            // массовый false-positive (`Выборка.Регистратор`,
+            // `СтрокаТЗ.ОбъектОплаты`). Пропускаем целиком — размен: не ловим
+            // опечатку в статическом методе такого типа (`Выборка.Слндующий`),
+            // зато не плодим FP на полях. Выявлено регресс-прогоном level=3
+            // (карточка #1232 — урок про массовый FP).
+            continue;
         } else {
             let m_lower = member.to_lowercase();
             let exists_method = ty
@@ -402,6 +416,33 @@ fn check_type_dot_members(
             }
         }
     }
+}
+
+/// Типы платформы, члены которых задаются в runtime, а не описаны в hbk:
+/// колонки выборки запроса / таблицы значений / дерева значений, произвольные
+/// ключи структуры. Для них проверка `Объект.Член` бессмысленна (массовый FP:
+/// `Выборка.Регистратор`, `СтрокаТЗ.ОбъектОплаты`). На уровнях 1/2 такие типы
+/// как `head` почти не встречаются; проблема всплывает на level=3, где
+/// return-type tracking выводит их как тип переменной (`Выб = Рез.Выбрать()`).
+fn is_dynamic_member_type(name_ru: &str) -> bool {
+    matches!(
+        name_ru.to_lowercase().as_str(),
+        // Колонки выборок и строк коллекций задаются текстом запроса / составом ТЗ.
+        "выборкаизрезультатазапроса"
+            | "выборкаданных"
+            | "строкатаблицызначений"
+            | "строкадеревазначений"
+            // Произвольные ключи.
+            | "структура"
+            | "фиксированнаяструктура"
+            // Реквизиты и элементы конкретной формы — в метаданных формы, не в hbk.
+            | "форма"
+            | "управляемаяформа"
+            | "элементыформы"
+            // Свойства XDTO задаются схемой/пакетом в runtime.
+            | "объектxdto"
+            | "значениеxdto"
+    )
 }
 
 fn check_new_expressions(index: &PlatformIndex, src: &str, errors: &mut Vec<ExprError>) {

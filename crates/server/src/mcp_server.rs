@@ -53,7 +53,7 @@ impl BslContextServer {
         Self {
             index: Arc::new(index),
             engine: Arc::new(engine),
-            default_validation_level: default_validation_level.clamp(1, 2),
+            default_validation_level: default_validation_level.clamp(1, 3),
             default_profile,
             tool_router: Self::tool_router(),
         }
@@ -122,8 +122,12 @@ pub struct ValidateExpressionParams {
     /// Уровень валидации:
     /// `1` (default) — статический анализ ссылок с явным именем типа в исходнике;
     /// `2` — дополнительно локальный type inference (Phase 8 MVP) для переменных,
-    /// присвоенных через `Новый`, `ТипX.ЗначениеY` или аннотацию `// @type ТипX`.
-    /// Уровень 2 даёт больше false-positive — поэтому идёт за флагом.
+    /// присвоенных через `Новый`, `ТипX.ЗначениеY` или аннотацию `// @type ТипX`;
+    /// `3` — дополнительно return-type tracking (Уровень 2.5): тип переменной из
+    /// возвращаемого типа метода/свойства и цепочек `Запрос.Выполнить().Выбрать()`,
+    /// а при заданном `base` — реквизиты справочников/документов из метаданных
+    /// конфигурации. Чем выше уровень, тем больше находок и потенциальных
+    /// false-positive — поэтому за флагом.
     pub level: Option<u8>,
     /// Профиль потребителя (карточка-decision #1230):
     /// `"full"` (default) — все находки, `level` как передан; для сильной модели,
@@ -276,7 +280,7 @@ impl BslContextServer {
         let level = p
             .level
             .unwrap_or(self.default_validation_level)
-            .clamp(1, 2);
+            .clamp(1, 3);
         let profile = match p.profile {
             Some(ref s) => Profile::parse_or_default(Some(s)),
             None => self.default_profile,
