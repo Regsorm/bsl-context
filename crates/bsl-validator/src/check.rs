@@ -8,6 +8,9 @@
 //! явным человеко-читаемым сообщением об ошибке (для модели). Без парсинга
 //! BSL — это уровень MCP-tool, на вход приходят уже извлечённые имена.
 
+use std::sync::OnceLock;
+
+use regex::Regex;
 use serde::Serialize;
 
 use platform_index::{PlatformIndex, Signature};
@@ -26,6 +29,9 @@ pub struct SignatureBrief {
     pub name: String,
     pub min_args: usize,
     pub max_args: usize,
+    /// `true` — функция принимает неограниченное число аргументов (вариативная,
+    /// напр. `Макс`/`Мин`); тогда верхняя граница `max_args` не проверяется.
+    pub variadic: bool,
     pub formatted: String,
 }
 
@@ -134,7 +140,11 @@ pub fn validate_method_call(
         };
     };
 
-    let signatures: Vec<SignatureBrief> = method.signatures.iter().map(brief_signature).collect();
+    let signatures: Vec<SignatureBrief> = method
+        .signatures
+        .iter()
+        .map(|s| brief_signature(&method.name_ru, s))
+        .collect();
     if signatures.is_empty() {
         // Метод без описанной сигнатуры — формально не можем проверить число аргументов.
         return MethodCallValidation {
@@ -151,7 +161,7 @@ pub fn validate_method_call(
 
     let any_match = signatures
         .iter()
-        .any(|s| arg_count >= s.min_args && arg_count <= s.max_args);
+        .any(|s| arg_count >= s.min_args && (s.variadic || arg_count <= s.max_args));
 
     if any_match {
         MethodCallValidation {
@@ -168,7 +178,9 @@ pub fn validate_method_call(
         let allowed_ranges = signatures
             .iter()
             .map(|s| {
-                if s.min_args == s.max_args {
+                if s.variadic {
+                    format!("{}+", s.min_args)
+                } else if s.min_args == s.max_args {
                     format!("{}", s.min_args)
                 } else {
                     format!("{}..{}", s.min_args, s.max_args)
@@ -189,9 +201,24 @@ pub fn validate_method_call(
     }
 }
 
-fn brief_signature(s: &Signature) -> SignatureBrief {
-    let max_args = s.parameters.len();
+fn brief_signature(method_name: &str, s: &Signature) -> SignatureBrief {
     let min_args = s.parameters.iter().filter(|p| p.required).count();
+    let mut max_args = s.parameters.len();
+
+    // Диапазонный параметр hbk вида `Значение1-Значение10` — это один слот в
+    // `parameters`, но синтаксически представляет несколько (до верхней цифры).
+    // Расширяем верхнюю границу на недостающие слоты (СтрШаблон и т.п.).
+    for p in &s.parameters {
+        if let Some(upper) = parse_range_upper(&p.name) {
+            max_args += upper.saturating_sub(1);
+        }
+    }
+
+    // Семантически вариативные глобальные функции (`Макс`/`Мин`): hbk описывает
+    // один параметр, а функция принимает неограниченное число. Признака в
+    // структуре нет — список фиксирован.
+    let variadic = is_variadic_global(method_name);
+
     let formatted = s
         .parameters
         .iter()
@@ -209,8 +236,28 @@ fn brief_signature(s: &Signature) -> SignatureBrief {
         name: s.name.clone(),
         min_args,
         max_args,
+        variadic,
         formatted,
     }
+}
+
+/// Глобальные функции платформы с неограниченным числом аргументов, у которых
+/// hbk-сигнатура показывает лишь один параметр (вариативность — только в тексте
+/// описания). Список фиксирован — таких функций единицы.
+fn is_variadic_global(method_name: &str) -> bool {
+    matches!(
+        method_name.to_lowercase().as_str(),
+        "макс" | "мин" | "max" | "min"
+    )
+}
+
+/// Извлечь верхнюю границу диапазонного имени параметра вида
+/// `Значение1-Значение10` → `Some(10)`. Иначе `None`.
+fn parse_range_upper(param_name: &str) -> Option<usize> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"(\d+)\D*-\D*(\d+)").unwrap());
+    let caps = re.captures(param_name)?;
+    caps.get(2)?.as_str().parse::<usize>().ok()
 }
 
 fn top_similar(query: &str, values: &[platform_index::EnumValue], top: usize) -> Vec<SimilarValue> {
@@ -302,5 +349,65 @@ mod tests {
         ];
         let top = top_similar("перенос", &values, 3);
         assert_eq!(top[0].name, "Переносить");
+    }
+
+    #[test]
+    fn parse_range_upper_works() {
+        assert_eq!(parse_range_upper("Значение1-Значение10"), Some(10));
+        assert_eq!(parse_range_upper("Шаблон"), None);
+        assert_eq!(parse_range_upper("Параметр2-Параметр7"), Some(7));
+    }
+
+    fn method_1param(name_ru: &str, param: &str, required: bool) -> platform_index::Method {
+        use platform_index::{Method, Parameter, Signature};
+        Method {
+            name_ru: name_ru.into(),
+            name_en: String::new(),
+            description: String::new(),
+            return_type: String::new(),
+            signatures: vec![Signature {
+                name: "Основная".into(),
+                description: String::new(),
+                parameters: vec![Parameter {
+                    name: param.into(),
+                    type_name: String::new(),
+                    required,
+                    description: String::new(),
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn variadic_max_accepts_many_args() {
+        use platform_index::PlatformIndex;
+        let mut idx = PlatformIndex::new();
+        idx.global_methods.push(method_1param("Макс", "Значение1", true));
+        assert!(validate_method_call(&idx, "Макс", 1).valid);
+        assert!(validate_method_call(&idx, "Макс", 5).valid, "Макс вариативна");
+        assert!(!validate_method_call(&idx, "Макс", 0).valid, "ниже min");
+    }
+
+    #[test]
+    fn strshablon_range_param_expands_max() {
+        use platform_index::{Method, Parameter, PlatformIndex, Signature};
+        let mut idx = PlatformIndex::new();
+        idx.global_methods.push(Method {
+            name_ru: "СтрШаблон".into(),
+            name_en: String::new(),
+            description: String::new(),
+            return_type: "Строка".into(),
+            signatures: vec![Signature {
+                name: "Основная".into(),
+                description: String::new(),
+                parameters: vec![
+                    Parameter { name: "Шаблон".into(), type_name: String::new(), required: true, description: String::new() },
+                    Parameter { name: "Значение1-Значение10".into(), type_name: String::new(), required: false, description: String::new() },
+                ],
+            }],
+        });
+        assert!(validate_method_call(&idx, "СтрШаблон", 3).valid, "Шаблон + 2 значения");
+        assert!(validate_method_call(&idx, "СтрШаблон", 11).valid, "Шаблон + 10 значений");
+        assert!(!validate_method_call(&idx, "СтрШаблон", 12).valid, "11 значений — превышение");
     }
 }

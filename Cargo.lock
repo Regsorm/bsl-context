@@ -213,7 +213,7 @@ dependencies = [
 
 [[package]]
 name = "bsl-context-server"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -238,7 +238,7 @@ dependencies = [
 
 [[package]]
 name = "bsl-validator"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "platform-index",
@@ -865,7 +865,7 @@ checksum = "4f467dd6dccf739c208452f8014c75c18bb8301b050ad1cfb27153803edb0f51"
 
 [[package]]
 name = "hbk-parser"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "ego-tree",
@@ -880,7 +880,7 @@ dependencies = [
 
 [[package]]
 name = "hbk-reader"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -1391,7 +1391,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
 name = "platform-index"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "hbk-parser",
