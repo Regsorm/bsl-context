@@ -7,8 +7,7 @@ properties, constructors, system enumeration values — plus static validation o
 BSL expressions against a real platform index.
 
 The data source is the platform's syntax assistant (`shcntx_ru.hbk`), parsed by a
-custom reader (running 1C is not required). Replaces the discontinued upstream
-`alkoleft/mcp-bsl-platform-context`.
+custom reader (running 1C is not required).
 
 ## Why
 
