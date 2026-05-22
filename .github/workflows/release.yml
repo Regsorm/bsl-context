@@ -53,9 +53,10 @@ jobs:
         shell: bash
         run: echo "tag=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
 
+      # Для push тега checkout по умолчанию берёт сам тег; для ручного
+      # запуска (workflow_dispatch) — ветку по умолчанию (main). И там, и там
+      # присутствуют README/LICENSE/CHANGELOG, нужные шагу упаковки.
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ steps.tag.outputs.tag }}
 
       - name: Установить Rust + target
         uses: dtolnay/rust-toolchain@stable
