@@ -32,12 +32,18 @@ impl PlatformIndex {
         self.types.get(&name_ru.to_lowercase())
     }
 
-    /// Точный поиск глобального метода по русскому имени (регистронезависимо).
-    pub fn find_global_method(&self, name_ru: &str) -> Option<&Method> {
-        let key = name_ru.to_lowercase();
-        self.global_methods
-            .iter()
-            .find(|m| m.name_ru.to_lowercase() == key)
+    /// Точный поиск глобального метода по имени (регистронезависимо).
+    ///
+    /// Сверяются ОБА имени — русское и английское: платформа принимает и
+    /// `Сообщить(...)`, и `Message(...)`. Раньше искали только по `name_ru`,
+    /// из-за чего английский вызов не находился и уходил в fuzzy, где
+    /// находил сам себя в `name_en` с нулевым расстоянием.
+    pub fn find_global_method(&self, name: &str) -> Option<&Method> {
+        let key = name.to_lowercase();
+        self.global_methods.iter().find(|m| {
+            m.name_ru.to_lowercase() == key
+                || (!m.name_en.is_empty() && m.name_en.to_lowercase() == key)
+        })
     }
 
     /// Точный поиск глобального свойства по русскому имени (регистронезависимо).
@@ -52,5 +58,44 @@ impl PlatformIndex {
     pub fn insert_type(&mut self, ty: Type) {
         let key = ty.name_ru.to_lowercase();
         self.types.insert(key, ty);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::entities::Method;
+
+    fn method(name_ru: &str, name_en: &str) -> Method {
+        Method {
+            name_ru: name_ru.into(),
+            name_en: name_en.into(),
+            description: String::new(),
+            return_type: String::new(),
+            signatures: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn find_global_method_by_russian_name() {
+        let mut index = PlatformIndex::new();
+        index.global_methods.push(method("Сообщить", "Message"));
+        assert!(index.find_global_method("сообщить").is_some());
+    }
+
+    #[test]
+    fn find_global_method_by_english_name() {
+        // Регресс: раньше сверялся только name_ru, английский синоним не находился.
+        let mut index = PlatformIndex::new();
+        index.global_methods.push(method("Сообщить", "Message"));
+        assert!(index.find_global_method("Message").is_some());
+        assert!(index.find_global_method("message").is_some());
+    }
+
+    #[test]
+    fn find_global_method_empty_name_en_does_not_match_empty_query() {
+        let mut index = PlatformIndex::new();
+        index.global_methods.push(method("Прочее", ""));
+        assert!(index.find_global_method("").is_none());
     }
 }

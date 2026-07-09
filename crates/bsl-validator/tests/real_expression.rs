@@ -134,6 +134,57 @@ fn user_procedure_call_silent_in_expression() {
 }
 
 #[test]
+fn english_global_method_is_not_flagged() {
+    // Английский синоним платформенного метода — валидный вызов, а не
+    // «неизвестный глобальный метод». Регресс: раньше find_global_method
+    // сверял только name_ru, и fuzzy находил сам себя с distance 0 → High.
+    let Some(path) = hbk_path() else { return };
+    let index = load_from_hbk(&path).expect("PlatformIndex");
+
+    let sample = index
+        .global_methods
+        .iter()
+        .find(|m| !m.name_en.is_empty() && m.name_en.chars().count() >= 5)
+        .expect("нужен глобальный метод с непустым name_en");
+    let en = sample.name_en.clone();
+
+    assert!(
+        index.find_global_method(&en).is_some(),
+        "find_global_method должен находить по английскому имени '{en}'"
+    );
+
+    let src = format!("{en}();");
+    let result = validate_expression(&index, &src);
+    let bad: Vec<_> = result
+        .errors
+        .iter()
+        .filter(|e| e.kind == ExprErrorKind::UnknownGlobalMethod)
+        .collect();
+    assert!(
+        bad.is_empty(),
+        "английское имя '{en}' не должно давать UnknownGlobalMethod: {bad:#?}"
+    );
+}
+
+#[test]
+fn deliberate_suffix_names_are_not_flagged() {
+    // Прикладные имена, похожие на платформенные лишь приписанным суффиксом.
+    let Some(path) = hbk_path() else { return };
+    let index = load_from_hbk(&path).expect("PlatformIndex");
+
+    for name in ["СтрокаТЧ", "Формат1", "Сообщить2", "СокрЛ2"] {
+        let src = format!("{name}();");
+        let result = validate_expression(&index, &src);
+        let bad: Vec<_> = result
+            .errors
+            .iter()
+            .filter(|e| e.kind == ExprErrorKind::UnknownGlobalMethod)
+            .collect();
+        assert!(bad.is_empty(), "'{name}' не опечатка, а своё имя: {bad:#?}");
+    }
+}
+
+#[test]
 fn ignores_comments_and_strings() {
     let Some(path) = hbk_path() else { return };
     let index = load_from_hbk(&path).expect("PlatformIndex");

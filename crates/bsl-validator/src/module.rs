@@ -216,7 +216,7 @@ fn emit_directive_check(
     if distance == 0 {
         return;
     }
-    let Some(confidence) = fuzzy_confidence_for(name, distance) else {
+    let Some(confidence) = fuzzy_confidence_for(name, &suggestion, distance) else {
         return;
     };
     // Позиция annotation-узла (0-based → 1-based для API).

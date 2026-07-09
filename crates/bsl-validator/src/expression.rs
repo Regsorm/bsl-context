@@ -569,7 +569,7 @@ pub(crate) fn check_global_calls(
             if let Some((suggestion, distance)) =
                 closest_global_method_with_distance(index, head)
             {
-                if let Some(confidence) = fuzzy_confidence_for(head, distance) {
+                if let Some(confidence) = fuzzy_confidence_for(head, &suggestion, distance) {
                     let (line, col) = pos_at(src, head_match.start());
                     errors.push(ExprError::new_with_confidence(
                         line,
@@ -810,19 +810,39 @@ fn closest_global_method_with_distance(
 }
 
 /// Двухпороговая эвристика Confidence по длине идентификатора и расстоянию
-/// Левенштейна. Возвращает None — значит fuzzy слишком далеко, эмитить не надо.
+/// Левенштейна. Возвращает None — значит эмиттить находку не надо.
 ///
 /// - Сильное сходство (High): distance ≤ 2 при len ≥ 5, либо distance ≤ 1 при len < 5.
 /// - Слабое сходство (Low): distance ≤ 3 при len ≥ 6.
 /// - Иначе: None.
 ///
-/// distance==0 отдаём как High: это редкий случай (найденный fuzzy'ем, но не
-/// прямым lookup — только через case-mismatch). Пусть тесты покажут.
-///
 /// Пороги подобраны так, чтобы длинные имена (типа `СтрНайти`, 8 символов)
 /// с 1-2 опечатками ловились уверенно, а короткие имена (типа `Мин`, 3 символа)
 /// требовали distance ≤ 1 — иначе `Мин` fuzzy к `Макс` даст ложный High.
-pub(crate) fn fuzzy_confidence_for(head: &str, distance: usize) -> Option<Confidence> {
+///
+/// Два отсекателя перед порогами:
+/// 1. `distance == 0` — совпадение точное, находку эмиттить бессмысленно
+///    (сообщение «X не найден, возможно вы имели в виду X»). Защита-дублёр:
+///    после расширения `find_global_method` на `name_en` такой случай не
+///    должен возникать, но молча выйти дешевле, чем врать.
+/// 2. `suggestion` — строгое начало `head`, а хвост это цифры либо 2+ символа.
+///    Это осознанно другое, более длинное имя (`СтрокаТЧ` = `Строка` + `ТЧ`,
+///    `Сообщить2` = `Сообщить` + `2`), а не опечатка. Опечатка приписыванием
+///    одной буквы (`Строкаа`) под правило не попадает и по-прежнему ловится.
+pub(crate) fn fuzzy_confidence_for(
+    head: &str,
+    suggestion: &str,
+    distance: usize,
+) -> Option<Confidence> {
+    if distance == 0 {
+        return None;
+    }
+    if let Some(suffix) = strip_prefix_ci(head, suggestion) {
+        let all_digits = !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit());
+        if all_digits || suffix.chars().count() >= 2 {
+            return None;
+        }
+    }
     let len = head.chars().count();
     let strong = (len >= 5 && distance <= 2) || (len < 5 && distance <= 1);
     let weak = len >= 6 && distance <= 3;
@@ -833,6 +853,17 @@ pub(crate) fn fuzzy_confidence_for(head: &str, distance: usize) -> Option<Confid
     } else {
         None
     }
+}
+
+/// Если `prefix` — строгое начало `head` (регистронезависимо), вернуть остаток.
+/// Равные строки дают `None`: остатка нет, это не «имя с суффиксом».
+fn strip_prefix_ci(head: &str, prefix: &str) -> Option<String> {
+    let head_lc = head.to_lowercase();
+    let prefix_lc = prefix.to_lowercase();
+    if prefix_lc.is_empty() || head_lc == prefix_lc {
+        return None;
+    }
+    head_lc.strip_prefix(&prefix_lc).map(|s| s.to_string())
 }
 
 fn similarity(a: &str, b: &str) -> f32 {
@@ -956,6 +987,40 @@ mod tests {
         let src = "Текст = НСтр(\"ru = 'Неверный тип запроса.'\");";
         let res = validate_expression_at_level(&index, src, 1);
         assert!(res.valid, "НСтр с одним строковым аргументом ложно помечен: {:?}", res.errors);
+    }
+
+    // ── fuzzy_confidence_for: дефект хотфикса 0.5.1 ─────────────────────────
+
+    #[test]
+    fn fuzzy_zero_distance_is_silent() {
+        assert_eq!(fuzzy_confidence_for("Сообщить", "Сообщить", 0), None);
+    }
+
+    #[test]
+    fn fuzzy_deliberate_suffix_is_not_a_typo() {
+        // Кандидат — строгое начало имени, хвост осмысленный или цифровой.
+        assert_eq!(fuzzy_confidence_for("СтрокаТЧ", "Строка", 2), None);
+        assert_eq!(fuzzy_confidence_for("Сообщить2", "Сообщить", 1), None);
+        assert_eq!(fuzzy_confidence_for("СокрЛ2", "СокрЛ", 1), None);
+        assert_eq!(fuzzy_confidence_for("Формат1", "Формат", 1), None);
+    }
+
+    #[test]
+    fn fuzzy_real_typo_still_high() {
+        // «СтрНайит» — перестановка букв, suggestion НЕ является началом head.
+        assert_eq!(
+            fuzzy_confidence_for("СтрНайит", "СтрНайти", 2),
+            Some(Confidence::High)
+        );
+    }
+
+    #[test]
+    fn fuzzy_single_letter_doubling_still_caught() {
+        // Приписана одна буква — это правдоподобная опечатка, не суффикс.
+        assert_eq!(
+            fuzzy_confidence_for("Строкаа", "Строка", 1),
+            Some(Confidence::High)
+        );
     }
 
     // ── Профиль потребителя и надёжность (карточка #1230) ──────────────────
