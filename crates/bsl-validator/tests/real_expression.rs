@@ -91,6 +91,49 @@ fn correct_code_yields_no_errors() {
 }
 
 #[test]
+fn platform_method_typo_becomes_unknown_global_method() {
+    let Some(path) = hbk_path() else { return };
+    let index = load_from_hbk(&path).expect("PlatformIndex");
+
+    // 'СтрНайит' — опечатка платформенного 'СтрНайти' (distance 2 при len 8):
+    // fuzzy эвристика fuzzy_confidence_for → High.
+    let src = "Поз = СтрНайит(\"abc\", \"b\");";
+    let result = validate_expression(&index, src);
+    println!("{result:#?}");
+    assert!(!result.valid, "ожидается valid=false");
+    let err = result
+        .errors
+        .iter()
+        .find(|e| e.kind == ExprErrorKind::UnknownGlobalMethod)
+        .expect("должна быть ошибка UnknownGlobalMethod");
+    assert_eq!(err.suggestion.as_deref(), Some("СтрНайти"));
+    assert_eq!(
+        err.confidence,
+        bsl_validator::Confidence::High,
+        "distance 2 при len 8 — сильное сходство, ожидается High"
+    );
+}
+
+#[test]
+fn user_procedure_call_silent_in_expression() {
+    // На уровне validate_expression whitelist пользовательских процедур не
+    // строится — вызов 'МояПроцедура' без похожего платформенного соседа
+    // должен молча пройти (fuzzy не выстреливает). Это регрессионный тест
+    // против ложных срабатываний на своих процедурах.
+    let Some(path) = hbk_path() else { return };
+    let index = load_from_hbk(&path).expect("PlatformIndex");
+
+    let src = "МояПроцедура(1, 2);";
+    let result = validate_expression(&index, src);
+    println!("{result:#?}");
+    assert!(
+        result.valid,
+        "вызов процедуры, непохожей на платформенную, не должен давать ошибок: {:#?}",
+        result.errors
+    );
+}
+
+#[test]
 fn ignores_comments_and_strings() {
     let Some(path) = hbk_path() else { return };
     let index = load_from_hbk(&path).expect("PlatformIndex");

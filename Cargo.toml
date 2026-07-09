@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 license = "MIT"
 description = "MCP-сервер контекста платформы 1С (типы, методы, перечисления + валидация BSL-выражений)"
@@ -59,6 +59,10 @@ regex = "1"
 
 # BSL-парсер (Phase 6)
 tree-sitter = "0.25"
+# Грамматика BSL (1С:Предприятие / OneScript) для tree-sitter.
+# Используется в `validate_module` для извлечения объявлений Процедура/Функция
+# и валидации имён директив компиляции/расширений (`&НаСервере`, `&Перед`, …).
+tree-sitter-onescript = "0.1"
 
 # Утилиты
 chrono = { version = "0.4", features = ["serde"] }

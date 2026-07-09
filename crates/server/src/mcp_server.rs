@@ -10,7 +10,8 @@
 use std::sync::Arc;
 
 use bsl_validator::{
-    validate_enum, validate_expression_with_profile, validate_method_call, Profile,
+    validate_enum, validate_expression_with_profile, validate_method_call,
+    validate_module_with_profile, Profile,
 };
 use platform_index::{format, Definition, PlatformIndex, SearchEngine};
 use rmcp::{
@@ -112,6 +113,23 @@ pub struct ValidateMethodCallParams {
     /// Количество фактически передаваемых аргументов в вызове.
     #[serde(alias = "argCount")]
     pub arg_count: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ValidateModuleParams {
+    /// Текст ЦЕЛОГО BSL-модуля (общий модуль, модуль объекта, модуль формы и т.п.).
+    /// В отличие от `validate_expression`, здесь валидатор сам извлекает
+    /// объявленные в модуле процедуры/функции через tree-sitter и не путает их
+    /// вызовы с опечатками платформенных методов.
+    #[serde(alias = "bslModule", alias = "module", alias = "code")]
+    pub source: String,
+    /// Уровень валидации — семантика та же, что у `validate_expression`
+    /// (1 — базовый, 2 — с local type inference, 3 — с return-type tracking).
+    /// Клампится в `[1..=3]`.
+    pub level: Option<u8>,
+    /// Профиль потребителя — `"full"` (все находки) / `"strict"` (только High
+    /// + форсированный level=1). Семантика та же, что у `validate_expression`.
+    pub profile: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -286,6 +304,31 @@ impl BslContextServer {
             None => self.default_profile,
         };
         let result = validate_expression_with_profile(&self.index, &p.source, level, profile);
+        serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    #[tool(
+        description = "Валидация ЦЕЛОГО BSL-модуля против платформенного контекста. Отличие от \
+                       validate_expression: сервер сам через tree-sitter извлекает объявления \
+                       Процедура/Функция и не считает их вызовы опечатками платформенных методов. \
+                       Ловит: несуществующие enum-значения; неизвестные типы в 'Новый'; неверное \
+                       число аргументов глобальных функций; опечатки платформенных методов \
+                       (fuzzy-сходство). Уровни/профили — как у validate_expression. Возвращает \
+                       JSON {valid, errors:[{line,col,kind,confidence,message,suggestion?}]}."
+    )]
+    pub async fn validate_module(
+        &self,
+        Parameters(p): Parameters<ValidateModuleParams>,
+    ) -> String {
+        let level = p
+            .level
+            .unwrap_or(self.default_validation_level)
+            .clamp(1, 3);
+        let profile = match p.profile {
+            Some(ref s) => Profile::parse_or_default(Some(s)),
+            None => self.default_profile,
+        };
+        let result = validate_module_with_profile(&self.index, &p.source, level, profile);
         serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
     }
 

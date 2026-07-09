@@ -23,6 +23,7 @@
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::sync::OnceLock;
 
 use platform_index::PlatformIndex;
@@ -76,6 +77,31 @@ impl ExprError {
             similar,
         }
     }
+
+    /// Сконструировать ошибку с явно заданным `confidence`. Нужно для случаев,
+    /// когда `kind` не однозначно определяет надёжность — например,
+    /// `UnknownGlobalMethod` и `UnknownDirective` эмиттятся с двухпороговым
+    /// Confidence по fuzzy-расстоянию (High при сильном сходстве, Low при
+    /// слабом), а не хардкодом от kind.
+    pub(crate) fn new_with_confidence(
+        line: u32,
+        col: u32,
+        kind: ExprErrorKind,
+        message: String,
+        confidence: Confidence,
+        suggestion: Option<String>,
+        similar: Vec<SimilarValue>,
+    ) -> Self {
+        Self {
+            line,
+            col,
+            kind,
+            message,
+            confidence,
+            suggestion,
+            similar,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -86,24 +112,34 @@ pub enum ExprErrorKind {
     UnknownNewType,
     WrongArgumentCount,
     UnknownGlobalMethod,
+    /// Имя директивы (`&НаСервере`, `&Перед`, …) не входит в whitelist
+    /// известных директив. Эмиттится только из `validate_module` при обходе
+    /// `annotation`-узлов AST. Confidence проставляется явно по двухпороговой
+    /// эвристике `fuzzy_confidence_for` (тот же механизм, что для
+    /// `UnknownGlobalMethod`).
+    UnknownDirective,
 }
 
 impl ExprErrorKind {
-    /// Надёжность находки этого вида.
+    /// Надёжность находки этого вида (fallback, если конструктор не задал явно).
     ///
     /// `High` (false-positive ≈ 0) — точная сверка с реальным индексом платформы:
     /// несуществующее значение перечисления и неверное число аргументов.
     ///
     /// `Low` (возможен false-positive) — зависит от эвристического type inference
-    /// (Уровень 2) либо от полноты hbk: член типа, тип в `Новый`, глобальный метод
-    /// (последний массово ложно срабатывает на вызовах процедур общих модулей БСП,
-    /// которых валидатор не видит). См. карточку #1230 и `rules/bsl-codegen.md`.
+    /// (Уровень 2) либо от полноты hbk: член типа, тип в `Новый`.
+    ///
+    /// `UnknownGlobalMethod` — Confidence проставляется НЕ через этот метод,
+    /// а явно через [`ExprError::new_with_confidence`] по двухпороговой эвристике
+    /// от `fuzzy_confidence_for`: High при сильном сходстве, Low при слабом.
+    /// Хардкод здесь — только как safe fallback.
     pub fn confidence(self) -> Confidence {
         match self {
             ExprErrorKind::UnknownEnumValue | ExprErrorKind::WrongArgumentCount => Confidence::High,
             ExprErrorKind::UnknownTypeMember
             | ExprErrorKind::UnknownNewType
-            | ExprErrorKind::UnknownGlobalMethod => Confidence::Low,
+            | ExprErrorKind::UnknownGlobalMethod
+            | ExprErrorKind::UnknownDirective => Confidence::Low,
         }
     }
 }
@@ -178,7 +214,7 @@ pub fn validate_expression_at_level(
     let mut errors = Vec::new();
     check_type_dot_members(index, &cleaned, scope_map.as_ref(), &mut errors);
     check_new_expressions(index, &cleaned, &mut errors);
-    check_global_calls(index, &cleaned, &mut errors);
+    check_global_calls(index, &cleaned, None, &mut errors);
 
     ExpressionValidation {
         valid: errors.is_empty(),
@@ -300,7 +336,7 @@ fn global_call_re() -> &'static Regex {
 
 // ── Проверки ──────────────────────────────────────────────────────────────
 
-fn check_type_dot_members(
+pub(crate) fn check_type_dot_members(
     index: &PlatformIndex,
     src: &str,
     scope_map: Option<&ScopeMap>,
@@ -445,7 +481,7 @@ fn is_dynamic_member_type(name_ru: &str) -> bool {
     )
 }
 
-fn check_new_expressions(index: &PlatformIndex, src: &str, errors: &mut Vec<ExprError>) {
+pub(crate) fn check_new_expressions(index: &PlatformIndex, src: &str, errors: &mut Vec<ExprError>) {
     for cap in new_re().captures_iter(src) {
         let ty_match = cap.name("ty").unwrap();
         let ty_name = ty_match.as_str();
@@ -473,16 +509,30 @@ fn check_new_expressions(index: &PlatformIndex, src: &str, errors: &mut Vec<Expr
     }
 }
 
-fn check_global_calls(index: &PlatformIndex, src: &str, errors: &mut Vec<ExprError>) {
+/// Проверка глобальных вызовов `Имя(args)` в тексте (уже замаскированном от
+/// строк/комментариев). `user_symbols` — необязательный whitelist имён своих
+/// процедур/функций (в lowercase), извлечённых из модуля вызывающим слоем
+/// (см. `module::validate_module_impl`). Если вызов попадает в whitelist —
+/// пропускаем без проверки. Для `validate_expression` передаётся `None`.
+pub(crate) fn check_global_calls(
+    index: &PlatformIndex,
+    src: &str,
+    user_symbols: Option<&HashSet<String>>,
+    errors: &mut Vec<ExprError>,
+) {
     for cap in global_call_re().captures_iter(src) {
         let head_match = cap.name("head").unwrap();
         let head = head_match.as_str();
 
         // Левый сосед — не должна быть «.» (тогда это вызов члена, не глобальный).
+        // Также «&» слева означает, что это annotation-директива
+        // (`&Перед("Foo")`, `&НаСервере` без скобок сюда не попадает вовсе),
+        // а не глобальный вызов — валидация директив идёт отдельным путём через
+        // `module::walk_module_ast`, здесь мы её молча пропускаем.
         let start = head_match.start();
         if start > 0 {
             let prev = src.as_bytes()[start - 1];
-            if prev == b'.' {
+            if prev == b'.' || prev == b'&' {
                 continue;
             }
             if !is_safe_left_boundary(src, start) {
@@ -492,6 +542,12 @@ fn check_global_calls(index: &PlatformIndex, src: &str, errors: &mut Vec<ExprErr
         // Игнорируем ключевые слова, не являющиеся вызовами.
         if is_bsl_keyword(head) {
             continue;
+        }
+        // Своя процедура/функция из этого же модуля — пропускаем.
+        if let Some(whitelist) = user_symbols {
+            if whitelist.contains(&head.to_lowercase()) {
+                continue;
+            }
         }
         // Имена, коллизирующие с приведением типа в языке запросов
         // (`ВЫРАЗИТЬ(X КАК ЧИСЛО(28,10))`): число «аргументов» в тексте запроса
@@ -505,7 +561,32 @@ fn check_global_calls(index: &PlatformIndex, src: &str, errors: &mut Vec<ExprErr
 
         // Если head — известный глобальный метод, попытаемся посчитать аргументы.
         let Some(_method) = index.find_global_method(head) else {
-            continue; // не наша забота на Уровне 1
+            // Неизвестный глобальный вызов: пробуем fuzzy к платформенным.
+            // Строгого совпадения нет — либо это опечатка платформенного метода,
+            // либо процедура общего модуля/БСП (валидатор её не видит). Различаем
+            // по расстоянию: сильное сходство → High (уверенно опечатка), слабое →
+            // Low (возможная опечатка), далёкое → молча пропускаем.
+            if let Some((suggestion, distance)) =
+                closest_global_method_with_distance(index, head)
+            {
+                if let Some(confidence) = fuzzy_confidence_for(head, distance) {
+                    let (line, col) = pos_at(src, head_match.start());
+                    errors.push(ExprError::new_with_confidence(
+                        line,
+                        col,
+                        ExprErrorKind::UnknownGlobalMethod,
+                        format!(
+                            "Глобальный метод '{}' не найден в платформенном контексте. \
+                             Возможно, вы имели в виду '{}'.",
+                            head, suggestion
+                        ),
+                        confidence,
+                        Some(suggestion),
+                        Vec::new(),
+                    ));
+                }
+            }
+            continue;
         };
 
         // Найти конец вызова (скобка после head). Группа уже захватила `(`,
@@ -691,6 +772,67 @@ fn closest_str(target: &str, candidates: &[String]) -> Option<String> {
         .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
         .filter(|(s, _)| *s > 0.5)
         .map(|(_, c)| c)
+}
+
+/// Ближайший глобальный метод к `target` по обоим языкам (name_ru + name_en).
+/// Возвращает (имя-победитель, distance). Distance — расстояние Левенштейна
+/// на lowercase формах.
+///
+/// Используется в `check_global_calls`, когда прямой lookup `find_global_method`
+/// вернул None: нужен не только suggestion, но и distance, чтобы выбрать
+/// Confidence по двухпороговой эвристике [`fuzzy_confidence_for`].
+///
+/// distance==0 в паре с промахом `find_global_method` означает case-mismatch
+/// (сам find регистронезависим, но при истинном совпадении мы бы не оказались
+/// в этой ветке; distance=0 возможен только если у нас не хватило нормализации
+/// на входе). Здесь возвращаем как есть — вызывающий сам решит, эмиттить ли.
+fn closest_global_method_with_distance(
+    index: &PlatformIndex,
+    target: &str,
+) -> Option<(String, usize)> {
+    let target_lc = target.to_lowercase();
+    let mut best: Option<(String, usize)> = None;
+    for m in &index.global_methods {
+        let d_ru = lev(&target_lc, &m.name_ru.to_lowercase());
+        match &best {
+            Some((_, d)) if d_ru >= *d => {}
+            _ => best = Some((m.name_ru.clone(), d_ru)),
+        }
+        if !m.name_en.is_empty() {
+            let d_en = lev(&target_lc, &m.name_en.to_lowercase());
+            match &best {
+                Some((_, d)) if d_en >= *d => {}
+                _ => best = Some((m.name_en.clone(), d_en)),
+            }
+        }
+    }
+    best
+}
+
+/// Двухпороговая эвристика Confidence по длине идентификатора и расстоянию
+/// Левенштейна. Возвращает None — значит fuzzy слишком далеко, эмитить не надо.
+///
+/// - Сильное сходство (High): distance ≤ 2 при len ≥ 5, либо distance ≤ 1 при len < 5.
+/// - Слабое сходство (Low): distance ≤ 3 при len ≥ 6.
+/// - Иначе: None.
+///
+/// distance==0 отдаём как High: это редкий случай (найденный fuzzy'ем, но не
+/// прямым lookup — только через case-mismatch). Пусть тесты покажут.
+///
+/// Пороги подобраны так, чтобы длинные имена (типа `СтрНайти`, 8 символов)
+/// с 1-2 опечатками ловились уверенно, а короткие имена (типа `Мин`, 3 символа)
+/// требовали distance ≤ 1 — иначе `Мин` fuzzy к `Макс` даст ложный High.
+pub(crate) fn fuzzy_confidence_for(head: &str, distance: usize) -> Option<Confidence> {
+    let len = head.chars().count();
+    let strong = (len >= 5 && distance <= 2) || (len < 5 && distance <= 1);
+    let weak = len >= 6 && distance <= 3;
+    if strong {
+        Some(Confidence::High)
+    } else if weak {
+        Some(Confidence::Low)
+    } else {
+        None
+    }
 }
 
 fn similarity(a: &str, b: &str) -> f32 {

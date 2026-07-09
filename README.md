@@ -37,10 +37,18 @@ returns findings with line, column, kind, and confidence:
 | `wrong_argument_count` | high | Global function argument count outside its overloads |
 | `unknown_type_member` | low | Platform type has no such method/property |
 | `unknown_new_type` | low | `Новый TypeX` constructor unknown to the platform |
-| `unknown_global_method` | low | Unknown global function |
+| `unknown_global_method` | high / low | Unknown global call similar to a platform method (fuzzy: strong match → high, weak → low) |
+| `unknown_directive` | high / low | Directive name (`&НаСервере`, `&Перед`, …) not in the whitelist (`validate_module` only) |
 
 high-confidence findings have a false-positive rate near zero; low-confidence ones
 depend on the accuracy of type inference and the completeness of the `hbk`.
+
+**Whole-module validation** (`validate_module`) — accepts the FULL module text
+(common module, object module, form module). The server uses
+`tree-sitter-onescript` to extract `Процедура`/`Функция` declarations and does
+not treat their calls as typos of platform methods. It also validates compiler
+and extension directive names (`&НаСервере`, `&Перед("Foo")`, …). Levels,
+profiles, and response format are the same as `validate_expression`.
 
 ### Validation levels
 
@@ -148,6 +156,7 @@ Transport — Streamable HTTP at `http://127.0.0.1:8007/mcp` (stateless).
 | `validate_enum` | Validate an enumeration value |
 | `validate_method_call` | Validate a global function's argument count |
 | `validate_expression` | Validate a BSL fragment against the platform |
+| `validate_module` | Validate a whole BSL module (with self-whitelist and directive check) |
 
 ## Connecting an MCP client
 

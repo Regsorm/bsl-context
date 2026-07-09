@@ -213,7 +213,7 @@ dependencies = [
 
 [[package]]
 name = "bsl-context-server"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -238,7 +238,7 @@ dependencies = [
 
 [[package]]
 name = "bsl-validator"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "platform-index",
@@ -247,6 +247,7 @@ dependencies = [
  "thiserror",
  "tracing",
  "tree-sitter",
+ "tree-sitter-onescript",
 ]
 
 [[package]]
@@ -865,7 +866,7 @@ checksum = "4f467dd6dccf739c208452f8014c75c18bb8301b050ad1cfb27153803edb0f51"
 
 [[package]]
 name = "hbk-parser"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "ego-tree",
@@ -880,7 +881,7 @@ dependencies = [
 
 [[package]]
 name = "hbk-reader"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -1391,7 +1392,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
 name = "platform-index"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "hbk-parser",
@@ -2286,6 +2287,16 @@ name = "tree-sitter-language"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "009994f150cc0cd50ff54917d5bc8bffe8cad10ca10d81c34da2ec421ae61782"
+
+[[package]]
+name = "tree-sitter-onescript"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2dfdefdc8317e6168dab69be3974347f2ab37f44b733d249f8d614d0b70f5e48"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
 
 [[package]]
 name = "typenum"
