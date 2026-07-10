@@ -28,8 +28,12 @@ against the actual API of a specific platform version.
 **Reference tools** — search and details for platform types, methods, properties,
 constructors, and enumeration values.
 
-**Expression validation** (`validate_expression`) — parses a BSL fragment and
-returns findings with line, column, kind, and confidence:
+**Module/fragment validation** (`validate_module`) — accepts either a whole
+module or an arbitrary fragment; via `tree-sitter-bsl` the server
+extracts `Процедура`/`Функция` declarations from the submitted text and does
+not treat their calls as typos of platform methods (for a fragment this set is
+simply empty); it also validates compiler/extension directive names. Returns
+findings with line, column, kind, and confidence:
 
 | Finding kind | confidence | Meaning |
 |--------------|-----------|---------|
@@ -38,17 +42,11 @@ returns findings with line, column, kind, and confidence:
 | `unknown_type_member` | low | Platform type has no such method/property |
 | `unknown_new_type` | low | `Новый TypeX` constructor unknown to the platform |
 | `unknown_global_method` | high / low | Unknown global call similar to a platform method (fuzzy: strong match → high, weak → low) |
-| `unknown_directive` | high / low | Directive name (`&НаСервере`, `&Перед`, …) not in the whitelist (`validate_module` only) |
+| `undeclared_method` | high | Call is not declared in the submitted module and unknown to the platform (whole-module check only; suppressed in extension modules) |
+| `unknown_directive` | high / low | Directive name (`&НаСервере`, `&Перед`, …) not in the whitelist |
 
 high-confidence findings have a false-positive rate near zero; low-confidence ones
 depend on the accuracy of type inference and the completeness of the `hbk`.
-
-**Whole-module validation** (`validate_module`) — accepts the FULL module text
-(common module, object module, form module). The server uses
-`tree-sitter-onescript` to extract `Процедура`/`Функция` declarations and does
-not treat their calls as typos of platform methods. It also validates compiler
-and extension directive names (`&НаСервере`, `&Перед("Foo")`, …). Levels,
-profiles, and response format are the same as `validate_expression`.
 
 ### Validation levels
 
@@ -63,6 +61,26 @@ the config), clamped to `[1..=3]`:
   type of a method/property, including chains like `Query.Execute().Select()`.
 
 The higher the level, the more findings — and the more potential false positives.
+
+### What the validator cannot know
+
+The validator sees the text of a SINGLE module plus the platform context. It
+does not know the configuration's metadata, so it cannot verify that
+application procedures declared in other modules exist. The `undeclared_method`
+finding is suppressed when the name may come from outside:
+
+- an ordinary (non-managed) form module calls its owner's object module export
+  methods without a prefix;
+- an extension module calls procedures of the module it extends (such a module
+  is recognized by the `&Перед`, `&После`, `&Вместо`, `&ИзменениеИКонтроль`
+  directives, and strict checking is disabled for it);
+- a global common module (`Глобальный = Истина`) is called without a prefix
+  from any module.
+
+The first and third cases cannot be recognized from the module text alone —
+false positives for `undeclared_method` are possible there. The `strict`
+profile will not filter them out (the finding has `high` confidence); when
+working with such modules it's better not to rely on this finding.
 
 ### Profiles
 
@@ -155,8 +173,7 @@ Transport — Streamable HTTP at `http://127.0.0.1:8007/mcp` (stateless).
 | `get_enum_values` | Values of a system enumeration |
 | `validate_enum` | Validate an enumeration value |
 | `validate_method_call` | Validate a global function's argument count |
-| `validate_expression` | Validate a BSL fragment against the platform |
-| `validate_module` | Validate a whole BSL module (with self-whitelist and directive check) |
+| `validate_module` | Validate BSL code (whole module or fragment) against the platform |
 
 ## Connecting an MCP client
 

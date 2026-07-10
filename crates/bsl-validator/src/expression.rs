@@ -112,6 +112,12 @@ pub enum ExprErrorKind {
     UnknownNewType,
     WrongArgumentCount,
     UnknownGlobalMethod,
+    /// Вызов `Имя(...)`, которого нет ни среди объявлений присланного модуля,
+    /// ни среди платформенных методов, и который ни на что не похож (fuzzy
+    /// промолчал). Эмиттится только при проверке ЦЕЛОГО модуля — там отсутствие
+    /// объявления означает описку либо забытую процедуру. На голом фрагменте
+    /// такой вывод неправомерен: объявление просто осталось за кадром.
+    UndeclaredMethod,
     /// Имя директивы (`&НаСервере`, `&Перед`, …) не входит в whitelist
     /// известных директив. Эмиттится только из `validate_module` при обходе
     /// `annotation`-узлов AST. Confidence проставляется явно по двухпороговой
@@ -135,7 +141,9 @@ impl ExprErrorKind {
     /// Хардкод здесь — только как safe fallback.
     pub fn confidence(self) -> Confidence {
         match self {
-            ExprErrorKind::UnknownEnumValue | ExprErrorKind::WrongArgumentCount => Confidence::High,
+            ExprErrorKind::UnknownEnumValue
+            | ExprErrorKind::WrongArgumentCount
+            | ExprErrorKind::UndeclaredMethod => Confidence::High,
             ExprErrorKind::UnknownTypeMember
             | ExprErrorKind::UnknownNewType
             | ExprErrorKind::UnknownGlobalMethod
@@ -203,6 +211,7 @@ pub fn validate_expression_at_level(
     source: &str,
     level: u8,
 ) -> ExpressionValidation {
+    let source = &strip_extension_directives(source);
     let cleaned = mask_strings_and_comments(source);
     let scope_map = if level >= 2 {
         let annotations = extract_type_annotations(source);
@@ -214,7 +223,7 @@ pub fn validate_expression_at_level(
     let mut errors = Vec::new();
     check_type_dot_members(index, &cleaned, scope_map.as_ref(), &mut errors);
     check_new_expressions(index, &cleaned, &mut errors);
-    check_global_calls(index, &cleaned, None, &mut errors);
+    check_global_calls(index, &cleaned, None, false, &mut errors);
 
     ExpressionValidation {
         valid: errors.is_empty(),
@@ -253,6 +262,57 @@ pub fn validate_expression_with_profile(
 /// строк сохраняются — это важно для line/col, передаваемых в ошибки. Русские
 /// буквы и прочие multi-byte UTF-8 символы НЕ трогаются — пробелами заменяются
 /// только байты внутри строк/комментариев (ASCII содержимое).
+/// Убрать директивы препроцессора расширений, сохранив длину строк.
+///
+/// В модуле расширения блок `#Удаление … #КонецУдаления` содержит код исходного
+/// модуля, который расширение выбрасывает: в скомпилированный модуль он не
+/// попадает. Беда в том, что этот код может обрывать строковый литерал на
+/// середине — тогда сам файл перестаёт быть корректным BSL, а маскировка строк
+/// «съезжает» и весь текст запроса ниже начинает считаться кодом (наблюдалось на
+/// `#Удаление` внутри текста запроса: закрывающая кавычка стояла в удаляемой
+/// строке, а вставляемая её не имела).
+///
+/// Поэтому удаляемые строки и сами строки-маркеры затираются пробелами до всякого
+/// разбора. Позиции сохраняются: и номера строк, и колонки остаются прежними.
+pub fn strip_extension_directives(src: &str) -> String {
+    let bytes = src.as_bytes();
+    let mut out = bytes.to_vec();
+    let mut in_deleted = false;
+    let mut pos = 0usize;
+
+    for line in src.split_inclusive('\n') {
+        let body_len = line.trim_end_matches(['\n', '\r']).len();
+        let head = line.trim_start().to_lowercase();
+
+        let starts_delete = head.starts_with("#удаление") || head.starts_with("#delete");
+        let ends_delete = head.starts_with("#конецудаления") || head.starts_with("#enddelete");
+        let is_marker = starts_delete
+            || ends_delete
+            || head.starts_with("#вставка")
+            || head.starts_with("#конецвставки")
+            || head.starts_with("#insert")
+            || head.starts_with("#endinsert");
+
+        if starts_delete {
+            in_deleted = true;
+        }
+        if is_marker || in_deleted {
+            // Затираем побайтно: длина и позиции сохраняются, UTF-8 остаётся валидным.
+            for b in out.iter_mut().take(pos + body_len).skip(pos) {
+                if *b != b'\t' {
+                    *b = b' ';
+                }
+            }
+        }
+        if ends_delete {
+            in_deleted = false;
+        }
+        pos += line.len();
+    }
+
+    String::from_utf8(out).expect("затирание пробелами сохраняет UTF-8 валидность")
+}
+
 pub fn mask_strings_and_comments(src: &str) -> String {
     let bytes = src.as_bytes();
     let mut out = bytes.to_vec();
@@ -289,7 +349,29 @@ pub fn mask_strings_and_comments(src: &str) -> String {
                     j += 1;
                     break;
                 }
-                if bytes[j] != b'\n' && bytes[j] != b'\r' {
+                if bytes[j] == b'\n' {
+                    // Перевод строки внутри многострочного литерала. Платформа
+                    // разрешает вставлять между строками-продолжениями (`|`)
+                    // обычные комментарии. Кавычка в таком комментарии литерал
+                    // НЕ закрывает — иначе всё, что ниже, инвертируется:
+                    // код считается строкой, а текст запроса кодом.
+                    j += 1;
+                    let mut k = j;
+                    while k < bytes.len() && (bytes[k] == b' ' || bytes[k] == b'\t') {
+                        k += 1;
+                    }
+                    if k + 1 < bytes.len() && bytes[k] == b'/' && bytes[k + 1] == b'/' {
+                        while k < bytes.len() && bytes[k] != b'\n' {
+                            if bytes[k] != b'\r' {
+                                out[k] = b' ';
+                            }
+                            k += 1;
+                        }
+                        j = k;
+                    }
+                    continue;
+                }
+                if bytes[j] != b'\r' {
                     out[j] = b' ';
                 }
                 j += 1;
@@ -512,14 +594,25 @@ pub(crate) fn check_new_expressions(index: &PlatformIndex, src: &str, errors: &m
 /// Проверка глобальных вызовов `Имя(args)` в тексте (уже замаскированном от
 /// строк/комментариев). `user_symbols` — необязательный whitelist имён своих
 /// процедур/функций (в lowercase), извлечённых из модуля вызывающим слоем
-/// (см. `module::validate_module_impl`). Если вызов попадает в whitelist —
+/// (см. `module::validate_module_at_level`). Если вызов попадает в whitelist —
 /// пропускаем без проверки. Для `validate_expression` передаётся `None`.
+///
+/// `strict_unknown` включает СТРОГИЙ режим: вызов, которого нет ни в whitelist,
+/// ни в платформе, и который ни на что не похож, эмиттится как
+/// `UndeclaredMethod`. Правомерен только для ЦЕЛОГО модуля, и только если это
+/// не модуль расширения (там половина имён приходит из расширяемого модуля,
+/// текста которого у валидатора нет).
 pub(crate) fn check_global_calls(
     index: &PlatformIndex,
     src: &str,
     user_symbols: Option<&HashSet<String>>,
+    strict_unknown: bool,
     errors: &mut Vec<ExprError>,
 ) {
+    // Методы собственного объекта/формы зовутся из его модуля без префикса.
+    // Строим один раз на модуль: обход всех типов дороже одной проверки вызова.
+    let type_methods = strict_unknown.then(|| index.all_type_method_names());
+
     for cap in global_call_re().captures_iter(src) {
         let head_match = cap.name("head").unwrap();
         let head = head_match.as_str();
@@ -536,6 +629,10 @@ pub(crate) fn check_global_calls(
                 continue;
             }
             if !is_safe_left_boundary(src, start) {
+                continue;
+            }
+            // `Новый Массив(10)` — конструктор, а не вызов метода.
+            if preceded_by_new(src, start) {
                 continue;
             }
         }
@@ -566,25 +663,47 @@ pub(crate) fn check_global_calls(
             // либо процедура общего модуля/БСП (валидатор её не видит). Различаем
             // по расстоянию: сильное сходство → High (уверенно опечатка), слабое →
             // Low (возможная опечатка), далёкое → молча пропускаем.
-            if let Some((suggestion, distance)) =
-                closest_global_method_with_distance(index, head)
+            let fuzzy = closest_global_method_with_distance(index, head)
+                .and_then(|(s, d)| fuzzy_confidence_for(head, &s, d).map(|c| (s, c)));
+            if let Some((suggestion, confidence)) = fuzzy {
+                let (line, col) = pos_at(src, head_match.start());
+                errors.push(ExprError::new_with_confidence(
+                    line,
+                    col,
+                    ExprErrorKind::UnknownGlobalMethod,
+                    format!(
+                        "Глобальный метод '{}' не найден в платформенном контексте. \
+                         Возможно, вы имели в виду '{}'.",
+                        head, suggestion
+                    ),
+                    confidence,
+                    Some(suggestion),
+                    Vec::new(),
+                ));
+            } else if strict_unknown
+                && !type_methods
+                    .as_ref()
+                    .is_some_and(|m| m.contains(&head.to_lowercase()))
             {
-                if let Some(confidence) = fuzzy_confidence_for(head, &suggestion, distance) {
-                    let (line, col) = pos_at(src, head_match.start());
-                    errors.push(ExprError::new_with_confidence(
-                        line,
-                        col,
-                        ExprErrorKind::UnknownGlobalMethod,
-                        format!(
-                            "Глобальный метод '{}' не найден в платформенном контексте. \
-                             Возможно, вы имели в виду '{}'.",
-                            head, suggestion
-                        ),
-                        confidence,
-                        Some(suggestion),
-                        Vec::new(),
-                    ));
-                }
+                // Целый модуль: вызов не объявлен здесь, не платформенный, не метод
+                // какого-либо платформенного типа и ни на что не похож. Процедуры
+                // общих модулей вызываются через точку и сюда не попадают, поэтому
+                // остаётся описка либо забытое объявление. Исключение — глобальные
+                // общие модули (флаг «Глобальный»): их процедуры зовутся без
+                // префикса, валидатор их не видит и даст здесь false-positive.
+                let (line, col) = pos_at(src, head_match.start());
+                errors.push(ExprError::new_with_confidence(
+                    line,
+                    col,
+                    ExprErrorKind::UndeclaredMethod,
+                    format!(
+                        "Метод '{}' не объявлен в этом модуле и не найден в платформенном контексте.",
+                        head
+                    ),
+                    Confidence::High,
+                    None,
+                    Vec::new(),
+                ));
             }
             continue;
         };
@@ -651,6 +770,20 @@ fn is_bsl_keyword(s: &str) -> bool {
             | "функция"
             | "конецфункции"
             | "возврат"
+            | "пока"
+            | "для"
+            | "каждого"
+            | "из"
+            | "по"
+            | "попытка"
+            | "исключение"
+            | "конецпопытки"
+            | "вызватьисключение"
+            | "прервать"
+            | "продолжить"
+            | "перем"
+            | "экспорт"
+            | "знач"
             | "и"
             | "или"
             | "не"
@@ -678,6 +811,17 @@ fn is_bsl_keyword(s: &str) -> bool {
             | "true"
             | "false"
             | "new"
+            | "try"
+            | "except"
+            | "endtry"
+            | "raise"
+            | "break"
+            | "continue"
+            | "var"
+            | "export"
+            | "val"
+            | "in"
+            | "to"
     )
 }
 
@@ -694,6 +838,25 @@ fn is_safe_left_boundary(src: &str, byte_idx: usize) -> bool {
         Some(c) if c.is_alphanumeric() || c == '_' => false,
         _ => true,
     }
+}
+
+/// Слева от `byte_idx` (через пробелы) стоит ключевое слово `Новый`/`New`?
+///
+/// Тогда `Массив(10)` — не вызов метода, а конструктор `Новый Массив(10)`.
+/// Такие узлы проверяет `check_new_expressions`, а `check_global_calls` обязан
+/// их пропустить: в строгом режиме иначе каждый конструктор станет ошибкой.
+fn preceded_by_new(src: &str, byte_idx: usize) -> bool {
+    let prefix = src[..byte_idx].trim_end();
+    let word = prefix
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| c.is_alphanumeric() || *c == '_')
+        .last()
+        .map(|(i, _)| &prefix[i..]);
+    matches!(
+        word.map(str::to_lowercase).as_deref(),
+        Some("новый") | Some("new")
+    )
 }
 
 fn pos_at(src: &str, byte_idx: usize) -> (u32, u32) {
@@ -829,6 +992,10 @@ fn closest_global_method_with_distance(
 ///    Это осознанно другое, более длинное имя (`СтрокаТЧ` = `Строка` + `ТЧ`,
 ///    `Сообщить2` = `Сообщить` + `2`), а не опечатка. Опечатка приписыванием
 ///    одной буквы (`Строкаа`) под правило не попадает и по-прежнему ловится.
+/// 3. Симметрично: `suggestion` — строгий конец `head`, а приставка это цифры,
+///    2+ символа (`тзСтрока`, `ТЗСтрока`) либо одна строчная буква перед
+///    заглавной (`тФормат` — венгерская нотация). Удвоение первой буквы
+///    (`ССообщить`, `ФФормат`) под правило не попадает и по-прежнему ловится.
 pub(crate) fn fuzzy_confidence_for(
     head: &str,
     suggestion: &str,
@@ -840,6 +1007,20 @@ pub(crate) fn fuzzy_confidence_for(
     if let Some(suffix) = strip_prefix_ci(head, suggestion) {
         let all_digits = !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit());
         if all_digits || suffix.chars().count() >= 2 {
+            return None;
+        }
+    }
+    if let Some(prefix) = strip_suffix_ci(head, suggestion) {
+        let all_digits = !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_digit());
+        if all_digits || prefix.chars().count() >= 2 {
+            return None;
+        }
+        // Приставка ровно из одного символа. Строчная буква перед заглавной —
+        // венгерская нотация (`тФормат`), а не опечатка. Заглавная приставка —
+        // удвоение первой буквы (`ССообщить`), её по-прежнему ловим.
+        let starts_lowercase = prefix.chars().next().is_some_and(char::is_lowercase);
+        let next_is_uppercase = head.chars().nth(1).is_some_and(char::is_uppercase);
+        if starts_lowercase && next_is_uppercase {
             return None;
         }
     }
@@ -864,6 +1045,20 @@ fn strip_prefix_ci(head: &str, prefix: &str) -> Option<String> {
         return None;
     }
     head_lc.strip_prefix(&prefix_lc).map(|s| s.to_string())
+}
+
+/// Если `suffix` — строгий конец `head` (регистронезависимо), вернуть приставку
+/// в ИСХОДНОМ регистре: вызывающему нужно отличить `тФормат` от `ФФормат`.
+/// Равные строки дают `None`: приставки нет, это не «имя с приставкой».
+fn strip_suffix_ci(head: &str, suffix: &str) -> Option<String> {
+    let head_lc = head.to_lowercase();
+    let suffix_lc = suffix.to_lowercase();
+    if suffix_lc.is_empty() || head_lc == suffix_lc {
+        return None;
+    }
+    head_lc.strip_suffix(&suffix_lc)?;
+    let prefix_len = head.chars().count().checked_sub(suffix.chars().count())?;
+    Some(head.chars().take(prefix_len).collect())
 }
 
 fn similarity(a: &str, b: &str) -> f32 {
@@ -991,6 +1186,7 @@ mod tests {
 
     // ── fuzzy_confidence_for: дефект хотфикса 0.5.1 ─────────────────────────
 
+    /// ВРЕМЕННЫЙ: где маскировка пропускает слова языка запросов.
     #[test]
     fn fuzzy_zero_distance_is_silent() {
         assert_eq!(fuzzy_confidence_for("Сообщить", "Сообщить", 0), None);
@@ -1019,6 +1215,28 @@ mod tests {
         // Приписана одна буква — это правдоподобная опечатка, не суффикс.
         assert_eq!(
             fuzzy_confidence_for("Строкаа", "Строка", 1),
+            Some(Confidence::High)
+        );
+    }
+
+    #[test]
+    fn fuzzy_deliberate_prefix_is_not_a_typo() {
+        // Кандидат — строгий конец имени: венгерская нотация, не опечатка.
+        assert_eq!(fuzzy_confidence_for("тФормат", "Формат", 1), None);
+        assert_eq!(fuzzy_confidence_for("тзСтрока", "Строка", 2), None);
+        assert_eq!(fuzzy_confidence_for("ТЗСтрока", "Строка", 2), None);
+        assert_eq!(fuzzy_confidence_for("1Формат", "Формат", 1), None);
+    }
+
+    #[test]
+    fn fuzzy_first_letter_doubling_still_caught() {
+        // Удвоена первая буква — приставка заглавная, это опечатка.
+        assert_eq!(
+            fuzzy_confidence_for("ССообщить", "Сообщить", 1),
+            Some(Confidence::High)
+        );
+        assert_eq!(
+            fuzzy_confidence_for("ФФормат", "Формат", 1),
             Some(Confidence::High)
         );
     }

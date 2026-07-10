@@ -4,7 +4,8 @@
 //! а не отдельная категория. Поэтому `types` — единый словарь, в котором
 //! и обычные типы, и перечисления (последние с непустым `enum_values`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 use crate::entities::{Method, Property, Type};
 
@@ -15,6 +16,10 @@ pub struct PlatformIndex {
     pub global_properties: Vec<Property>,
     /// Ключ — `name_ru` в нижнем регистре. Тип-перечисление и обычный тип лежат вместе.
     pub types: HashMap<String, Type>,
+    /// Ленивый кэш имён методов всех типов (см. `all_type_method_names`).
+    /// Обход 2414 типов стоит десятки миллисекунд — на каждый вызов
+    /// `validate_module` это заметно, а индекс после загрузки неизменен.
+    type_method_names: OnceLock<HashSet<String>>,
 }
 
 impl PlatformIndex {
@@ -52,6 +57,33 @@ impl PlatformIndex {
         self.global_properties
             .iter()
             .find(|p| p.name_ru.to_lowercase() == key)
+    }
+
+    /// Имена (lowercase, русские и английские) ВСЕХ методов ВСЕХ типов платформы.
+    ///
+    /// Нужны строгой проверке модуля: внутри собственного модуля объекта или
+    /// формы её методы зовутся без префикса — `Закрыть()`, `ЭтоНовый()`,
+    /// `РеквизитФормыВЗначение(...)`. Это не глобальные методы, поэтому
+    /// `find_global_method` их не видит, но опиской они не являются. Какой
+    /// именно тип соответствует модулю, известно только из метаданных
+    /// конфигурации, которых у платформенного индекса нет, — поэтому берём
+    /// объединение по всем типам.
+    /// Считается один раз при первом обращении и кэшируется: индекс после
+    /// загрузки не меняется, а обход всех типов на каждый вызов валидатора
+    /// съедал заметное время.
+    pub fn all_type_method_names(&self) -> &HashSet<String> {
+        self.type_method_names.get_or_init(|| {
+            let mut names = HashSet::new();
+            for ty in self.types.values() {
+                for m in &ty.methods {
+                    names.insert(m.name_ru.to_lowercase());
+                    if !m.name_en.is_empty() {
+                        names.insert(m.name_en.to_lowercase());
+                    }
+                }
+            }
+            names
+        })
     }
 
     /// Вставка типа в storage. Перезаписывает по ключу `name_ru.lowercase()`.

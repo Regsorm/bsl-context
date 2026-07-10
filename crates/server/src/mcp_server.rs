@@ -10,8 +10,7 @@
 use std::sync::Arc;
 
 use bsl_validator::{
-    validate_enum, validate_expression_with_profile, validate_method_call,
-    validate_module_with_profile, Profile,
+    validate_enum, validate_method_call, validate_module_with_profile, Profile,
 };
 use platform_index::{format, Definition, PlatformIndex, SearchEngine};
 use rmcp::{
@@ -26,11 +25,11 @@ use serde::{Deserialize, Serialize};
 pub struct BslContextServer {
     pub index: Arc<PlatformIndex>,
     pub engine: Arc<SearchEngine>,
-    /// Дефолтный уровень валидации, если клиент не передал `level` в `validate_expression`.
+    /// Дефолтный уровень валидации, если клиент не передал `level` в `validate_module`.
     /// Берётся из `config.toml` (поле `default_validation_level`), кламп в `[1..=2]`.
     pub default_validation_level: u8,
     /// Дефолтный профиль потребителя, если клиент не передал `profile`
-    /// в `validate_expression`. Берётся из `config.toml` (поле `default_profile`).
+    /// в `validate_module`. Берётся из `config.toml` (поле `default_profile`).
     pub default_profile: Profile,
     tool_router: ToolRouter<Self>,
 }
@@ -117,35 +116,26 @@ pub struct ValidateMethodCallParams {
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ValidateModuleParams {
-    /// Текст ЦЕЛОГО BSL-модуля (общий модуль, модуль объекта, модуль формы и т.п.).
-    /// В отличие от `validate_expression`, здесь валидатор сам извлекает
-    /// объявленные в модуле процедуры/функции через tree-sitter и не путает их
-    /// вызовы с опечатками платформенных методов.
-    #[serde(alias = "bslModule", alias = "module", alias = "code")]
-    pub source: String,
-    /// Уровень валидации — семантика та же, что у `validate_expression`
-    /// (1 — базовый, 2 — с local type inference, 3 — с return-type tracking).
-    /// Клампится в `[1..=3]`.
-    pub level: Option<u8>,
-    /// Профиль потребителя — `"full"` (все находки) / `"strict"` (только High
-    /// + форсированный level=1). Семантика та же, что у `validate_expression`.
-    pub profile: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct ValidateExpressionParams {
-    /// Фрагмент BSL-кода (выражение, оператор или несколько строк).
-    #[serde(alias = "bslSnippet", alias = "snippet", alias = "code")]
+    /// Текст BSL: целый модуль (общий модуль, модуль объекта, модуль формы) либо
+    /// произвольный фрагмент. У целого модуля валидатор сам извлекает через
+    /// tree-sitter объявленные процедуры/функции и не путает их вызовы с
+    /// опечатками платформенных методов; у фрагмента этот список просто пуст.
+    #[serde(
+        alias = "bslModule",
+        alias = "module",
+        alias = "bslSnippet",
+        alias = "snippet",
+        alias = "code"
+    )]
     pub source: String,
     /// Уровень валидации:
     /// `1` (default) — статический анализ ссылок с явным именем типа в исходнике;
     /// `2` — дополнительно локальный type inference (Phase 8 MVP) для переменных,
     /// присвоенных через `Новый`, `ТипX.ЗначениеY` или аннотацию `// @type ТипX`;
     /// `3` — дополнительно return-type tracking (Уровень 2.5): тип переменной из
-    /// возвращаемого типа метода/свойства и цепочек `Запрос.Выполнить().Выбрать()`,
-    /// а при заданном `base` — реквизиты справочников/документов из метаданных
-    /// конфигурации. Чем выше уровень, тем больше находок и потенциальных
-    /// false-positive — поэтому за флагом.
+    /// возвращаемого типа метода/свойства и цепочек `Запрос.Выполнить().Выбрать()`.
+    /// Чем выше уровень, тем больше находок и потенциальных false-positive —
+    /// поэтому за флагом. Клампится в `[1..=3]`.
     pub level: Option<u8>,
     /// Профиль потребителя (карточка-decision #1230):
     /// `"full"` (default) — все находки, `level` как передан; для сильной модели,
@@ -283,38 +273,17 @@ impl BslContextServer {
     }
 
     #[tool(
-        description = "Phase 6 (Уровень 1): валидация BSL-фрагмента против платформенного контекста. \
-                       Ловит несуществующие значения системных перечислений, неизвестные платформенные типы в \
-                       'Новый ТипX', неверное число аргументов глобальных функций. Не делает inter-procedural \
-                       type inference (это Уровень 2/3, пост-MVP). У каждой находки есть поле confidence \
-                       (high/low). Параметр profile: 'strict' (только high-confidence + level=1, для слабых \
-                       моделей) или 'full' (все находки, default). Возвращает JSON \
+        description = "Валидация BSL-кода против платформенного контекста. Принимает и целый модуль, \
+                       и отдельный фрагмент. Ловит: несуществующие значения системных перечислений; \
+                       неизвестные платформенные типы в 'Новый ТипX'; неверное число аргументов \
+                       глобальных функций; опечатки платформенных методов и директив (fuzzy-сходство). \
+                       Объявленные в самом тексте Процедура/Функция извлекаются через tree-sitter, их \
+                       вызовы не считаются опечатками. У каждой находки есть поле confidence (high/low). \
+                       Параметр level: 1 (default) — только явные имена типов; 2 — плюс локальный вывод \
+                       типа переменных; 3 — плюс тип из возвращаемых значений. Параметр profile: 'strict' \
+                       (только high-confidence + level=1, для слабых моделей) или 'full' (все находки, \
+                       default). Возвращает JSON \
                        {valid, errors:[{line,col,kind,confidence,message,suggestion?}]}."
-    )]
-    pub async fn validate_expression(
-        &self,
-        Parameters(p): Parameters<ValidateExpressionParams>,
-    ) -> String {
-        let level = p
-            .level
-            .unwrap_or(self.default_validation_level)
-            .clamp(1, 3);
-        let profile = match p.profile {
-            Some(ref s) => Profile::parse_or_default(Some(s)),
-            None => self.default_profile,
-        };
-        let result = validate_expression_with_profile(&self.index, &p.source, level, profile);
-        serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
-    }
-
-    #[tool(
-        description = "Валидация ЦЕЛОГО BSL-модуля против платформенного контекста. Отличие от \
-                       validate_expression: сервер сам через tree-sitter извлекает объявления \
-                       Процедура/Функция и не считает их вызовы опечатками платформенных методов. \
-                       Ловит: несуществующие enum-значения; неизвестные типы в 'Новый'; неверное \
-                       число аргументов глобальных функций; опечатки платформенных методов \
-                       (fuzzy-сходство). Уровни/профили — как у validate_expression. Возвращает \
-                       JSON {valid, errors:[{line,col,kind,confidence,message,suggestion?}]}."
     )]
     pub async fn validate_module(
         &self,
