@@ -7,10 +7,15 @@
 //! Phase 5 (когда подключим валидаторы) — добавит `validateEnum`,
 //! `validateMethodCall`. Phase 6 — `validateExpression`.
 
+use std::collections::BTreeSet;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use anyhow::Context;
 use bsl_validator::{
-    validate_enum, validate_method_call, validate_module_with_profile, Profile,
+    validate_enum, validate_method_call, validate_module_with_profile,
+    validate_module_with_symbols, Profile, SymbolSource,
 };
 use platform_index::{format, Definition, PlatformIndex, SearchEngine};
 use rmcp::{
@@ -31,6 +36,18 @@ pub struct BslContextServer {
     /// Дефолтный профиль потребителя, если клиент не передал `profile`
     /// в `validate_module`. Берётся из `config.toml` (поле `default_profile`).
     pub default_profile: Profile,
+    /// Внешний источник имён. Под `RwLock`, потому что `rebuild_symbol_index`
+    /// подменяет его на ходу. `tokio`-версия: блокировка переживает `await`
+    /// вокруг сборки индекса.
+    pub symbol_source: Arc<tokio::sync::RwLock<Option<Arc<dyn SymbolSource>>>>,
+    /// Конфиг источника — нужен `rebuild_symbol_index`, чтобы взять пути.
+    /// Клиент путей не передаёт: что пересобирать, решает конфиг сервера.
+    pub symbol_source_config: crate::config::SymbolSourceConfig,
+    /// Идёт ли сейчас пересборка. Две одновременные недопустимы.
+    rebuilding: Arc<AtomicBool>,
+    /// Белый список инструментов из `[tools].enabled`. `None` — фильтр выключен.
+    /// `Arc`, потому что сервер клонируется на каждый запрос.
+    allowed_tools: Option<Arc<BTreeSet<String>>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -55,9 +72,152 @@ impl BslContextServer {
             engine: Arc::new(engine),
             default_validation_level: default_validation_level.clamp(1, 3),
             default_profile,
+            symbol_source: Arc::new(tokio::sync::RwLock::new(None)),
+            symbol_source_config: Default::default(),
+            rebuilding: Arc::new(AtomicBool::new(false)),
+            allowed_tools: None,
             tool_router: Self::tool_router(),
         }
     }
+
+    /// Подключить внешний источник имён (см. крейт `symbol-source`). Без
+    /// вызова `validate_module` работает без внешнего контекста конфигурации.
+    pub fn with_symbol_source(mut self, source: Option<Arc<dyn SymbolSource>>) -> Self {
+        self.symbol_source = Arc::new(tokio::sync::RwLock::new(source));
+        self
+    }
+
+    /// Конфиг источника (пути для пересборки). Без него `rebuild_symbol_index` откажет.
+    pub fn with_symbol_source_config(mut self, cfg: crate::config::SymbolSourceConfig) -> Self {
+        self.symbol_source_config = cfg;
+        self
+    }
+
+    /// Применить белый список инструментов (`[tools].enabled` из config.toml).
+    ///
+    /// Пустой список — фильтр выключен, доступны все инструменты. Неизвестные
+    /// имена старту не мешают: пишется предупреждение, сервер работает (иначе
+    /// опечатка в конфиге роняла бы сервис).
+    pub fn apply_tools_whitelist(mut self, enabled: &[String]) -> Self {
+        if enabled.is_empty() {
+            tracing::info!("[tools].enabled пуст — белый список выключен, доступны все инструменты");
+            return self;
+        }
+        let known: BTreeSet<String> = self
+            .tool_router
+            .list_all()
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        let allowed: BTreeSet<String> = enabled.iter().cloned().collect();
+        let unknown: Vec<&str> = allowed
+            .iter()
+            .filter(|n| !known.contains(*n))
+            .map(|s| s.as_str())
+            .collect();
+        if !unknown.is_empty() {
+            tracing::warn!(
+                ?unknown,
+                "[tools].enabled содержит неизвестные имена инструментов (опечатка?) — они ни на что не повлияют"
+            );
+        }
+        tracing::info!(
+            known = allowed.len() - unknown.len(),
+            listed = allowed.len(),
+            "[tools].enabled — белый список активен"
+        );
+        self.allowed_tools = Some(Arc::new(allowed));
+        self
+    }
+
+    /// Разрешён ли инструмент белым списком. Без списка — разрешено всё.
+    pub fn is_tool_allowed(&self, name: &str) -> bool {
+        match &self.allowed_tools {
+            Some(allowed) => allowed.contains(name),
+            None => true,
+        }
+    }
+
+    /// Собрать индекс во временный файл, снять старый источник, подменить файл,
+    /// открыть новый. Старый источник снимается ДО подмены: SQLite держит файл
+    /// открытым, и на Windows переименовать поверх него нельзя.
+    async fn rebuild_inner(&self, root: &Path, db_path: &Path) -> anyhow::Result<String> {
+        if let Some(dir) = db_path.parent() {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("не удалось создать каталог {}", dir.display()))?;
+        }
+        let tmp = db_path.with_extension("db.tmp");
+
+        let (root_c, tmp_c) = (root.to_path_buf(), tmp.clone());
+        let build = tokio::task::spawn_blocking(move || lite_index::build(&root_c, &tmp_c, 0))
+            .await
+            .context("задача сборки индекса упала")?;
+        let stats = match build {
+            Ok(stats) => stats,
+            Err(e) => {
+                // Недособранный временный файл — мусор, рабочая база не тронута.
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
+        };
+
+        // Блокировка на запись: текущие валидации дождутся, новые подождут нас.
+        let mut guard = self.symbol_source.write().await;
+        *guard = None; // закрывает старую базу — иначе Windows не даст её заменить
+
+        let (tmp_c, db_c) = (tmp.clone(), db_path.to_path_buf());
+        let swapped = tokio::task::spawn_blocking(move || -> anyhow::Result<symbol_source::LiteSource> {
+            if db_c.exists() {
+                std::fs::remove_file(&db_c)
+                    .with_context(|| format!("не удалось удалить старую базу {}", db_c.display()))?;
+            }
+            std::fs::rename(&tmp_c, &db_c)
+                .with_context(|| format!("не удалось переместить {} → {}", tmp_c.display(), db_c.display()))?;
+            symbol_source::LiteSource::open(&db_c).context("не удалось открыть свежий индекс")
+        })
+        .await
+        .context("задача подмены индекса упала")?;
+
+        let source = match swapped {
+            Ok(source) => source,
+            Err(e) => {
+                // Подмена не удалась. Источник уже снят — пробуем вернуть прежнюю
+                // базу, если файл на месте: иначе сервер останется без источника
+                // до перезапуска, хотя валидация могла бы продолжать работать.
+                if db_path.exists() {
+                    match symbol_source::LiteSource::open(db_path) {
+                        Ok(old) => {
+                            *guard = Some(Arc::new(old) as Arc<dyn SymbolSource>);
+                            tracing::warn!(error = %e, "пересборка не удалась — вернулись к прежнему индексу");
+                        }
+                        Err(reopen) => {
+                            tracing::error!(error = %reopen, "прежний индекс не открывается — источник отключён");
+                        }
+                    }
+                }
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
+        };
+
+        *guard = Some(Arc::new(source) as Arc<dyn SymbolSource>);
+        drop(guard);
+
+        Ok(serde_json::json!({
+            "ok": true,
+            "modules": stats.modules,
+            "methods": stats.methods,
+            "global_modules": stats.global_modules,
+            "elapsed_ms": stats.elapsed_ms,
+            "db_path": db_path.display().to_string(),
+        })
+        .to_string())
+    }
+}
+
+/// Отказ инструмента: не паника и не пустой ответ, а внятная причина.
+fn err_json(message: &str) -> String {
+    serde_json::json!({"ok": false, "message": message}).to_string()
 }
 
 // ── Параметры tools ────────────────────────────────────────────────────────
@@ -145,6 +305,10 @@ pub struct ValidateModuleParams {
     /// (LibreChat/DeepSeek), чтобы ложное срабатывание не приводило к зацикливанию.
     /// Неизвестное значение трактуется как `"full"`.
     pub profile: Option<String>,
+    /// Относительный путь модуля в выгрузке; нужен, чтобы учесть экспортные
+    /// методы модуля объекта-владельца внешней обработки.
+    #[serde(alias = "modulePath")]
+    pub module_path: Option<String>,
 }
 
 // ── Tools ──────────────────────────────────────────────────────────────────
@@ -297,7 +461,19 @@ impl BslContextServer {
             Some(ref s) => Profile::parse_or_default(Some(s)),
             None => self.default_profile,
         };
-        let result = validate_module_with_profile(&self.index, &p.source, level, profile);
+        let guard = self.symbol_source.read().await;
+        let result = match guard.as_ref() {
+            Some(source) => validate_module_with_symbols(
+                &self.index,
+                &p.source,
+                level,
+                profile,
+                p.module_path.as_deref(),
+                Some(source.as_ref()),
+            ),
+            None => validate_module_with_profile(&self.index, &p.source, level, profile),
+        };
+        drop(guard);
         serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
     }
 
@@ -316,6 +492,41 @@ impl BslContextServer {
             );
         }
         format::format_enum_values(&ty.enum_values, &ty.name_ru)
+    }
+
+    #[tool(
+        description = "Пересобрать облегчённый индекс имён конфигурации. Работает только при \
+                       symbol_source.kind = \"lite\". Пути берутся ИЗ КОНФИГА сервера: `root` — \
+                       каталог выгрузки, `db_path` — файл базы (каталог создаётся, если его нет). \
+                       Сборка идёт во временный файл и подменяет старую базу целиком: если она \
+                       упадёт, рабочая база останется прежней. Возвращает JSON \
+                       {ok, modules, methods, global_modules, elapsed_ms, db_path} либо {ok:false, message}."
+    )]
+    pub async fn rebuild_symbol_index(&self) -> String {
+        let cfg = self.symbol_source_config.clone();
+        // 1. Пересобирать имеет смысл только собственный индекс.
+        if cfg.kind != "lite" {
+            return err_json(&format!(
+                "symbol_source.kind = \"{}\": источник читает чужой индекс, пересобирать нечего",
+                cfg.kind
+            ));
+        }
+        let (Some(root), Some(db_path)) = (cfg.root.clone(), cfg.db_path.clone()) else {
+            return err_json("для пересборки нужны symbol_source.root и symbol_source.db_path в config.toml");
+        };
+        if !root.is_dir() {
+            return err_json(&format!("symbol_source.root = {} — каталога нет", root.display()));
+        }
+        // 2. Одна сборка за раз.
+        if self.rebuilding.swap(true, Ordering::SeqCst) {
+            return err_json("пересборка уже идёт");
+        }
+        let result = self.rebuild_inner(&root, &db_path).await;
+        self.rebuilding.store(false, Ordering::SeqCst);
+        match result {
+            Ok(json) => json,
+            Err(e) => err_json(&format!("{e:#}")),
+        }
     }
 }
 
@@ -342,8 +553,10 @@ impl ServerHandler for BslContextServer {
         _request: Option<rmcp::model::PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
+        let mut tools = self.tool_router.list_all();
+        tools.retain(|t| self.is_tool_allowed(t.name.as_ref()));
         let mut result = rmcp::model::ListToolsResult::default();
-        result.tools = self.tool_router.list_all();
+        result.tools = tools;
         Ok(result)
     }
 
@@ -352,6 +565,18 @@ impl ServerHandler for BslContextServer {
         request: rmcp::model::CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        // Проверка белого списка ДО диспетча: модель может позвать инструмент,
+        // которого не было в `tools/list` (из системного промпта, из памяти).
+        // Намеренно дублирует фильтр в `list_tools`.
+        if !self.is_tool_allowed(request.name.as_ref()) {
+            return Err(rmcp::ErrorData::invalid_params(
+                format!(
+                    "инструмент '{}' отключён белым списком [tools].enabled в config.toml",
+                    request.name
+                ),
+                None,
+            ));
+        }
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         self.tool_router.call(tcc).await
     }

@@ -7,6 +7,7 @@ description = "Валидатор BSL-выражений: tree-sitter → изв
 
 [dependencies]
 platform-index = { path = "../platform-index" }
+bsl-parse = { path = "../bsl-parse" }
 tree-sitter = { workspace = true }
 tree-sitter-bsl = { workspace = true }
 serde = { workspace = true }

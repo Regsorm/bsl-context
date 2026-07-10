@@ -200,3 +200,67 @@ async fn validate_method_call_accepts_normal_call() {
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(v["valid"], true);
 }
+
+#[tokio::test]
+async fn tools_whitelist_hides_and_blocks_tools() {
+    let Some(srv) = make_server().await else {
+        eprintln!("skip: hbk не найден");
+        return;
+    };
+    // Без белого списка доступно всё.
+    assert!(srv.is_tool_allowed("search"));
+    assert!(srv.is_tool_allowed("validate_module"));
+
+    // Неизвестное имя в списке не роняет сервер и ничего не разрешает.
+    // Клонируем, а не грузим hbk второй раз: загрузка индекса — десятки секунд.
+    let srv2 = srv.clone().apply_tools_whitelist(&[
+        "validate_module".to_string(),
+        "нет_такого_инструмента".to_string(),
+    ]);
+    assert!(srv2.is_tool_allowed("validate_module"));
+    assert!(!srv2.is_tool_allowed("search"));
+
+    // С белым списком — только перечисленное.
+    let srv = srv.apply_tools_whitelist(&["validate_module".to_string()]);
+    assert!(srv.is_tool_allowed("validate_module"));
+    assert!(!srv.is_tool_allowed("search"));
+}
+
+#[tokio::test]
+async fn rebuild_symbol_index_refuses_when_source_is_not_lite() {
+    let Some(srv) = make_server().await else { eprintln!("skip: hbk не найден"); return; };
+    // Конфига источника нет → kind по умолчанию "none".
+    let json = srv.rebuild_symbol_index().await;
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["ok"], false);
+    assert!(v["message"].as_str().unwrap().contains("пересобирать нечего"));
+}
+
+#[tokio::test]
+async fn rebuild_symbol_index_builds_database_and_creates_directory() {
+    let Some(srv) = make_server().await else { eprintln!("skip: hbk не найден"); return; };
+    let root = std::path::Path::new(r"C:\RepoWMS");
+    if !root.exists() { eprintln!("skip: корпуса RepoWMS нет"); return; }
+    // Каталога заведомо нет — инструмент обязан его создать.
+    let dir = std::env::temp_dir().join("bslctx_rebuild_test").join("nested");
+    let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    let db = dir.join("wms_lite.db");
+
+    let mut cfg = bsl_context_server::config::SymbolSourceConfig::default();
+    cfg.kind = "lite".to_string();
+    cfg.root = Some(root.to_path_buf());
+    cfg.db_path = Some(db.clone());
+    let srv = srv.with_symbol_source_config(cfg);
+
+    let json = srv.rebuild_symbol_index().await;
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["ok"], true, "ответ: {json}");
+    assert!(v["modules"].as_u64().unwrap() > 0);
+    assert!(db.exists(), "база не создана");
+    // Источник подменён в памяти.
+    assert!(srv.symbol_source.read().await.is_some());
+    // Временный файл убран.
+    assert!(!db.with_extension("db.tmp").exists());
+
+    let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+}

@@ -4,12 +4,15 @@ members = [
     "crates/hbk-reader",
     "crates/hbk-parser",
     "crates/platform-index",
+    "crates/bsl-parse",
     "crates/bsl-validator",
+    "crates/lite-index",
+    "crates/symbol-source",
     "crates/server",
 ]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 license = "MIT"
 description = "MCP-сервер контекста платформы 1С (типы, методы, перечисления + валидация BSL-кода)"

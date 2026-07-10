@@ -1,0 +1,20 @@
+[package]
+name = "symbol-source"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Источники имён методов конфигурации: свой lite-индекс, база code-index, MCP-сервер code-index"
+
+[dependencies]
+bsl-validator = { path = "../bsl-validator" }
+lite-index    = { path = "../lite-index" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { workspace = true }
+serde_json = "1"
+anyhow = { workspace = true }
+tracing = { workspace = true }
+ureq = { version = "2", features = ["json"] }
+zstd = "0.13"
+
+[dev-dependencies]
+tempfile = { workspace = true }

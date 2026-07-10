@@ -151,6 +151,72 @@ otherwise networked requests get `403 Forbidden: Host header is not allowed`:
 allowed_hosts = ["localhost", "127.0.0.1", "::1", "<server-ip>"]
 ```
 
+### External source of configuration names
+
+The validator receives the text of a SINGLE module, so a call to a procedure declared
+in another file of the configuration looks like a typo to it. A symbol source fixes
+that: it answers three questions — "does the configuration declare such a method",
+"is it an exported method of a GLOBAL common module", and "which exported methods does
+the owner object module of an external data processor have".
+
+Measured on the UT configuration (14905 modules): without a source — 1420 high-confidence
+`undeclared_method` findings; with one — 44, of which exactly one is real.
+
+Three ways to connect it, same result:
+
+```toml
+# 1. Own lightweight index. The server stays self-contained.
+[symbol_source]
+kind = "lite"
+root = 'C:\RepoUT'                          # configuration dump directory
+db_path = 'C:\tools\bsl-context\ut_lite.db' # database file; the directory is created for you
+```
+
+The database is built by the `rebuild_symbol_index` tool — call it after the first start
+and after every change to the configuration. It takes no parameters: the paths come from
+the config. While it runs, validation keeps using the previous database; if the build
+fails, the previous database stays intact. The same can be done from the command line:
+`bsl-lite-index build --root <dump> --db <file.db>` (the directory must already exist).
+
+```toml
+# 2. Reading the code-index database directly (same machine only).
+[symbol_source]
+kind = "code_index_db"
+db_path = 'C:\RepoUT\.code-index\index.db'
+```
+
+```toml
+# 3. Through a running code-index service — any machine, by address and port.
+[symbol_source]
+kind = "code_index_mcp"
+url = "http://127.0.0.1:8011/mcp"
+repo = "ut"
+timeout_ms = 5000
+```
+
+With no section (or `kind = "none"`) the validator behaves as before, knowing nothing
+about the configuration.
+
+How they differ. `lite` needs nothing external and answers from memory, but its database
+must be rebuilt after the configuration changes. The `code-index` sources read from that
+index instead — if a file watcher keeps it current, the names are always fresh. The
+"global common module" flag is taken from the module's XML, which `code-index` stores verbatim.
+
+### Tool whitelist
+
+If you only need part of the server's surface, list the tools you want in the
+`[tools]` section. For example, module validation plus two lookup helpers:
+
+```toml
+[tools]
+enabled = ["validate_module", "get_constructors", "get_enum_values"]
+```
+
+A missing section or an empty list means all nine tools are available, as before.
+Hidden tools are absent from `tools/list` and are rejected on a direct call.
+An unknown name does not break startup: it produces a warning in the log and the
+tool simply never appears.
+
 ## Running
 
 ```bash
@@ -174,6 +240,7 @@ Transport — Streamable HTTP at `http://127.0.0.1:8007/mcp` (stateless).
 | `validate_enum` | Validate an enumeration value |
 | `validate_method_call` | Validate a global function's argument count |
 | `validate_module` | Validate BSL code (whole module or fragment) against the platform |
+| `rebuild_symbol_index` | Rebuild the own name index (`kind = "lite"`); paths come from the config |
 
 ## Connecting an MCP client
 

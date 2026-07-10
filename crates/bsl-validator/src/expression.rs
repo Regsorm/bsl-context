@@ -21,15 +21,16 @@
 //! где `"..."` / `|...` / `//...` заменяются на пробелы той же длины: это
 //! сохраняет line/col, но не даёт regex захватить содержимое строк.
 
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::sync::OnceLock;
 
 use platform_index::PlatformIndex;
 
+use bsl_parse::{collect_facts, CallFact, DotFact, NewFact};
+
 use crate::check::{validate_method_call, SimilarValue};
 use crate::scope::{extract_scope_map, extract_type_annotations, ScopeMap};
+use crate::symbols::SymbolSource;
 
 /// Результат валидации выражения.
 #[derive(Debug, Clone, Serialize)]
@@ -213,6 +214,7 @@ pub fn validate_expression_at_level(
 ) -> ExpressionValidation {
     let source = &strip_extension_directives(source);
     let cleaned = mask_strings_and_comments(source);
+    let facts = collect_facts(source);
     let scope_map = if level >= 2 {
         let annotations = extract_type_annotations(source);
         Some(extract_scope_map(index, &cleaned, &annotations, level))
@@ -221,9 +223,10 @@ pub fn validate_expression_at_level(
     };
 
     let mut errors = Vec::new();
-    check_type_dot_members(index, &cleaned, scope_map.as_ref(), &mut errors);
-    check_new_expressions(index, &cleaned, &mut errors);
-    check_global_calls(index, &cleaned, None, false, &mut errors);
+    check_type_dot_members(index, source, &facts.dots, scope_map.as_ref(), &mut errors);
+    check_new_expressions(index, source, &facts.news, &mut errors);
+    check_global_calls(index, source, &facts.calls, None, false, None, None, &mut errors);
+    errors.sort_by_key(|e| (e.line, e.col));
 
     ExpressionValidation {
         valid: errors.is_empty(),
@@ -257,200 +260,31 @@ pub fn validate_expression_with_profile(
 }
 
 // ── Очистка строк и комментариев ──────────────────────────────────────────
-
-/// Замаскировать пробелами строковые литералы и комментарии. Длина и позиции
-/// строк сохраняются — это важно для line/col, передаваемых в ошибки. Русские
-/// буквы и прочие multi-byte UTF-8 символы НЕ трогаются — пробелами заменяются
-/// только байты внутри строк/комментариев (ASCII содержимое).
-/// Убрать директивы препроцессора расширений, сохранив длину строк.
-///
-/// В модуле расширения блок `#Удаление … #КонецУдаления` содержит код исходного
-/// модуля, который расширение выбрасывает: в скомпилированный модуль он не
-/// попадает. Беда в том, что этот код может обрывать строковый литерал на
-/// середине — тогда сам файл перестаёт быть корректным BSL, а маскировка строк
-/// «съезжает» и весь текст запроса ниже начинает считаться кодом (наблюдалось на
-/// `#Удаление` внутри текста запроса: закрывающая кавычка стояла в удаляемой
-/// строке, а вставляемая её не имела).
-///
-/// Поэтому удаляемые строки и сами строки-маркеры затираются пробелами до всякого
-/// разбора. Позиции сохраняются: и номера строк, и колонки остаются прежними.
-pub fn strip_extension_directives(src: &str) -> String {
-    let bytes = src.as_bytes();
-    let mut out = bytes.to_vec();
-    let mut in_deleted = false;
-    let mut pos = 0usize;
-
-    for line in src.split_inclusive('\n') {
-        let body_len = line.trim_end_matches(['\n', '\r']).len();
-        let head = line.trim_start().to_lowercase();
-
-        let starts_delete = head.starts_with("#удаление") || head.starts_with("#delete");
-        let ends_delete = head.starts_with("#конецудаления") || head.starts_with("#enddelete");
-        let is_marker = starts_delete
-            || ends_delete
-            || head.starts_with("#вставка")
-            || head.starts_with("#конецвставки")
-            || head.starts_with("#insert")
-            || head.starts_with("#endinsert");
-
-        if starts_delete {
-            in_deleted = true;
-        }
-        if is_marker || in_deleted {
-            // Затираем побайтно: длина и позиции сохраняются, UTF-8 остаётся валидным.
-            for b in out.iter_mut().take(pos + body_len).skip(pos) {
-                if *b != b'\t' {
-                    *b = b' ';
-                }
-            }
-        }
-        if ends_delete {
-            in_deleted = false;
-        }
-        pos += line.len();
-    }
-
-    String::from_utf8(out).expect("затирание пробелами сохраняет UTF-8 валидность")
-}
-
-pub fn mask_strings_and_comments(src: &str) -> String {
-    let bytes = src.as_bytes();
-    let mut out = bytes.to_vec();
-
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        // Однострочный комментарий //...
-        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
-            let mut j = i;
-            while j < bytes.len() && bytes[j] != b'\n' {
-                if bytes[j] != b'\r' {
-                    out[j] = b' ';
-                }
-                j += 1;
-            }
-            i = j;
-            continue;
-        }
-        // Строка "..."
-        if b == b'"' {
-            out[i] = b' '; // открывающая кавычка
-            let mut j = i + 1;
-            while j < bytes.len() {
-                if bytes[j] == b'"' {
-                    if j + 1 < bytes.len() && bytes[j + 1] == b'"' {
-                        // escaped quote — затираем обе и идём дальше
-                        out[j] = b' ';
-                        out[j + 1] = b' ';
-                        j += 2;
-                        continue;
-                    }
-                    out[j] = b' ';
-                    j += 1;
-                    break;
-                }
-                if bytes[j] == b'\n' {
-                    // Перевод строки внутри многострочного литерала. Платформа
-                    // разрешает вставлять между строками-продолжениями (`|`)
-                    // обычные комментарии. Кавычка в таком комментарии литерал
-                    // НЕ закрывает — иначе всё, что ниже, инвертируется:
-                    // код считается строкой, а текст запроса кодом.
-                    j += 1;
-                    let mut k = j;
-                    while k < bytes.len() && (bytes[k] == b' ' || bytes[k] == b'\t') {
-                        k += 1;
-                    }
-                    if k + 1 < bytes.len() && bytes[k] == b'/' && bytes[k + 1] == b'/' {
-                        while k < bytes.len() && bytes[k] != b'\n' {
-                            if bytes[k] != b'\r' {
-                                out[k] = b' ';
-                            }
-                            k += 1;
-                        }
-                        j = k;
-                    }
-                    continue;
-                }
-                if bytes[j] != b'\r' {
-                    out[j] = b' ';
-                }
-                j += 1;
-            }
-            i = j;
-            continue;
-        }
-        i += 1;
-    }
-
-    String::from_utf8(out).expect("mask_strings_and_comments сохраняет UTF-8 валидность")
-}
-
-// ── Регэксы (cached) ──────────────────────────────────────────────────────
-
-fn type_dot_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        // Слева НЕ должно быть точки или идентификатора (граница), а после
-        // первого Идентификатора.Идентификатора может быть ещё точка — это
-        // Уровень 2/3, мы его не валидируем.
-        Regex::new(r"(?P<head>[A-Za-zА-Яа-яЁё_][A-Za-zА-Яа-яЁё_0-9]*)\.(?P<member>[A-Za-zА-Яа-яЁё_][A-Za-zА-Яа-яЁё_0-9]*)").unwrap()
-    })
-}
-
-fn new_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        // `Новый ИмяТипа` (с опциональной скобкой после, которую захватываем для
-        // подсчёта аргументов в Phase 6.5+).
-        Regex::new(r"(?i)(?:^|[^A-Za-zА-Яа-яЁё_0-9])(Новый|New)\s+(?P<ty>[A-Za-zА-Яа-яЁё_][A-Za-zА-Яа-яЁё_0-9]*)").unwrap()
-    })
-}
-
-fn global_call_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        // `Идентификатор(` где идентификатор не предшествует точке/идентификатору.
-        // Используем lookbehind через alt (regex crate не поддерживает look-around),
-        // поэтому ловим контекст в группе `head` и проверяем post-hoc.
-        Regex::new(r"(?P<head>[A-Za-zА-Яа-яЁё_][A-Za-zА-Яа-яЁё_0-9]*)\s*\(").unwrap()
-    })
-}
+//
+// Перенесены в крейт `bsl-parse` (нужны и внешнему индексатору кода),
+// здесь — публичный реэкспорт для обратной совместимости: на них ссылается
+// bench-код и `scope.rs`.
+pub use bsl_parse::{mask_strings_and_comments, strip_extension_directives};
 
 // ── Проверки ──────────────────────────────────────────────────────────────
 
 pub(crate) fn check_type_dot_members(
     index: &PlatformIndex,
     src: &str,
+    dots: &[DotFact],
     scope_map: Option<&ScopeMap>,
     errors: &mut Vec<ExprError>,
 ) {
-    for cap in type_dot_re().captures_iter(src) {
-        let head_match = cap.name("head").unwrap();
-        let member_match = cap.name("member").unwrap();
-        let head = head_match.as_str();
-        let member = member_match.as_str();
-
-        // Слева НЕ должна быть «.» (это значит, что head — тоже член) или другой
-        // буквенный символ (значит, head попал в середину имени).
-        let prev_idx = head_match.start();
-        if prev_idx > 0 {
-            let prev_byte = src.as_bytes()[prev_idx - 1];
-            // Проверка: предыдущий символ не должен быть «.» или идентификаторным.
-            if prev_byte == b'.' {
-                continue;
-            }
-            // Многобайтные русские символы — обработаем через char-итератор.
-            if !is_safe_left_boundary(src, prev_idx) {
-                continue;
-            }
-        }
+    for dot in dots {
+        let head = dot.head.as_str();
+        let member = dot.member.as_str();
 
         // Уровень 1: head — это имя платформенного типа.
         // Уровень 2: head может быть локальной переменной с известным типом.
         let resolved_type_name: Option<String> = match index.find_type(head) {
             Some(_) => Some(head.to_string()),
             None => scope_map
-                .and_then(|sm| sm.type_of_var(head_match.start(), head))
+                .and_then(|sm| sm.type_of_var(dot.head_byte, head))
                 .cloned(),
         };
         let Some(type_name) = resolved_type_name else {
@@ -468,7 +302,7 @@ pub(crate) fn check_type_dot_members(
                 .iter()
                 .any(|v| v.name_ru.to_lowercase() == m_lower || v.name_en.to_lowercase() == m_lower);
             if !exists {
-                let (line, col) = pos_at(src, member_match.start());
+                let (line, col) = pos_at(src, dot.member_byte);
                 let allowed: Vec<String> =
                     ty.enum_values.iter().map(|v| v.name_ru.clone()).collect();
                 let suggestion = closest_str(member, &allowed);
@@ -510,7 +344,7 @@ pub(crate) fn check_type_dot_members(
                 .iter()
                 .any(|p| p.name_ru.to_lowercase() == m_lower || p.name_en.to_lowercase() == m_lower);
             if !exists_method && !exists_prop {
-                let (line, col) = pos_at(src, member_match.start());
+                let (line, col) = pos_at(src, dot.member_byte);
                 let mut allowed: Vec<String> =
                     ty.methods.iter().map(|m| m.name_ru.clone()).collect();
                 allowed.extend(ty.properties.iter().map(|p| p.name_ru.clone()));
@@ -563,22 +397,25 @@ fn is_dynamic_member_type(name_ru: &str) -> bool {
     )
 }
 
-pub(crate) fn check_new_expressions(index: &PlatformIndex, src: &str, errors: &mut Vec<ExprError>) {
-    for cap in new_re().captures_iter(src) {
-        let ty_match = cap.name("ty").unwrap();
-        let ty_name = ty_match.as_str();
-        if index.find_type(ty_name).is_none() {
-            let (line, col) = pos_at(src, ty_match.start());
+pub(crate) fn check_new_expressions(
+    index: &PlatformIndex,
+    src: &str,
+    news: &[NewFact],
+    errors: &mut Vec<ExprError>,
+) {
+    for n in news {
+        if index.find_type(&n.type_name).is_none() {
+            let (line, col) = pos_at(src, n.byte);
             let all_types: Vec<String> = index.types.values().map(|t| t.name_ru.clone()).collect();
-            let suggestion = closest_str(ty_name, &all_types);
+            let suggestion = closest_str(&n.type_name, &all_types);
             errors.push(ExprError::new(
                 line,
                 col,
                 ExprErrorKind::UnknownNewType,
                 format!(
                     "Тип '{}' не найден в платформенном контексте (Новый '{}').{}",
-                    ty_name,
-                    ty_name,
+                    n.type_name,
+                    n.type_name,
                     suggestion
                         .as_ref()
                         .map(|s| format!(" Возможно: '{s}'."))
@@ -591,82 +428,65 @@ pub(crate) fn check_new_expressions(index: &PlatformIndex, src: &str, errors: &m
     }
 }
 
-/// Проверка глобальных вызовов `Имя(args)` в тексте (уже замаскированном от
-/// строк/комментариев). `user_symbols` — необязательный whitelist имён своих
-/// процедур/функций (в lowercase), извлечённых из модуля вызывающим слоем
-/// (см. `module::validate_module_at_level`). Если вызов попадает в whitelist —
-/// пропускаем без проверки. Для `validate_expression` передаётся `None`.
+/// Проверка глобальных вызовов `Имя(args)`, извлечённых деревом
+/// ([`crate::ast::collect_facts`]) в виде [`CallFact`]. `user_symbols` —
+/// необязательный whitelist имён своих процедур/функций (в lowercase),
+/// извлечённых из модуля вызывающим слоем (см. `module::validate_module_at_level`).
+/// Если вызов попадает в whitelist — пропускаем без проверки. Для
+/// `validate_expression` передаётся `None`.
 ///
 /// `strict_unknown` включает СТРОГИЙ режим: вызов, которого нет ни в whitelist,
 /// ни в платформе, и который ни на что не похож, эмиттится как
 /// `UndeclaredMethod`. Правомерен только для ЦЕЛОГО модуля, и только если это
 /// не модуль расширения (там половина имён приходит из расширяемого модуля,
 /// текста которого у валидатора нет).
+///
+/// `symbols` — необязательный внешний источник имён (см.
+/// [`crate::symbols::SymbolSource`]): методы других модулей конфигурации.
+/// Используется ТОЛЬКО внутри `strict_unknown`, чтобы закрыть два случая
+/// false-positive — экспорт глобального общего модуля и метод модуля
+/// объекта-владельца (`owner_exports`, предзагруженный набор lowercase-имён).
 pub(crate) fn check_global_calls(
     index: &PlatformIndex,
     src: &str,
+    calls: &[CallFact],
     user_symbols: Option<&HashSet<String>>,
     strict_unknown: bool,
+    symbols: Option<&dyn SymbolSource>,
+    owner_exports: Option<&HashSet<String>>,
     errors: &mut Vec<ExprError>,
 ) {
-    // Методы собственного объекта/формы зовутся из его модуля без префикса.
-    // Строим один раз на модуль: обход всех типов дороже одной проверки вызова.
-    let type_methods = strict_unknown.then(|| index.all_type_method_names());
+    // Методы собственного объекта/формы/менеджера зовутся из его модуля без
+    // префикса (`Закрыть()`, `ЭтоНовый()`, `ПустаяСсылка()`). Кэш в индексе —
+    // считается один раз на процесс.
+    let type_methods = index.all_type_method_names();
 
-    for cap in global_call_re().captures_iter(src) {
-        let head_match = cap.name("head").unwrap();
-        let head = head_match.as_str();
-
-        // Левый сосед — не должна быть «.» (тогда это вызов члена, не глобальный).
-        // Также «&» слева означает, что это annotation-директива
-        // (`&Перед("Foo")`, `&НаСервере` без скобок сюда не попадает вовсе),
-        // а не глобальный вызов — валидация директив идёт отдельным путём через
-        // `module::walk_module_ast`, здесь мы её молча пропускаем.
-        let start = head_match.start();
-        if start > 0 {
-            let prev = src.as_bytes()[start - 1];
-            if prev == b'.' || prev == b'&' {
-                continue;
-            }
-            if !is_safe_left_boundary(src, start) {
-                continue;
-            }
-            // `Новый Массив(10)` — конструктор, а не вызов метода.
-            if preceded_by_new(src, start) {
-                continue;
-            }
-        }
-        // Игнорируем ключевые слова, не являющиеся вызовами.
-        if is_bsl_keyword(head) {
-            continue;
-        }
+    for call in calls {
         // Своя процедура/функция из этого же модуля — пропускаем.
         if let Some(whitelist) = user_symbols {
-            if whitelist.contains(&head.to_lowercase()) {
+            if whitelist.contains(&call.name.to_lowercase()) {
                 continue;
             }
         }
-        // Имена, коллизирующие с приведением типа в языке запросов
-        // (`ВЫРАЗИТЬ(X КАК ЧИСЛО(28,10))`): число «аргументов» в тексте запроса
-        // не имеет отношения к BSL-функции Число() — массовый false-positive.
-        // Проверку числа аргументов для них не делаем (baseline 2026-05-21,
-        // карточка #1232). Глубокий фикс через маскировку оказался нестабильным
-        // (откат в v0.3.5), поэтому точечно глушим коллизию.
-        if is_query_cast_collision(head) {
-            continue;
-        }
 
-        // Если head — известный глобальный метод, попытаемся посчитать аргументы.
-        let Some(_method) = index.find_global_method(head) else {
+        // Если имя — известный глобальный метод, попытаемся посчитать аргументы.
+        let Some(_method) = index.find_global_method(&call.name) else {
+            // Метод платформенного типа, вызванный без префикса из собственного
+            // модуля. Это ни неизвестный глобальный метод, ни описка: fuzzy тут
+            // выдавал уверенную чушь (`ПустаяСсылка()` в модуле менеджера →
+            // «возможно, вы имели в виду ПустаяСтрока», 343 находки на УТ).
+            if type_methods.contains(&call.name.to_lowercase()) {
+                continue;
+            }
             // Неизвестный глобальный вызов: пробуем fuzzy к платформенным.
             // Строгого совпадения нет — либо это опечатка платформенного метода,
             // либо процедура общего модуля/БСП (валидатор её не видит). Различаем
             // по расстоянию: сильное сходство → High (уверенно опечатка), слабое →
             // Low (возможная опечатка), далёкое → молча пропускаем.
-            let fuzzy = closest_global_method_with_distance(index, head)
-                .and_then(|(s, d)| fuzzy_confidence_for(head, &s, d).map(|c| (s, c)));
+            let fuzzy = closest_global_method_with_distance(index, &call.name)
+                .and_then(|(s, d)| fuzzy_confidence_for(&call.name, &s, d).map(|c| (s, c)));
             if let Some((suggestion, confidence)) = fuzzy {
-                let (line, col) = pos_at(src, head_match.start());
+                let (line, col) = pos_at(src, call.byte);
                 errors.push(ExprError::new_with_confidence(
                     line,
                     col,
@@ -674,61 +494,67 @@ pub(crate) fn check_global_calls(
                     format!(
                         "Глобальный метод '{}' не найден в платформенном контексте. \
                          Возможно, вы имели в виду '{}'.",
-                        head, suggestion
+                        call.name, suggestion
                     ),
                     confidence,
                     Some(suggestion),
                     Vec::new(),
                 ));
-            } else if strict_unknown
-                && !type_methods
-                    .as_ref()
-                    .is_some_and(|m| m.contains(&head.to_lowercase()))
-            {
+            } else if strict_unknown {
                 // Целый модуль: вызов не объявлен здесь, не платформенный, не метод
-                // какого-либо платформенного типа и ни на что не похож. Процедуры
-                // общих модулей вызываются через точку и сюда не попадают, поэтому
-                // остаётся описка либо забытое объявление. Исключение — глобальные
-                // общие модули (флаг «Глобальный»): их процедуры зовутся без
-                // префикса, валидатор их не видит и даст здесь false-positive.
-                let (line, col) = pos_at(src, head_match.start());
-                errors.push(ExprError::new_with_confidence(
-                    line,
-                    col,
-                    ExprErrorKind::UndeclaredMethod,
-                    format!(
-                        "Метод '{}' не объявлен в этом модуле и не найден в платформенном контексте.",
-                        head
-                    ),
-                    Confidence::High,
-                    None,
-                    Vec::new(),
-                ));
+                // какого-либо платформенного типа (отсечено выше) и ни на что не
+                // похож. Процедуры общих модулей вызываются через точку и сюда не
+                // попадают, поэтому остаётся описка либо забытое объявление.
+                // Исключение — глобальные общие модули (флаг «Глобальный»): их
+                // процедуры зовутся без префикса, валидатор их не видит и даст
+                // здесь false-positive. Внешний источник имён (`symbols`) закрывает
+                // этот случай и ещё один — метод модуля объекта-владельца
+                // (`owner_exports`) для модуля обычной формы внешней обработки.
+                let lc = call.name.to_lowercase();
+                let is_owner_export = owner_exports.map(|s| s.contains(&lc)).unwrap_or(false);
+                let is_global_export = symbols.map(|s| s.is_global_export(&lc)).unwrap_or(false);
+                if is_owner_export || is_global_export {
+                    // Не описка: метод виден отсюда через внешний источник.
+                } else if symbols.map(|s| s.method_exists(&lc)).unwrap_or(false) {
+                    // Имя объявлено где-то в конфигурации, но отсюда может быть
+                    // не видно по правилам видимости — находка остаётся, но
+                    // с пониженной уверенностью.
+                    let (line, col) = pos_at(src, call.byte);
+                    errors.push(ExprError::new_with_confidence(
+                        line,
+                        col,
+                        ExprErrorKind::UndeclaredMethod,
+                        format!(
+                            "Метод '{}' не объявлен в этом модуле. В конфигурации он есть, \
+                             но отсюда может быть не виден — проверьте правила видимости.",
+                            call.name
+                        ),
+                        Confidence::Low,
+                        None,
+                        Vec::new(),
+                    ));
+                } else {
+                    let (line, col) = pos_at(src, call.byte);
+                    errors.push(ExprError::new_with_confidence(
+                        line,
+                        col,
+                        ExprErrorKind::UndeclaredMethod,
+                        format!(
+                            "Метод '{}' не объявлен в этом модуле и не найден в платформенном контексте.",
+                            call.name
+                        ),
+                        Confidence::High,
+                        None,
+                        Vec::new(),
+                    ));
+                }
             }
             continue;
         };
 
-        // Найти конец вызова (скобка после head). Группа уже захватила `(`,
-        // надо отыскать парную закрывающую с учётом вложенности.
-        let paren_start = head_match.end();
-        // Сдвинуться к открывающей скобке (regex захватил `\s*\(`).
-        let bytes = src.as_bytes();
-        let mut k = paren_start;
-        while k < bytes.len() && bytes[k].is_ascii_whitespace() {
-            k += 1;
-        }
-        if k >= bytes.len() || bytes[k] != b'(' {
-            continue;
-        }
-        let open = k;
-        let close = match find_matching_paren(bytes, open) {
-            Some(c) => c,
-            None => continue,
-        };
-        let arg_count = count_top_level_args(&src[open + 1..close]);
-        let result = validate_method_call(index, head, arg_count);
+        let result = validate_method_call(index, &call.name, call.arg_count);
         if !result.valid {
-            let (line, col) = pos_at(src, head_match.start());
+            let (line, col) = pos_at(src, call.byte);
             errors.push(ExprError::new(
                 line,
                 col,
@@ -742,122 +568,6 @@ pub(crate) fn check_global_calls(
 }
 
 // ── Вспомогательные ──────────────────────────────────────────────────────
-
-/// Имена, коллизирующие с приведением типа в языке запросов
-/// (`ВЫРАЗИТЬ(... КАК ЧИСЛО(n,m))`). Для них проверка числа аргументов как
-/// BSL-функции не делается — иначе массовый false-positive из текстов запросов,
-/// которые не всегда полностью замаскированы (1С-врезки `//` в многострочных
-/// литералах ломают парность кавычек). Карточка #1232.
-fn is_query_cast_collision(name: &str) -> bool {
-    matches!(name.to_lowercase().as_str(), "число" | "number")
-}
-
-fn is_bsl_keyword(s: &str) -> bool {
-    // Минимальный список ключевых слов BSL, которые могут стоять перед `(`
-    // (например, `Если(...)` — нет, `Если` без скобок). На всякий случай —
-    // основные операторы.
-    matches!(
-        s.to_lowercase().as_str(),
-        "если"
-            | "тогда"
-            | "иначе"
-            | "иначеесли"
-            | "конецесли"
-            | "цикл"
-            | "конеццикла"
-            | "процедура"
-            | "конецпроцедуры"
-            | "функция"
-            | "конецфункции"
-            | "возврат"
-            | "пока"
-            | "для"
-            | "каждого"
-            | "из"
-            | "по"
-            | "попытка"
-            | "исключение"
-            | "конецпопытки"
-            | "вызватьисключение"
-            | "прервать"
-            | "продолжить"
-            | "перем"
-            | "экспорт"
-            | "знач"
-            | "и"
-            | "или"
-            | "не"
-            | "истина"
-            | "ложь"
-            | "новый"
-            | "if"
-            | "then"
-            | "else"
-            | "elsif"
-            | "endif"
-            | "while"
-            | "for"
-            | "each"
-            | "do"
-            | "enddo"
-            | "procedure"
-            | "endprocedure"
-            | "function"
-            | "endfunction"
-            | "return"
-            | "and"
-            | "or"
-            | "not"
-            | "true"
-            | "false"
-            | "new"
-            | "try"
-            | "except"
-            | "endtry"
-            | "raise"
-            | "break"
-            | "continue"
-            | "var"
-            | "export"
-            | "val"
-            | "in"
-            | "to"
-    )
-}
-
-/// Левый соседний символ должен быть НЕ идентификаторным
-/// (буква/цифра/подчёркивание). Учитываем многобайтные русские буквы.
-fn is_safe_left_boundary(src: &str, byte_idx: usize) -> bool {
-    if byte_idx == 0 {
-        return true;
-    }
-    // Найти ближайший char до byte_idx.
-    let prefix = &src[..byte_idx];
-    let last = prefix.chars().next_back();
-    match last {
-        Some(c) if c.is_alphanumeric() || c == '_' => false,
-        _ => true,
-    }
-}
-
-/// Слева от `byte_idx` (через пробелы) стоит ключевое слово `Новый`/`New`?
-///
-/// Тогда `Массив(10)` — не вызов метода, а конструктор `Новый Массив(10)`.
-/// Такие узлы проверяет `check_new_expressions`, а `check_global_calls` обязан
-/// их пропустить: в строгом режиме иначе каждый конструктор станет ошибкой.
-fn preceded_by_new(src: &str, byte_idx: usize) -> bool {
-    let prefix = src[..byte_idx].trim_end();
-    let word = prefix
-        .char_indices()
-        .rev()
-        .take_while(|(_, c)| c.is_alphanumeric() || *c == '_')
-        .last()
-        .map(|(i, _)| &prefix[i..]);
-    matches!(
-        word.map(str::to_lowercase).as_deref(),
-        Some("новый") | Some("new")
-    )
-}
 
 fn pos_at(src: &str, byte_idx: usize) -> (u32, u32) {
     let mut line: u32 = 1;
@@ -874,57 +584,6 @@ fn pos_at(src: &str, byte_idx: usize) -> (u32, u32) {
         }
     }
     (line, col)
-}
-
-fn find_matching_paren(bytes: &[u8], open: usize) -> Option<usize> {
-    debug_assert!(bytes[open] == b'(');
-    let mut depth = 1;
-    let mut i = open + 1;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'(' => depth += 1,
-            b')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
-}
-
-fn count_top_level_args(args_text: &str) -> usize {
-    // Реально пустые скобки `Метод()` — аргументов нет.
-    if args_text.is_empty() {
-        return 0;
-    }
-    // Между скобками только пробелы. Главный случай — единственный аргумент,
-    // целиком стёртый маскировкой строки/комментария: `НСтр("ru = '...'")`
-    // после mask_strings_and_comments превращается в `НСтр(           )`.
-    // Раньше тут возвращался 0 → массовый false-positive «не принимает 0
-    // аргументов» на НСтр/Тип/ПредопределенноеЗначение и т.п. (baseline
-    // 2026-05-21: ~918k срабатываний wrong_argument_count, из них ~560k — НСтр).
-    // Реальный вызов без аргументов почти всегда пишут как `Метод()` без
-    // пробела (его поймала проверка `is_empty` выше), поэтому «одни пробелы
-    // при ненулевой длине» трактуем как 1 аргумент.
-    let trimmed = args_text.trim();
-    if trimmed.is_empty() {
-        return 1;
-    }
-    let mut depth = 0i32;
-    let mut commas = 0usize;
-    for b in args_text.bytes() {
-        match b {
-            b'(' | b'[' | b'{' => depth += 1,
-            b')' | b']' | b'}' => depth -= 1,
-            b',' if depth == 0 => commas += 1,
-            _ => {}
-        }
-    }
-    commas + 1
 }
 
 fn closest_str(target: &str, candidates: &[String]) -> Option<String> {
@@ -1095,70 +754,6 @@ fn lev(a: &str, b: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn mask_keeps_positions() {
-        let src = "Если А = \"строка\" Тогда";
-        let masked = mask_strings_and_comments(src);
-        assert_eq!(masked.len(), src.len());
-        // Текст вне строки сохранился.
-        assert!(masked.contains("Если А ="));
-        // Содержимое строки замаскировано.
-        assert!(!masked.contains("строка"));
-    }
-
-    #[test]
-    fn mask_handles_comment_to_eol() {
-        let src = "А = 1; // комментарий\nБ = 2;";
-        let masked = mask_strings_and_comments(src);
-        assert!(masked.contains("А = 1;"));
-        assert!(!masked.contains("комментарий"));
-        assert!(masked.contains("Б = 2;"));
-    }
-
-    #[test]
-    fn chislo_call_with_two_args_skipped() {
-        // `Число(28,10)` коллизирует с приведением типа в языке запросов
-        // (ВЫРАЗИТЬ(X КАК ЧИСЛО(28,10))). Проверка числа аргументов для Число
-        // отключена → не должно быть wrong_argument_count даже при 2 аргументах.
-        use platform_index::{Method, Parameter, PlatformIndex, Signature};
-        let mut index = PlatformIndex::new();
-        index.global_methods.push(Method {
-            name_ru: "Число".into(),
-            name_en: "Number".into(),
-            description: String::new(),
-            return_type: "Число".into(),
-            signatures: vec![Signature {
-                name: "Основная".into(),
-                description: String::new(),
-                parameters: vec![Parameter {
-                    name: "Значение".into(),
-                    type_name: String::new(),
-                    required: true,
-                    description: String::new(),
-                }],
-            }],
-        });
-        let res = validate_expression_at_level(&index, "X = Число(28, 10);", 1);
-        assert!(res.valid, "Число(28,10) не должно ловиться: {:?}", res.errors);
-    }
-
-    #[test]
-    fn count_args_simple() {
-        assert_eq!(count_top_level_args(""), 0); // Метод() — без аргументов
-        assert_eq!(count_top_level_args("а"), 1);
-        assert_eq!(count_top_level_args("а, б, в"), 3);
-        assert_eq!(count_top_level_args("а, Функция(б, в), г"), 3);
-    }
-
-    #[test]
-    fn count_args_masked_string_is_one() {
-        // После mask_strings_and_comments единственный аргумент-строка
-        // превращается в пробелы — это 1 аргумент, не 0 (фикс false-positive
-        // на НСтр/Тип/ПредопределенноеЗначение, baseline 2026-05-21).
-        assert_eq!(count_top_level_args("            "), 1);
-        assert_eq!(count_top_level_args("      ,    "), 2); // НСтр("...","ru")
-    }
 
     #[test]
     fn nstr_with_string_arg_is_valid() {

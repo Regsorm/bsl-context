@@ -3,9 +3,10 @@
 //! В отличие от [`crate::expression::validate_expression`], который принимает
 //! короткий фрагмент и не отличает вызов «своей» процедуры от опечатки
 //! платформенного метода, `validate_module` работает со всем текстом модуля:
-//! из него извлекаются все объявления `Процедура ИмяX(...)` и `Функция ИмяY(...)`,
-//! собирается whitelist «своих» имён — и `check_global_calls` пропускает эти
-//! вызовы без fuzzy-проверки.
+//! из него извлекаются все объявления `Процедура ИмяX(...)` и `Функция ИмяY(...)`
+//! (один проход [`crate::ast::collect_facts`], общий с фактами `TypeDotMember`/
+//! `NewExpression`/`GlobalCall`), собирается whitelist «своих» имён — и
+//! `check_global_calls` пропускает эти вызовы без fuzzy-проверки.
 //!
 //! Так исчезает основной источник false-positive для новой находки
 //! `UnknownGlobalMethod`: неизвестный вызов, которого нет в whitelist И
@@ -29,6 +30,8 @@ use std::collections::HashSet;
 
 use platform_index::PlatformIndex;
 
+use bsl_parse::{collect_facts, scan_declarations};
+
 use crate::directives::{closest_directive_with_distance, is_extension_module, is_known_directive};
 use crate::expression::{
     check_global_calls, check_new_expressions, check_type_dot_members, fuzzy_confidence_for,
@@ -36,6 +39,7 @@ use crate::expression::{
     ExpressionValidation, Profile,
 };
 use crate::scope::{extract_scope_map, extract_type_annotations};
+use crate::symbols::SymbolSource;
 
 /// Главный API: проверить целый BSL-модуль. Дефолтный уровень — 1.
 pub fn validate_module(index: &PlatformIndex, source: &str) -> ExpressionValidation {
@@ -57,12 +61,29 @@ pub fn validate_module_at_level(
     source: &str,
     level: u8,
 ) -> ExpressionValidation {
+    validate_module_at_level_inner(index, source, level, None, None)
+}
+
+/// Общее тело `validate_module_at_level`/`validate_module_with_symbols`.
+///
+/// `symbols`/`owner_exports` — внешний источник имён (см.
+/// [`crate::symbols::SymbolSource`]) и предзагруженный набор экспортных имён
+/// модуля объекта-владельца; оба `None` при вызове без источника — поведение
+/// не отличается от прежнего `validate_module_at_level`.
+fn validate_module_at_level_inner(
+    index: &PlatformIndex,
+    source: &str,
+    level: u8,
+    symbols: Option<&dyn SymbolSource>,
+    owner_exports: Option<&HashSet<String>>,
+) -> ExpressionValidation {
     // Модуль расширения: блоки `#Удаление … #КонецУдаления` в скомпилированный
     // модуль не попадают, но могут обрывать строковый литерал на середине —
     // тогда файл не является корректным BSL, маскировка «съезжает» и текст
     // запроса ниже принимается за код. Убираем их до всякого разбора.
     let source = &strip_extension_directives(source);
     let cleaned = mask_strings_and_comments(source);
+    let facts = collect_facts(source);
 
     let scope_map = if level >= 2 {
         let annotations = extract_type_annotations(source);
@@ -70,16 +91,11 @@ pub fn validate_module_at_level(
     } else {
         None
     };
-
     let mut errors = Vec::new();
-    // Whitelist объявлений строится из ДВУХ источников, потому что ни один не
-    // полон (замер на 14905 модулях УТ): разбор находит 2753 имени, невидимых
-    // текстовому проходу (заголовок с переносом строки перед скобкой), а текст
-    // спасает 34 имени, теряемых разбором на файлах с ERROR. Пропущенное имя в
-    // строгом режиме сразу даёт ложный `UndeclaredMethod`, поэтому берётся
-    // объединение. AST читает ОРИГИНАЛЬНЫЙ source: строки и комментарии
-    // tree-sitter отсекает сам.
-    let mut user_symbols = walk_module_ast(source);
+
+    // Объявления из ДВУХ источников: дерево теряет их на файлах с ERROR,
+    // текстовый проход не видит заголовков с переносом перед скобкой.
+    let mut user_symbols = facts.declarations.clone();
     user_symbols.extend(scan_declarations(source));
 
     scan_directives(&cleaned, &mut errors);
@@ -89,15 +105,19 @@ pub fn validate_module_at_level(
     // описка» здесь неправомерен: строгий режим выключаем, whitelist остаётся.
     let strict_unknown = !is_extension_module(&cleaned);
 
-    check_type_dot_members(index, &cleaned, scope_map.as_ref(), &mut errors);
-    check_new_expressions(index, &cleaned, &mut errors);
+    check_type_dot_members(index, source, &facts.dots, scope_map.as_ref(), &mut errors);
+    check_new_expressions(index, source, &facts.news, &mut errors);
     check_global_calls(
         index,
-        &cleaned,
+        source,
+        &facts.calls,
         Some(&user_symbols),
         strict_unknown,
+        symbols,
+        owner_exports,
         &mut errors,
     );
+    errors.sort_by_key(|e| (e.line, e.col));
 
     ExpressionValidation {
         valid: errors.is_empty(),
@@ -129,105 +149,40 @@ pub fn validate_module_with_profile(
     result
 }
 
-/// Запасной сбор объявлений построчно — на случай, когда tree-sitter не смог
-/// разобрать модуль и часть `proc_declaration`/`func_declaration` потерялась.
+/// Проверка модуля с внешним источником имён (см. [`crate::symbols::SymbolSource`]).
 ///
-/// Строки и комментарии предварительно замаскированы, поэтому слово `Процедура`
-/// внутри строкового литерала объявлением не станет. Имя берётся до первой
-/// открывающей скобки; строки без скобки игнорируются.
-fn scan_declarations(source: &str) -> HashSet<String> {
-    let cleaned = mask_strings_and_comments(source);
-    let mut names = HashSet::new();
-    for line in cleaned.lines() {
-        let trimmed = line.trim_start();
-        let lower = trimmed.to_lowercase();
-        let rest = ["процедура ", "функция ", "procedure ", "function "]
-            .iter()
-            .find_map(|kw| lower.strip_prefix(kw));
-        let Some(rest) = rest else { continue };
-        let Some((name, _)) = rest.split_once('(') else {
-            continue;
-        };
-        let name = name.trim();
-        if !name.is_empty() && !name.contains(char::is_whitespace) {
-            names.insert(name.to_string());
-        }
-    }
-    names
-}
+/// Как [`validate_module_with_profile`], но `check_global_calls` дополнительно
+/// получает `symbols` и предзагруженные экспортные имена модуля
+/// объекта-владельца — для этого нужен `module_path` (относительный путь
+/// модуля в выгрузке); `None`, если он неизвестен или не нужен.
+pub fn validate_module_with_symbols(
+    index: &PlatformIndex,
+    source: &str,
+    level: u8,
+    profile: Profile,
+    module_path: Option<&str>,
+    symbols: Option<&dyn SymbolSource>,
+) -> ExpressionValidation {
+    let effective_level = if profile == Profile::Strict { 1 } else { level };
+    let owner_exports = module_path
+        .zip(symbols)
+        .and_then(|(path, src)| src.owner_exports(path));
+    let mut result = validate_module_at_level_inner(
+        index,
+        source,
+        effective_level,
+        symbols,
+        owner_exports.as_ref(),
+    );
 
-/// Проход по AST BSL-модуля: собирает whitelist proc/func-имён.
-/// Один tree-sitter-parse на весь модуль.
-///
-/// Устойчивость к синтаксическим ошибкам: tree-sitter даёт `ERROR`-узлы и
-/// продолжает разбор, поэтому даже поломанный модуль отдаёт часть объявлений.
-/// На пустой строке / двоичном мусоре возвращается пустой whitelist —
-/// недостающие имена подберёт `scan_declarations`.
-fn walk_module_ast(source: &str) -> HashSet<String> {
-    let mut names = HashSet::new();
-
-    // Двоичный .bsl (EDT-защищённые модули поставщика) — не отдаём в tree-sitter,
-    // иначе он деградирует на бесструктурном вводе. Маркер — NUL-байт
-    // в первых 8 КБ (см. `code-index::parser::bsl::looks_binary`).
-    if source.as_bytes().iter().take(8192).any(|&b| b == 0) {
-        return names;
+    if profile == Profile::Strict {
+        result
+            .errors
+            .retain(|e| e.confidence == Confidence::High);
+        result.valid = result.errors.is_empty();
     }
 
-    let mut parser = tree_sitter::Parser::new();
-    if parser
-        .set_language(&tree_sitter_bsl::LANGUAGE.into())
-        .is_err()
-    {
-        // Не смогли выставить язык — молча возвращаем пустой whitelist.
-        // Валидатор продолжит без него, это не блокирующая ошибка.
-        return names;
-    }
-    // Страховка от патологического ввода: 10-секундный дедлайн парсинга.
-    // При превышении parse() вернёт None → пустой whitelist.
-    #[allow(deprecated)]
-    parser.set_timeout_micros(10_000 * 1000);
-
-    let Some(tree) = parser.parse(source, None) else {
-        return names;
-    };
-    let source_bytes = source.as_bytes();
-
-    walk_recursive(tree.root_node(), source_bytes, &mut names, 0);
-
-    names
-}
-
-/// Рекурсивный обход AST: собирает имена объявлений процедур и функций.
-/// Ограничение глубины — 80 (совпадает с code-index-core:parser/bsl.rs).
-///
-/// Директивы здесь НЕ проверяются: грамматика `tree-sitter-bsl` заводит узел
-/// `annotation` только для КОРРЕКТНЫХ директив, а опечатка (`&НаКлентее`)
-/// приходит как `ERROR`. Опечатки ловит `scan_directives` по тексту.
-fn walk_recursive(
-    node: tree_sitter::Node,
-    source_bytes: &[u8],
-    names: &mut HashSet<String>,
-    depth: usize,
-) {
-    if depth > 80 {
-        return;
-    }
-
-    if matches!(node.kind(), "procedure_definition" | "function_definition") {
-        if let Some(name) = node
-            .child_by_field_name("name")
-            .and_then(|n| n.utf8_text(source_bytes).ok())
-        {
-            if !name.is_empty() {
-                names.insert(name.to_lowercase());
-            }
-        }
-    }
-
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        walk_recursive(child, source_bytes, names, depth + 1);
-    }
+    result
 }
 
 /// Проверка имён директив (`&НаСервере`, `&Перед("Foo")`) текстовым проходом.
@@ -284,7 +239,7 @@ mod tests {
     use super::*;
 
     fn collect_names(src: &str) -> HashSet<String> {
-        let mut names = walk_module_ast(src);
+        let mut names = collect_facts(src).declarations;
         names.extend(scan_declarations(src));
         names
     }
@@ -394,5 +349,133 @@ EndFunction
             "директива расширения дала ошибку: {:?}",
             errors
         );
+    }
+
+    // ── validate_module_with_symbols ───────────────────────────────────────
+
+    /// Источник-заглушка: поведение каждого метода задаётся явно на тест,
+    /// без похода в реальный индекс/БД.
+    struct StubSource {
+        global_export: bool,
+        exists: bool,
+        owner: Option<HashSet<String>>,
+    }
+
+    impl SymbolSource for StubSource {
+        fn is_global_export(&self, _name_lower: &str) -> bool {
+            self.global_export
+        }
+
+        fn method_exists(&self, _name_lower: &str) -> bool {
+            self.exists
+        }
+
+        fn owner_exports(&self, _module_path: &str) -> Option<HashSet<String>> {
+            self.owner.clone()
+        }
+
+        fn describe(&self) -> String {
+            "stub".to_string()
+        }
+    }
+
+    /// Модуль с ровно одним неизвестным вызовом — общая фикстура для тестов ниже.
+    fn module_with_unknown_call() -> &'static str {
+        "\
+Процедура Тест()
+НеизвестныйВызов();
+КонецПроцедуры
+"
+    }
+
+    #[test]
+    fn symbols_global_export_suppresses_finding() {
+        let index = PlatformIndex::new();
+        let source = StubSource {
+            global_export: true,
+            exists: false,
+            owner: None,
+        };
+        let result = validate_module_with_symbols(
+            &index,
+            module_with_unknown_call(),
+            1,
+            Profile::Full,
+            None,
+            Some(&source),
+        );
+        assert!(
+            result.errors.is_empty(),
+            "экспорт глобального модуля не должен давать находку: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn symbols_owner_export_suppresses_finding() {
+        let index = PlatformIndex::new();
+        let mut owner = HashSet::new();
+        owner.insert("неизвестныйвызов".to_string());
+        let source = StubSource {
+            global_export: false,
+            exists: false,
+            owner: Some(owner),
+        };
+        let result = validate_module_with_symbols(
+            &index,
+            module_with_unknown_call(),
+            1,
+            Profile::Full,
+            Some("external/Обр/Form/Ф/Form.obj.bsl"),
+            Some(&source),
+        );
+        assert!(
+            result.errors.is_empty(),
+            "метод модуля объекта-владельца не должен давать находку: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn symbols_method_exists_downgrades_confidence() {
+        let index = PlatformIndex::new();
+        let source = StubSource {
+            global_export: false,
+            exists: true,
+            owner: None,
+        };
+        let result = validate_module_with_symbols(
+            &index,
+            module_with_unknown_call(),
+            1,
+            Profile::Full,
+            None,
+            Some(&source),
+        );
+        let finding = result
+            .errors
+            .iter()
+            .find(|e| matches!(e.kind, ExprErrorKind::UndeclaredMethod))
+            .expect("метод есть в конфигурации — находка должна остаться");
+        assert_eq!(finding.confidence, Confidence::Low);
+    }
+
+    #[test]
+    fn no_symbol_source_keeps_high_confidence() {
+        let index = PlatformIndex::new();
+        let result = validate_module_with_symbols(
+            &index,
+            module_with_unknown_call(),
+            1,
+            Profile::Full,
+            None,
+            None,
+        );
+        let finding = result
+            .errors
+            .iter()
+            .find(|e| matches!(e.kind, ExprErrorKind::UndeclaredMethod))
+            .expect("без источника поведение должно быть прежним — находка есть");
+        assert_eq!(finding.confidence, Confidence::High);
     }
 }

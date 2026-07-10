@@ -12,6 +12,8 @@ path = "src/main.rs"
 [dependencies]
 platform-index = { path = "../platform-index" }
 bsl-validator  = { path = "../bsl-validator" }
+symbol-source  = { path = "../symbol-source" }
+lite-index     = { path = "../lite-index" }
 
 tokio = { workspace = true }
 axum = { workspace = true }

@@ -58,6 +58,93 @@ pub struct Config {
     /// иначе rmcp вернёт `403 Forbidden: Host header is not allowed`. Запись без
     /// порта разрешает любой порт этого хоста.
     pub allowed_hosts: Vec<String>,
+
+    /// Внешний источник имён методов конфигурации (см. крейт `symbol-source`).
+    /// Нужен, чтобы `validate_module` не считал опиской вызовы процедур глобальных
+    /// общих модулей и методов модуля объекта-владельца внешней обработки.
+    pub symbol_source: SymbolSourceConfig,
+
+    /// Белый список инструментов. Пустой (по умолчанию) — доступны все.
+    pub tools: ToolsConfig,
+}
+
+/// Конфигурация внешнего источника имён (крейт `symbol-source`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SymbolSourceConfig {
+    /// "none" (по умолчанию) | "lite" | "code_index_db" | "code_index_mcp"
+    pub kind: String,
+    /// Абсолютный путь к базе: файл lite-индекса либо `<repo>/.code-index/index.db`.
+    pub db_path: Option<PathBuf>,
+    /// Корень выгрузки конфигурации. Нужен ТОЛЬКО инструменту `rebuild_symbol_index`
+    /// при `kind = "lite"`: из него собирается облегчённый индекс. Валидация имён
+    /// файловую систему не трогает — читает только базу/сервис.
+    pub root: Option<PathBuf>,
+    /// URL MCP-сервера code-index, например http://127.0.0.1:8011/mcp
+    pub url: Option<String>,
+    /// Алиас репозитория для MCP-источника, например "ut-test".
+    pub repo: Option<String>,
+    /// Таймаут HTTP, мс.
+    pub timeout_ms: u64,
+}
+
+impl Default for SymbolSourceConfig {
+    fn default() -> Self {
+        Self {
+            kind: "none".to_string(),
+            db_path: None,
+            root: None,
+            url: None,
+            repo: None,
+            timeout_ms: 5000,
+        }
+    }
+}
+
+impl SymbolSourceConfig {
+    /// Проверка обязательных полей по `kind`. Понятная ошибка на загрузке
+    /// конфига вместо тихого падения источника при первом обращении.
+    fn validate(&self) -> anyhow::Result<()> {
+        match self.kind.as_str() {
+            "none" => Ok(()),
+            "lite" | "code_index_db" => {
+                if self.db_path.is_none() {
+                    anyhow::bail!(
+                        "symbol_source.kind = \"{}\" требует symbol_source.db_path",
+                        self.kind
+                    );
+                }
+                Ok(())
+            }
+            "code_index_mcp" => {
+                if self.url.is_none() {
+                    anyhow::bail!(
+                        "symbol_source.kind = \"code_index_mcp\" требует symbol_source.url"
+                    );
+                }
+                if self.repo.is_none() {
+                    anyhow::bail!(
+                        "symbol_source.kind = \"code_index_mcp\" требует symbol_source.repo"
+                    );
+                }
+                Ok(())
+            }
+            other => anyhow::bail!(
+                "symbol_source.kind = \"{other}\" неизвестен. Допустимые значения: \
+                 none, lite, code_index_db, code_index_mcp"
+            ),
+        }
+    }
+}
+
+/// Белый список MCP-инструментов (`[tools]` в config.toml).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ToolsConfig {
+    /// Имена разрешённых инструментов. Пустой список — фильтр выключен,
+    /// доступны все. Пример: `enabled = ["validate_module"]` — сервер отдаёт
+    /// и выполняет только валидацию модуля.
+    pub enabled: Vec<String>,
 }
 
 impl Default for Config {
@@ -75,6 +162,8 @@ impl Default for Config {
                 "127.0.0.1".to_string(),
                 "::1".to_string(),
             ],
+            symbol_source: SymbolSourceConfig::default(),
+            tools: ToolsConfig::default(),
         }
     }
 }
@@ -90,6 +179,30 @@ impl Config {
         // Кламп уровня в безопасный диапазон, чтобы конфиг с опечаткой
         // (`level = 5`) не валил сервер и не приводил к скрытым ошибкам.
         cfg.default_validation_level = cfg.default_validation_level.clamp(1, 3);
+        cfg.symbol_source.validate()?;
         Ok(cfg)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tools_whitelist_parsed_from_toml() {
+        let cfg: Config = toml::from_str("[tools]\nenabled = [\"validate_module\"]\n").unwrap();
+        assert_eq!(cfg.tools.enabled, vec!["validate_module".to_string()]);
+    }
+
+    #[test]
+    fn tools_section_absent_means_empty_whitelist() {
+        let cfg: Config = toml::from_str("port = 8007\n").unwrap();
+        assert!(cfg.tools.enabled.is_empty());
+    }
+
+    #[test]
+    fn symbol_source_root_parsed() {
+        let cfg: Config = toml::from_str("[symbol_source]\nkind = \"lite\"\ndb_path = \"a.db\"\nroot = \"C:/RepoUT\"\n").unwrap();
+        assert_eq!(cfg.symbol_source.root.as_deref(), Some(std::path::Path::new("C:/RepoUT")));
     }
 }

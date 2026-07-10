@@ -8,7 +8,14 @@ pub mod directives;
 pub mod expression;
 pub mod module;
 pub mod scope;
+pub mod symbols;
 
+/// Единый слой разбора вынесен в отдельный крейт: им пользуется и индексатор кода.
+pub use bsl_parse::{module_declarations, module_declarations_split, normalize_for_parser};
+pub mod ast {
+    //! Совместимость: разбор переехал в крейт `bsl-parse`.
+    pub use bsl_parse::normalize_for_parser;
+}
 pub use check::{
     validate_enum, validate_method_call, EnumValidation, MethodCallValidation, SimilarValue,
     SignatureBrief,
@@ -19,5 +26,7 @@ pub use expression::{
 };
 pub use module::{
     validate_module, validate_module_at_level, validate_module_with_profile,
+    validate_module_with_symbols,
 };
 pub use scope::{extract_scope_map, extract_type_annotations, Scope, ScopeMap};
+pub use symbols::SymbolSource;
