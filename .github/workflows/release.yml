@@ -19,8 +19,35 @@ permissions:
   contents: write   # нужно для загрузки ассетов в Release
 
 jobs:
+  # Релиз создаётся ОДИН раз и до сборок. Раньше его создавала каждая из четырёх
+  # параллельных работ — если готового ещё не видно. На v0.8.0 все четыре стартовали
+  # в одну секунду, две успели создать по объекту релиза, и macOS (самая долгая сборка)
+  # залила архив в свой дубль-черновик, а на публикации получила отказ
+  # `already_exists: tag_name`. Итог: работа упала, архив под macOS в релиз не попал.
+  create-release:
+    name: Создать Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Определить тег
+        id: tag
+        run: echo "tag=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      # Идемпотентно: при повторном запуске (workflow_dispatch на существующий тег)
+      # ничего не пересоздаётся, заметки релиза не затираются.
+      - name: Создать релиз, если его ещё нет
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Релиз $TAG уже существует — создавать не нужно."
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --generate-notes
+          fi
+
   build:
     name: ${{ matrix.target }}
+    needs: create-release   # релиз уже существует — сборкам остаётся только долить архивы
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false   # одна упавшая цель не отменяет остальные
@@ -90,8 +117,11 @@ jobs:
           Compress-Archive -Path $dist -DestinationPath "$dist.zip"
           "ASSET=$dist.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
 
+      # Только заливка: релиз создан отдельной работой выше. Никакая сборка больше не
+      # создаёт релиз сама, поэтому гонки за тег не возникает. --clobber делает шаг
+      # повторяемым: перезапуск работы просто заменит архив, а не упадёт на дубле.
       - name: Загрузить в Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.tag.outputs.tag }}
-          files: ${{ env.ASSET }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ steps.tag.outputs.tag }}" "$ASSET" --clobber --repo "$GITHUB_REPOSITORY"
