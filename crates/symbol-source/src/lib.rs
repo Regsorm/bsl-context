@@ -14,6 +14,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -255,6 +256,9 @@ pub struct CodeIndexMcpSource {
     /// Кэш экспортов владельца по пути модуля формы: один вызов `get_file_summary`
     /// на модуль, а не на каждое имя.
     owner_cache: Mutex<std::collections::HashMap<String, HashSet<String>>>,
+    /// Источник в рабочем состоянии. Сбрасывается в `false` любой ошибкой транспорта
+    /// (см. `is_healthy`) — обратно уже не поднимается: источник пересоздаётся заново.
+    healthy: AtomicBool,
 }
 
 /// Находка `search_function`: то, что нужно обоим вопросам источника.
@@ -278,8 +282,10 @@ impl CodeIndexMcpSource {
             search_cache: Mutex::new(std::collections::HashMap::new()),
             global_module_cache: Mutex::new(std::collections::HashMap::new()),
             owner_cache: Mutex::new(std::collections::HashMap::new()),
+            healthy: AtomicBool::new(true),
         };
         source.initialize()?;
+        source.ensure_repo_known()?;
         Ok(source)
     }
 
@@ -325,6 +331,49 @@ impl CodeIndexMcpSource {
         Ok(())
     }
 
+    /// Проверить, что code-index вообще знает этот репозиторий. Без проверки источник
+    /// молча отвечал бы «метод не найден» на любое имя, а валидатор — выдавал находку
+    /// «метод не объявлен» на каждый вызов процедуры. Лучше внятный отказ на старте.
+    ///
+    /// Спрашиваем статистику ИМЕННО по своему репозиторию (`get_stats(repo)`) — это 14 мс.
+    /// Полный `get_stats()` без аргументов считает статистику по всем репозиториям сразу:
+    /// на холодную это больше 5 секунд, и проверка сама себя роняла по таймауту (замер
+    /// 2026-07-13). На незнакомое имя code-index отвечает «Неизвестный repo …» и тут же
+    /// перечисляет доступные — отдельный запрос за списком не нужен.
+    fn ensure_repo_known(&self) -> Result<()> {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {
+                "name": "get_stats",
+                "arguments": {"repo": self.repo}
+            }
+        });
+        let resp = self
+            .post(body)
+            .with_context(|| format!("code-index mcp: get_stats к {} не прошёл", self.url))?;
+        let text = resp.into_string().context("code-index mcp: тело ответа")?;
+        let value = parse_sse_json(&text)
+            .ok_or_else(|| anyhow::anyhow!("code-index mcp: пустой/неразбираемый SSE-ответ"))?;
+        match repo_check_from_get_stats(&value, &self.repo) {
+            RepoCheck::Known => Ok(()),
+            RepoCheck::Unknown(message) => {
+                anyhow::bail!("code-index по адресу {}: {}", self.url, message)
+            }
+            // Форма ответа может смениться в новой версии code-index — это чужой продукт.
+            // Не распознали — не блокируем старт, просто не проверяем.
+            RepoCheck::Unrecognized => {
+                tracing::warn!(
+                    url = %self.url,
+                    repo = %self.repo,
+                    "code-index mcp: ответ get_stats не распознан, проверка репозитория пропущена"
+                );
+                Ok(())
+            }
+        }
+    }
+
     /// POST к `/mcp` с заголовками и сессией. Общая часть всех вызовов.
     fn post(&self, body: Value) -> Result<ureq::Response, ureq::Error> {
         let mut req = self
@@ -349,15 +398,23 @@ impl CodeIndexMcpSource {
         if let Some(cached) = self.search_cache.lock().unwrap().get(name_lower) {
             return cached.clone();
         }
-        let found = self.call_search(name_lower).unwrap_or_else(|e| {
-            tracing::warn!(error = %e, name = name_lower, "code-index mcp: ошибка search_function");
-            Vec::new()
-        });
-        self.search_cache
-            .lock()
-            .unwrap()
-            .insert(name_lower.to_string(), found.clone());
-        found
+        match self.call_search(name_lower) {
+            Ok(found) => {
+                self.search_cache
+                    .lock()
+                    .unwrap()
+                    .insert(name_lower.to_string(), found.clone());
+                found
+            }
+            Err(e) => {
+                // Пустой результат НЕ кэшируется: иначе одна сетевая ошибка отравляет
+                // кэш до перезапуска сервера, и валидатор до конца сессии считает,
+                // что метода нигде не существует.
+                tracing::warn!(error = %e, name = name_lower, "code-index mcp: ошибка search_function");
+                self.healthy.store(false, Ordering::Relaxed);
+                Vec::new()
+            }
+        }
     }
 
     fn call_search(&self, name_lower: &str) -> Result<Vec<FoundFn>> {
@@ -385,15 +442,20 @@ impl CodeIndexMcpSource {
         if let Some(cached) = self.global_module_cache.lock().unwrap().get(xml_path) {
             return *cached;
         }
-        let is_global = self.call_module_is_global(xml_path).unwrap_or_else(|e| {
-            tracing::warn!(error = %e, xml_path, "code-index mcp: ошибка read_file общего модуля");
-            false
-        });
-        self.global_module_cache
-            .lock()
-            .unwrap()
-            .insert(xml_path.to_string(), is_global);
-        is_global
+        match self.call_module_is_global(xml_path) {
+            Ok(is_global) => {
+                self.global_module_cache
+                    .lock()
+                    .unwrap()
+                    .insert(xml_path.to_string(), is_global);
+                is_global
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, xml_path, "code-index mcp: ошибка read_file общего модуля");
+                self.healthy.store(false, Ordering::Relaxed);
+                false
+            }
+        }
     }
 
     fn call_module_is_global(&self, xml_path: &str) -> Result<bool> {
@@ -467,12 +529,21 @@ impl SymbolSource for CodeIndexMcpSource {
         if let Some(cached) = self.owner_cache.lock().unwrap().get(&owner) {
             return Some(cached.clone());
         }
-        let names = self.call_owner_exports(&owner).unwrap_or_else(|e| {
-            tracing::warn!(error = %e, owner = %owner, "code-index mcp: ошибка get_file_summary");
-            HashSet::new()
-        });
-        self.owner_cache.lock().unwrap().insert(owner, names.clone());
-        Some(names)
+        match self.call_owner_exports(&owner) {
+            Ok(names) => {
+                self.owner_cache.lock().unwrap().insert(owner, names.clone());
+                Some(names)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, owner = %owner, "code-index mcp: ошибка get_file_summary");
+                self.healthy.store(false, Ordering::Relaxed);
+                Some(HashSet::new())
+            }
+        }
+    }
+
+    fn is_healthy(&self) -> bool {
+        self.healthy.load(Ordering::Relaxed)
     }
 
     fn describe(&self) -> String {
@@ -518,6 +589,40 @@ fn common_module_xml_path(module_path: &str) -> Option<String> {
 /// и источник молча отвечает «имени нет» на любое имя.
 fn payload(value: &Value) -> &Value {
     value.get("result").unwrap_or(value)
+}
+
+/// Итог проверки репозитория по ответу `get_stats(repo)`.
+enum RepoCheck {
+    /// code-index знает этот репозиторий.
+    Known,
+    /// code-index явно ответил «Неизвестный repo …» — в его сообщении уже перечислены
+    /// доступные имена, поэтому текст берём целиком.
+    Unknown(String),
+    /// Форма ответа не распознана — блокировать старт по этому поводу нельзя.
+    Unrecognized,
+}
+
+/// Разбор ответа `get_stats(repo=…)`. Формы подтверждены на живом сервере:
+/// известный репозиторий — `{"repo":"ut-test","db":{...},"daemon":{...}}`;
+/// неизвестный — `{"status":"not_started","message":"Неизвестный repo 'x'. Доступные: [...]"}`.
+///
+/// Репозиторий, который известен, но ещё не проиндексирован, проверку ПРОХОДИТ:
+/// он объявлен в конфиге code-index, просто не готов — это не повод не подключаться.
+fn repo_check_from_get_stats(value: &Value, repo: &str) -> RepoCheck {
+    let Some(text) = value.pointer("/result/content/0/text").and_then(|t| t.as_str()) else {
+        return RepoCheck::Unrecognized;
+    };
+    let Ok(parsed) = serde_json::from_str::<Value>(text) else {
+        return RepoCheck::Unrecognized;
+    };
+    let body = payload(&parsed);
+    if body.get("repo").and_then(|r| r.as_str()) == Some(repo) {
+        return RepoCheck::Known;
+    }
+    match body.get("message").and_then(|m| m.as_str()) {
+        Some(msg) if msg.contains("Неизвестный repo") => RepoCheck::Unknown(msg.to_string()),
+        _ => RepoCheck::Unrecognized,
+    }
 }
 
 /// Имена экспортных функций из ответа `get_file_summary` (нижний регистр).
@@ -625,6 +730,39 @@ mod tests {
         let fns = found_fns_from_search(&v);
         assert!(!fns.iter().any(|f| f.name_lower == "сведенияовнешнейобработке"));
         assert!(fns.iter().any(|f| f.name_lower == "сведенияовнешнейобработкедопустимой"));
+    }
+
+    #[test]
+    fn repo_check_known_repo() {
+        let v = tool_response(
+            r#"{"repo":"ut-test","path":"C:/RepoUT-test","db":{"total_functions":261548}}"#,
+        );
+        assert!(matches!(
+            repo_check_from_get_stats(&v, "ut-test"),
+            RepoCheck::Known
+        ));
+    }
+
+    #[test]
+    fn repo_check_unknown_repo_carries_available_list() {
+        let v = tool_response(
+            r#"{"status":"not_started","message":"Неизвестный repo 'нет-такого'. Доступные: [\"ut\", \"wms\"]"}"#,
+        );
+        match repo_check_from_get_stats(&v, "нет-такого") {
+            RepoCheck::Unknown(msg) => {
+                assert!(msg.contains("ut"), "в сообщении должен быть список доступных: {msg}");
+            }
+            _ => panic!("неизвестный репозиторий должен быть распознан как Unknown"),
+        }
+    }
+
+    #[test]
+    fn repo_check_unrecognized_shape_does_not_block() {
+        let v = tool_response(r#"{"something_else": true}"#);
+        assert!(matches!(
+            repo_check_from_get_stats(&v, "ut"),
+            RepoCheck::Unrecognized
+        ));
     }
 
     #[test]

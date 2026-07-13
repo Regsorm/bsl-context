@@ -56,7 +56,7 @@ fn build_symbol_source(cfg: &config::SymbolSourceConfig) -> Option<Arc<dyn Symbo
         }
         "code_index_mcp" => {
             let url = cfg.url.clone()?;
-            let repo = cfg.repo.clone()?;
+            let repo = cfg.code_index_repo_effective()?.to_string();
             match symbol_source::CodeIndexMcpSource::new(url.clone(), repo.clone(), cfg.timeout_ms)
             {
                 Ok(src) => Some(Arc::new(src) as Arc<dyn SymbolSource>),
@@ -115,9 +115,21 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Внешний источник имён (см. крейт `symbol-source`) — строится один раз,
-    // независимо от индекса платформы; ошибка создания не мешает старту.
-    let symbol_source = build_symbol_source(&cfg.symbol_source);
+    // Источники имён конфигураций (по одному на конфигурацию, у каждого свой способ
+    // доступа). Ошибка создания конкретного источника не валит сервер: предупреждение
+    // в лог, валидация по этой конфигурации пойдёт без знания её имён.
+    let source_slots: Vec<_> = cfg
+        .resolved_symbol_sources()?
+        .into_iter()
+        .map(|(name, sc)| {
+            let src = build_symbol_source(&sc);
+            (name, sc, src)
+        })
+        .collect();
+    info!(
+        sources = ?source_slots.iter().map(|(n, _, _)| n.as_str()).collect::<Vec<_>>(),
+        "конфигурации, доступные параметру repo"
+    );
 
     // Загрузка индекса (Phase 4): если platform_path задан — eager build перед стартом
     // HTTP. Парсинг hbk на 8.3.27 занимает ~5–7 сек, поэтому делаем синхронно через
@@ -148,8 +160,7 @@ async fn main() -> anyhow::Result<()> {
                         cfg.default_validation_level,
                         cfg.default_profile,
                     )
-                    .with_symbol_source(symbol_source.clone())
-                    .with_symbol_source_config(cfg.symbol_source.clone())
+                    .with_sources(source_slots)
                     .apply_tools_whitelist(&cfg.tools.enabled),
                 )
             }

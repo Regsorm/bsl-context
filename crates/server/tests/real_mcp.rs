@@ -13,8 +13,8 @@
 use std::path::PathBuf;
 
 use bsl_context_server::mcp_server::{
-    BslContextServer, GetMemberParams, InfoParams, SearchParams, TypeNameParams,
-    ValidateEnumParams, ValidateMethodCallParams,
+    BslContextServer, GetMemberParams, InfoParams, RebuildSymbolIndexParams, SearchParams,
+    TypeNameParams, ValidateEnumParams, ValidateMethodCallParams, ValidateModuleParams,
 };
 use platform_index::load_from_hbk;
 use rmcp::handler::server::wrapper::Parameters;
@@ -229,8 +229,16 @@ async fn tools_whitelist_hides_and_blocks_tools() {
 #[tokio::test]
 async fn rebuild_symbol_index_refuses_when_source_is_not_lite() {
     let Some(srv) = make_server().await else { eprintln!("skip: hbk не найден"); return; };
-    // Конфига источника нет → kind по умолчанию "none".
-    let json = srv.rebuild_symbol_index().await;
+    // Слот сконфигурирован, но источник — не lite (например, прямое чтение базы
+    // code-index): пересобирать через этот инструмент нечего, это чужой индекс.
+    let mut cfg = bsl_context_server::config::SymbolSourceConfig::default();
+    cfg.kind = "code_index_db".to_string();
+    cfg.db_path = Some(std::path::PathBuf::from(r"C:\RepoUT\.code-index\index.db"));
+    let srv = srv.with_sources(vec![("ut".to_string(), cfg, None)]);
+
+    let json = srv
+        .rebuild_symbol_index(Parameters(RebuildSymbolIndexParams { repo: Some("ut".to_string()) }))
+        .await;
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(v["ok"], false);
     assert!(v["message"].as_str().unwrap().contains("пересобирать нечего"));
@@ -250,17 +258,137 @@ async fn rebuild_symbol_index_builds_database_and_creates_directory() {
     cfg.kind = "lite".to_string();
     cfg.root = Some(root.to_path_buf());
     cfg.db_path = Some(db.clone());
-    let srv = srv.with_symbol_source_config(cfg);
+    let srv = srv.with_sources(vec![("wms".to_string(), cfg, None)]);
 
-    let json = srv.rebuild_symbol_index().await;
+    let json = srv
+        .rebuild_symbol_index(Parameters(RebuildSymbolIndexParams { repo: Some("wms".to_string()) }))
+        .await;
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(v["ok"], true, "ответ: {json}");
     assert!(v["modules"].as_u64().unwrap() > 0);
     assert!(db.exists(), "база не создана");
     // Источник подменён в памяти.
-    assert!(srv.symbol_source.read().await.is_some());
+    assert!(srv.sources["wms"].source.read().await.is_some());
     // Временный файл убран.
     assert!(!db.with_extension("db.tmp").exists());
 
     let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+}
+
+#[tokio::test]
+async fn validate_module_rejects_unknown_repo() {
+    let Some(srv) = make_server().await else { eprintln!("skip: hbk не найден"); return; };
+    let mut cfg = bsl_context_server::config::SymbolSourceConfig::default();
+    cfg.kind = "lite".to_string();
+    cfg.db_path = Some(std::path::PathBuf::from(r"C:\tools\bsl-context\ut_lite.db"));
+    let srv = srv.with_sources(vec![("ut".to_string(), cfg, None)]);
+
+    let json = srv
+        .validate_module(Parameters(ValidateModuleParams {
+            source: "Процедура Тест()\nКонецПроцедуры".into(),
+            level: None,
+            profile: None,
+            module_path: None,
+            repo: Some("нет-такого".to_string()),
+        }))
+        .await;
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["ok"], false);
+    assert!(
+        v["message"].as_str().unwrap().contains("ut"),
+        "в сообщении должны быть перечислены доступные алиасы: {json}"
+    );
+}
+
+#[tokio::test]
+async fn validate_module_requires_repo_when_sources_configured() {
+    let Some(srv) = make_server().await else { eprintln!("skip: hbk не найден"); return; };
+    let mut cfg = bsl_context_server::config::SymbolSourceConfig::default();
+    cfg.kind = "lite".to_string();
+    cfg.db_path = Some(std::path::PathBuf::from(r"C:\tools\bsl-context\ut_lite.db"));
+    let srv = srv.with_sources(vec![("ut".to_string(), cfg, None)]);
+
+    let json = srv
+        .validate_module(Parameters(ValidateModuleParams {
+            source: "Процедура Тест()\nКонецПроцедуры".into(),
+            level: None,
+            profile: None,
+            module_path: None,
+            repo: None,
+        }))
+        .await;
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["ok"], false);
+    assert!(v["message"].as_str().unwrap().contains("repo обязателен"));
+}
+
+#[tokio::test]
+async fn validate_module_without_sources_checks_platform_only() {
+    let Some(srv) = make_server().await else { eprintln!("skip: hbk не найден"); return; };
+    // Ни одной конфигурации не настроено — repo не нужен, проверка идёт только
+    // против справки платформы (как до появления параметра repo).
+    let json = srv
+        .validate_module(Parameters(ValidateModuleParams {
+            source: "Процедура Тест()\n\tА = ТипРазмещенияТекстаТабличногоДокумента.Перенос;\nКонецПроцедуры".into(),
+            level: None,
+            profile: None,
+            module_path: None,
+            repo: None,
+        }))
+        .await;
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert!(v.get("valid").is_some(), "ожидался обычный результат валидации: {json}");
+}
+
+#[tokio::test]
+async fn validate_module_refuses_when_lite_index_not_built() {
+    let Some(srv) = make_server().await else { eprintln!("skip: hbk не найден"); return; };
+    // Слот настроен (kind = "lite"), но источник — None: rebuild_symbol_index ни разу
+    // не запускали. Тихая валидация без имён здесь недопустима — нужен явный отказ,
+    // а не молчаливая деградация до режима "без конфигурации".
+    let mut cfg = bsl_context_server::config::SymbolSourceConfig::default();
+    cfg.kind = "lite".to_string();
+    cfg.db_path = Some(std::path::PathBuf::from(r"C:\tools\bsl-context\ut_lite.db"));
+    let srv = srv.with_sources(vec![("ut".to_string(), cfg, None)]);
+
+    let json = srv
+        .validate_module(Parameters(ValidateModuleParams {
+            source: "Процедура Тест()\nКонецПроцедуры".into(),
+            level: None,
+            profile: None,
+            module_path: None,
+            repo: Some("ut".to_string()),
+        }))
+        .await;
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["ok"], false);
+    assert!(
+        v["message"].as_str().unwrap().contains("rebuild_symbol_index"),
+        "сообщение должно указывать на rebuild_symbol_index: {json}"
+    );
+}
+
+#[tokio::test]
+async fn validate_module_rejects_repo_when_no_sources_configured() {
+    let Some(srv) = make_server().await else { eprintln!("skip: hbk не найден"); return; };
+    // Сервер вообще без слотов (make_server их не настраивает), но клиент явно
+    // просит repo — отказ должен называть причину, а не тихо съесть параметр.
+    let json = srv
+        .validate_module(Parameters(ValidateModuleParams {
+            source: "Процедура Тест()\nКонецПроцедуры".into(),
+            level: None,
+            profile: None,
+            module_path: None,
+            repo: Some("ut".to_string()),
+        }))
+        .await;
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["ok"], false);
+    assert!(
+        v["message"]
+            .as_str()
+            .unwrap()
+            .contains("не настроено ни одной конфигурации"),
+        "сообщение: {json}"
+    );
 }

@@ -73,3 +73,30 @@ default_validation_level = 1
 # url = "http://127.0.0.1:8011/mcp"
 # repo = "ut"
 # timeout_ms = 5000
+
+# Несколько конфигураций сразу. У validate_module и rebuild_symbol_index появляется
+# параметр repo = значение поля repo нужной секции. Взаимоисключающе с [symbol_source]
+# выше — указаны обе секции сразу, сервер откажется стартовать.
+#
+# Способ доступа у каждой свой. По скорости: lite и code_index_db читают файл базы
+# напрямую — это на порядки быстрее code_index_mcp, где каждое имя уходит отдельным
+# запросом по сети к другому процессу.
+#
+# [[symbol_sources]]
+# repo = "ut"
+# kind = "lite"
+# root = 'C:\RepoUT'
+# db_path = 'C:\tools\bsl-context\ut_lite.db'
+#
+# [[symbol_sources]]
+# repo = "bp"
+# kind = "code_index_db"
+# db_path = 'C:\RepoBP_SS\.code-index\index.db'
+#
+# [[symbol_sources]]
+# repo = "zup"
+# kind = "code_index_mcp"
+# url = "http://10.0.0.5:8011/mcp"          # code-index на другой машине
+# # code_index_repo не задан — в запросах к code-index используется тот же алиас "zup".
+# # Нужен, только если в code-index репозиторий зарегистрирован под другим именем:
+# # code_index_repo = "zup-prod"

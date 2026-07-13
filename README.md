@@ -202,6 +202,58 @@ must be rebuilt after the configuration changes. The `code-index` sources read f
 index instead — if a file watcher keeps it current, the names are always fresh. The
 "global common module" flag is taken from the module's XML, which `code-index` stores verbatim.
 
+They also differ in speed. Measured on a 261,548-function index: a direct SQLite lookup
+takes 13 µs (142 ns once the names are held in memory), a networked `code-index` request
+13.4 ms. The validator checks hundreds of calls per module, so prefer `lite` or
+`code_index_db`; use `code_index_mcp` when the index lives on another machine.
+
+### Several configurations on one server
+
+One server can serve several configurations at once, each with its own access method.
+Instead of the single `[symbol_source]` section, list them:
+
+```toml
+[[symbol_sources]]
+repo = "ut"                    # configuration alias — this is the tools' `repo` argument
+kind = "lite"
+root = 'C:\RepoUT'
+db_path = 'C:\tools\bsl-context\ut_lite.db'
+
+[[symbol_sources]]
+repo = "bp"
+kind = "code_index_db"
+db_path = 'C:\RepoBP\.code-index\index.db'
+
+[[symbol_sources]]
+repo = "zup"
+kind = "code_index_mcp"
+url = "http://10.0.0.5:8011/mcp"
+code_index_repo = "zup-prod"   # optional: only when code-index names that repository differently
+```
+
+`validate_module` and `rebuild_symbol_index` then take a `repo` argument — that alias.
+**It is required whenever at least one configuration is configured**, even a single one:
+a call must be unambiguous. An unknown alias is refused with the list of available ones.
+`[symbol_source]` and `[[symbol_sources]]` are mutually exclusive.
+
+With no configuration set up at all the argument is not needed: code is checked against
+the platform reference only.
+
+### What happens when a symbol source is unavailable
+
+A source that answers "no such method" to everything is worse than no source at all: the
+validator turns that into a high-confidence `undeclared_method` finding on every single
+procedure call. Hence:
+
+- **On connect**, a `code_index_mcp` source asks `code-index` for the stats of its own
+  repository. If `code-index` does not know it, the source is not created and the log gets
+  an explicit error listing the available repositories.
+- **A configuration is declared but its source failed to come up** — `validate_module` for
+  that alias refuses and explains why (for `lite`: "index not built, call
+  `rebuild_symbol_index`") instead of emitting findings that are certainly false.
+- **A source dies mid-flight** (network, `code-index` down) — it is marked unhealthy, the
+  empty answer is not cached, and validation for that configuration refuses until recovery.
+
 ### Tool whitelist
 
 If you only need part of the server's surface, list the tools you want in the

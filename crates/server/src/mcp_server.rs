@@ -7,7 +7,7 @@
 //! Phase 5 (когда подключим валидаторы) — добавит `validateEnum`,
 //! `validateMethodCall`. Phase 6 — `validateExpression`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -25,6 +25,30 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// Слот одного источника имён: конфиг, сам источник (пересборка подменяет его на
+/// ходу) и флаг «идёт пересборка». Флаг на слот, а не на сервер: пересборка индекса
+/// одной конфигурации не должна мешать работе с другой.
+pub struct SourceSlot {
+    pub config: crate::config::SymbolSourceConfig,
+    /// Под `RwLock`, потому что `rebuild_symbol_index` подменяет источник на ходу.
+    /// `tokio`-версия: блокировка переживает `await` вокруг сборки индекса.
+    pub source: tokio::sync::RwLock<Option<Arc<dyn SymbolSource>>>,
+    rebuilding: AtomicBool,
+}
+
+impl SourceSlot {
+    pub fn new(
+        config: crate::config::SymbolSourceConfig,
+        source: Option<Arc<dyn SymbolSource>>,
+    ) -> Self {
+        Self {
+            config,
+            source: tokio::sync::RwLock::new(source),
+            rebuilding: AtomicBool::new(false),
+        }
+    }
+}
+
 /// Состояние MCP-сервера: индекс + поисковый движок (готовы к чтению).
 #[derive(Clone)]
 pub struct BslContextServer {
@@ -36,15 +60,10 @@ pub struct BslContextServer {
     /// Дефолтный профиль потребителя, если клиент не передал `profile`
     /// в `validate_module`. Берётся из `config.toml` (поле `default_profile`).
     pub default_profile: Profile,
-    /// Внешний источник имён. Под `RwLock`, потому что `rebuild_symbol_index`
-    /// подменяет его на ходу. `tokio`-версия: блокировка переживает `await`
-    /// вокруг сборки индекса.
-    pub symbol_source: Arc<tokio::sync::RwLock<Option<Arc<dyn SymbolSource>>>>,
-    /// Конфиг источника — нужен `rebuild_symbol_index`, чтобы взять пути.
-    /// Клиент путей не передаёт: что пересобирать, решает конфиг сервера.
-    pub symbol_source_config: crate::config::SymbolSourceConfig,
-    /// Идёт ли сейчас пересборка. Две одновременные недопустимы.
-    rebuilding: Arc<AtomicBool>,
+    /// Именованные источники имён конфигураций. Ключ — алиас: это значение параметра
+    /// `repo` у `validate_module`/`rebuild_symbol_index`. Пустая карта — конфигураций
+    /// не настроено, валидация идёт только против справки платформы.
+    pub sources: Arc<BTreeMap<String, SourceSlot>>,
     /// Белый список инструментов из `[tools].enabled`. `None` — фильтр выключен.
     /// `Arc`, потому что сервер клонируется на каждый запрос.
     allowed_tools: Option<Arc<BTreeSet<String>>>,
@@ -72,24 +91,24 @@ impl BslContextServer {
             engine: Arc::new(engine),
             default_validation_level: default_validation_level.clamp(1, 3),
             default_profile,
-            symbol_source: Arc::new(tokio::sync::RwLock::new(None)),
-            symbol_source_config: Default::default(),
-            rebuilding: Arc::new(AtomicBool::new(false)),
+            sources: Arc::new(BTreeMap::new()),
             allowed_tools: None,
             tool_router: Self::tool_router(),
         }
     }
 
-    /// Подключить внешний источник имён (см. крейт `symbol-source`). Без
-    /// вызова `validate_module` работает без внешнего контекста конфигурации.
-    pub fn with_symbol_source(mut self, source: Option<Arc<dyn SymbolSource>>) -> Self {
-        self.symbol_source = Arc::new(tokio::sync::RwLock::new(source));
-        self
-    }
-
-    /// Конфиг источника (пути для пересборки). Без него `rebuild_symbol_index` откажет.
-    pub fn with_symbol_source_config(mut self, cfg: crate::config::SymbolSourceConfig) -> Self {
-        self.symbol_source_config = cfg;
+    /// Подключить именованные источники имён (по одному на конфигурацию). Вызывается
+    /// один раз на старте: карта дальше не меняется, меняется только содержимое слотов
+    /// (пересборка индекса конкретной конфигурации).
+    pub fn with_sources(
+        mut self,
+        slots: Vec<(String, crate::config::SymbolSourceConfig, Option<Arc<dyn SymbolSource>>)>,
+    ) -> Self {
+        let map = slots
+            .into_iter()
+            .map(|(name, config, source)| (name, SourceSlot::new(config, source)))
+            .collect();
+        self.sources = Arc::new(map);
         self
     }
 
@@ -138,10 +157,39 @@ impl BslContextServer {
         }
     }
 
+    /// Настроенные алиасы через запятую — для текста ошибок.
+    fn source_names(&self) -> String {
+        self.sources.keys().cloned().collect::<Vec<_>>().join(", ")
+    }
+
+    /// Найти конфигурацию по алиасу. `repo` обязателен, когда настроена хотя бы одна:
+    /// молча подставлять единственную нельзя — вызов должен быть однозначным.
+    fn resolve_slot(&self, repo: Option<&str>) -> Result<&SourceSlot, String> {
+        if self.sources.is_empty() {
+            return Err(
+                "на сервере не настроено ни одной конфигурации: ни выгрузки, ни источника имён \
+                 (секция [[symbol_sources]] в config.toml)"
+                    .to_string(),
+            );
+        }
+        match repo {
+            Some(name) => self.sources.get(name).ok_or_else(|| {
+                format!(
+                    "конфигурация \"{name}\" не настроена; доступны: {}",
+                    self.source_names()
+                )
+            }),
+            None => Err(format!(
+                "параметр repo обязателен; доступные конфигурации: {}",
+                self.source_names()
+            )),
+        }
+    }
+
     /// Собрать индекс во временный файл, снять старый источник, подменить файл,
     /// открыть новый. Старый источник снимается ДО подмены: SQLite держит файл
     /// открытым, и на Windows переименовать поверх него нельзя.
-    async fn rebuild_inner(&self, root: &Path, db_path: &Path) -> anyhow::Result<String> {
+    async fn rebuild_inner(&self, slot: &SourceSlot, root: &Path, db_path: &Path) -> anyhow::Result<String> {
         if let Some(dir) = db_path.parent() {
             std::fs::create_dir_all(dir)
                 .with_context(|| format!("не удалось создать каталог {}", dir.display()))?;
@@ -162,7 +210,7 @@ impl BslContextServer {
         };
 
         // Блокировка на запись: текущие валидации дождутся, новые подождут нас.
-        let mut guard = self.symbol_source.write().await;
+        let mut guard = slot.source.write().await;
         *guard = None; // закрывает старую базу — иначе Windows не даст её заменить
 
         let (tmp_c, db_c) = (tmp.clone(), db_path.to_path_buf());
@@ -309,6 +357,18 @@ pub struct ValidateModuleParams {
     /// методы модуля объекта-владельца внешней обработки.
     #[serde(alias = "modulePath")]
     pub module_path: Option<String>,
+    /// Алиас конфигурации из настроек сервера (`repo` в `[[symbol_sources]]`), чьи
+    /// имена методов учитывать. Обязателен, если на сервере настроена хотя бы одна
+    /// конфигурация. Если не настроено ни одной — код проверяется только против
+    /// справки платформы, и параметр не нужен.
+    pub repo: Option<String>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct RebuildSymbolIndexParams {
+    /// Алиас конфигурации, чей lite-индекс пересобрать (`repo` в `[[symbol_sources]]`).
+    pub repo: Option<String>,
 }
 
 // ── Tools ──────────────────────────────────────────────────────────────────
@@ -446,7 +506,11 @@ impl BslContextServer {
                        Параметр level: 1 (default) — только явные имена типов; 2 — плюс локальный вывод \
                        типа переменных; 3 — плюс тип из возвращаемых значений. Параметр profile: 'strict' \
                        (только high-confidence + level=1, для слабых моделей) или 'full' (все находки, \
-                       default). Возвращает JSON \
+                       default). Параметр repo — алиас конфигурации из настроек сервера \
+                       ([[symbol_sources]] в config.toml), чьи имена методов учитывать; обязателен, \
+                       если на сервере настроена хотя бы одна конфигурация (список доступных алиасов \
+                       возвращается отказом при промахе), иначе не нужен — проверка идёт только против \
+                       справки платформы. Возвращает JSON \
                        {valid, errors:[{line,col,kind,confidence,message,suggestion?}]}."
     )]
     pub async fn validate_module(
@@ -461,19 +525,68 @@ impl BslContextServer {
             Some(ref s) => Profile::parse_or_default(Some(s)),
             None => self.default_profile,
         };
-        let guard = self.symbol_source.read().await;
-        let result = match guard.as_ref() {
-            Some(source) => validate_module_with_symbols(
-                &self.index,
-                &p.source,
-                level,
-                profile,
-                p.module_path.as_deref(),
-                Some(source.as_ref()),
-            ),
-            None => validate_module_with_profile(&self.index, &p.source, level, profile),
+        // Ни одной конфигурации не настроено И клиент не просил repo — обычная проверка
+        // против справки платформы, как до появления параметра repo. Остальные случаи
+        // (сервер пуст, но repo передан; сервер настроен) идут через resolve_slot — он
+        // же формирует и единообразный текст ошибки для этого и для rebuild_symbol_index.
+        let slot = if self.sources.is_empty() && p.repo.is_none() {
+            None
+        } else {
+            match self.resolve_slot(p.repo.as_deref()) {
+                Ok(slot) => Some(slot),
+                Err(msg) => return err_json(&msg),
+            }
         };
-        drop(guard);
+        let Some(slot) = slot else {
+            let result = validate_module_with_profile(&self.index, &p.source, level, profile);
+            return serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
+        };
+        // Слот найден по точному совпадению repo — значит параметр был Some.
+        let repo = p.repo.as_deref().unwrap_or_default();
+        let guard = slot.source.read().await;
+        let source = match guard.as_ref() {
+            Some(source) => source,
+            // Слот настроен, но источник не поднят: для lite сборка ещё не запускалась,
+            // для остальных — создание источника упало на старте (смотри лог сервера).
+            // Тихая валидация без имён здесь недопустима — именно так на УТ получалась
+            // 1420 ложных находок «метод не объявлен» на каждый вызов процедуры.
+            None => {
+                return if slot.config.kind == "lite" {
+                    err_json(&format!(
+                        "индекс имён конфигурации \"{repo}\" не собран — вызовите \
+                         rebuild_symbol_index с repo=\"{repo}\""
+                    ))
+                } else {
+                    err_json(&format!(
+                        "источник имён конфигурации \"{repo}\" не подключён — смотрите ошибку \
+                         в журнале сервера"
+                    ))
+                };
+            }
+        };
+        if !source.is_healthy() {
+            return err_json(&format!(
+                "источник имён конфигурации \"{repo}\" недоступен: {}. Проверьте code-index.",
+                source.describe()
+            ));
+        }
+        let result = validate_module_with_symbols(
+            &self.index,
+            &p.source,
+            level,
+            profile,
+            p.module_path.as_deref(),
+            Some(source.as_ref()),
+        );
+        if !source.is_healthy() {
+            // Отвалился во время самой валидации (code-index упал на полпути) — часть
+            // имён могла быть заменена пустыми ответами. Лучше явный отказ, чем
+            // заведомо неполный результат.
+            return err_json(&format!(
+                "источник имён конфигурации \"{repo}\" недоступен: {}. Проверьте code-index.",
+                source.describe()
+            ));
+        }
         serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
     }
 
@@ -499,11 +612,21 @@ impl BslContextServer {
                        symbol_source.kind = \"lite\". Пути берутся ИЗ КОНФИГА сервера: `root` — \
                        каталог выгрузки, `db_path` — файл базы (каталог создаётся, если его нет). \
                        Сборка идёт во временный файл и подменяет старую базу целиком: если она \
-                       упадёт, рабочая база останется прежней. Возвращает JSON \
+                       упадёт, рабочая база останется прежней. Параметр repo — алиас конфигурации из \
+                       настроек сервера ([[symbol_sources]] в config.toml), чей индекс пересобрать; \
+                       обязателен всегда, даже если настроена только одна конфигурация — вызов должен \
+                       быть однозначным. Возвращает JSON \
                        {ok, modules, methods, global_modules, elapsed_ms, db_path} либо {ok:false, message}."
     )]
-    pub async fn rebuild_symbol_index(&self) -> String {
-        let cfg = self.symbol_source_config.clone();
+    pub async fn rebuild_symbol_index(
+        &self,
+        Parameters(p): Parameters<RebuildSymbolIndexParams>,
+    ) -> String {
+        let slot = match self.resolve_slot(p.repo.as_deref()) {
+            Ok(slot) => slot,
+            Err(msg) => return err_json(&msg),
+        };
+        let cfg = slot.config.clone();
         // 1. Пересобирать имеет смысл только собственный индекс.
         if cfg.kind != "lite" {
             return err_json(&format!(
@@ -517,12 +640,12 @@ impl BslContextServer {
         if !root.is_dir() {
             return err_json(&format!("symbol_source.root = {} — каталога нет", root.display()));
         }
-        // 2. Одна сборка за раз.
-        if self.rebuilding.swap(true, Ordering::SeqCst) {
+        // 2. Одна сборка за раз для ЭТОЙ конфигурации — другие слоты пересобираются независимо.
+        if slot.rebuilding.swap(true, Ordering::SeqCst) {
             return err_json("пересборка уже идёт");
         }
-        let result = self.rebuild_inner(&root, &db_path).await;
-        self.rebuilding.store(false, Ordering::SeqCst);
+        let result = self.rebuild_inner(slot, &root, &db_path).await;
+        slot.rebuilding.store(false, Ordering::SeqCst);
         match result {
             Ok(json) => json,
             Err(e) => err_json(&format!("{e:#}")),
