@@ -125,6 +125,16 @@ pub enum ExprErrorKind {
     /// эвристике `fuzzy_confidence_for` (тот же механизм, что для
     /// `UnknownGlobalMethod`).
     UnknownDirective,
+    /// Имя локальной переменной совпало с членом контекста модуля: свойством
+    /// глобального контекста (`PlatformIndex.global_properties`) либо — в модуле
+    /// формы — методом/свойством типа `ФормаКлиентскогоПриложения`. Присваивание
+    /// такому имени не создаёт переменную, а падает в рантайме («Поле объекта
+    /// недоступно для записи») либо молча меняет свойство платформы. Эмиттится
+    /// только из `validate_module` (`crate::context_names`). Confidence
+    /// проставляется явно: метод или read-only свойство → High, свойство,
+    /// доступное для записи, → Low (присваивание компилируется, но не создаёт
+    /// переменную).
+    ShadowedContextName,
 }
 
 impl ExprErrorKind {
@@ -140,6 +150,10 @@ impl ExprErrorKind {
     /// а явно через [`ExprError::new_with_confidence`] по двухпороговой эвристике
     /// от `fuzzy_confidence_for`: High при сильном сходстве, Low при слабом.
     /// Хардкод здесь — только как safe fallback.
+    ///
+    /// `ShadowedContextName` — Confidence тоже проставляется явно, через
+    /// `new_with_confidence` (`crate::context_names`); здесь — Low как
+    /// безопасный fallback.
     pub fn confidence(self) -> Confidence {
         match self {
             ExprErrorKind::UnknownEnumValue
@@ -148,7 +162,8 @@ impl ExprErrorKind {
             ExprErrorKind::UnknownTypeMember
             | ExprErrorKind::UnknownNewType
             | ExprErrorKind::UnknownGlobalMethod
-            | ExprErrorKind::UnknownDirective => Confidence::Low,
+            | ExprErrorKind::UnknownDirective
+            | ExprErrorKind::ShadowedContextName => Confidence::Low,
         }
     }
 }
@@ -569,7 +584,7 @@ pub(crate) fn check_global_calls(
 
 // ── Вспомогательные ──────────────────────────────────────────────────────
 
-fn pos_at(src: &str, byte_idx: usize) -> (u32, u32) {
+pub(crate) fn pos_at(src: &str, byte_idx: usize) -> (u32, u32) {
     let mut line: u32 = 1;
     let mut col: u32 = 1;
     for (i, ch) in src.char_indices() {

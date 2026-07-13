@@ -7,7 +7,7 @@
 //! Phase 5 (когда подключим валидаторы) — добавит `validateEnum`,
 //! `validateMethodCall`. Phase 6 — `validateExpression`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -15,7 +15,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use bsl_validator::{
     validate_enum, validate_method_call, validate_module_with_profile,
-    validate_module_with_symbols, Profile, SymbolSource,
+    validate_module_with_symbols, Profile, SymbolSource, FORM_TYPE,
 };
 use platform_index::{format, Definition, PlatformIndex, SearchEngine};
 use rmcp::{
@@ -354,9 +354,20 @@ pub struct ValidateModuleParams {
     /// Неизвестное значение трактуется как `"full"`.
     pub profile: Option<String>,
     /// Относительный путь модуля в выгрузке; нужен, чтобы учесть экспортные
-    /// методы модуля объекта-владельца внешней обработки.
+    /// методы модуля объекта-владельца внешней обработки, а также чтобы понять,
+    /// что это модуль формы (`.../Forms/<Имя>/Ext/Form/Module.bsl` или
+    /// `.../Form/<Имя>/Form.obj.bsl`), и включить проверку имён, занятых
+    /// членами `ФормаКлиентскогоПриложения`.
     #[serde(alias = "modulePath")]
     pub module_path: Option<String>,
+    /// Имена реквизитов формы (`Объект`, `Список`, свои реквизиты). Реквизит
+    /// перекрывает имя контекста, поэтому такие имена из проверки исключаются —
+    /// и тогда внутри модуля формы включается проверка имён глобального
+    /// контекста (`Справочники = …` в форме без реквизита `Справочники` —
+    /// ошибка). Без этого параметра она в формах не работает: валидатор не
+    /// видит состава реквизитов и молчит, чтобы не выдать ложную находку.
+    #[serde(alias = "formAttributes")]
+    pub form_attributes: Option<Vec<String>>,
     /// Алиас конфигурации из настроек сервера (`repo` в `[[symbol_sources]]`), чьи
     /// имена методов учитывать. Обязателен, если на сервере настроена хотя бы одна
     /// конфигурация. Если не настроено ни одной — код проверяется только против
@@ -510,7 +521,13 @@ impl BslContextServer {
                        ([[symbol_sources]] в config.toml), чьи имена методов учитывать; обязателен, \
                        если на сервере настроена хотя бы одна конфигурация (список доступных алиасов \
                        возвращается отказом при промахе), иначе не нужен — проверка идёт только против \
-                       справки платформы. Возвращает JSON \
+                       справки платформы. Ловит также имена локальных переменных, занятые свойствами \
+                       глобального контекста, и (при переданном module_path модуля формы) членами \
+                       ФормаКлиентскогоПриложения — присваивание такому имени падает в рантайме. \
+                       Параметр form_attributes — имена реквизитов формы: реквизит перекрывает имя \
+                       контекста, и, передав их, вы включаете проверку имён глобального контекста \
+                       внутри модуля формы (без него она там выключена). \
+                       Возвращает JSON \
                        {valid, errors:[{line,col,kind,confidence,message,suggestion?}]}."
     )]
     pub async fn validate_module(
@@ -537,8 +554,21 @@ impl BslContextServer {
                 Err(msg) => return err_json(&msg),
             }
         };
+        // Реквизиты формы сверяются регистронезависимо, как и всё в BSL.
+        let form_attributes: Option<HashSet<String>> = p
+            .form_attributes
+            .as_ref()
+            .map(|names| names.iter().map(|n| n.to_lowercase()).collect());
+
         let Some(slot) = slot else {
-            let result = validate_module_with_profile(&self.index, &p.source, level, profile);
+            let result = validate_module_with_profile(
+                &self.index,
+                &p.source,
+                p.module_path.as_deref(),
+                form_attributes.as_ref(),
+                level,
+                profile,
+            );
             return serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
         };
         // Слот найден по точному совпадению repo — значит параметр был Some.
@@ -576,6 +606,7 @@ impl BslContextServer {
             level,
             profile,
             p.module_path.as_deref(),
+            form_attributes.as_ref(),
             Some(source.as_ref()),
         );
         if !source.is_healthy() {
@@ -605,6 +636,58 @@ impl BslContextServer {
             );
         }
         format::format_enum_values(&ty.enum_values, &ty.name_ru)
+    }
+
+    #[tool(
+        description = "Имена, которые нельзя брать под локальные переменные BSL: они заняты контекстом \
+                       модуля. Четыре группы. global_readonly — свойства глобального контекста только \
+                       для чтения (Справочники, Документы, Метаданные, …): присваивание падает в \
+                       рантайме, в ЛЮБОМ модуле. form_readonly — свойства ФормаКлиентскогоПриложения \
+                       только для чтения (Параметры, Элементы, Команды, ЭтотОбъект, …): падает в модуле \
+                       управляемой формы. global_writable (РабочаяДата, ГлавныйСтиль) и form_writable \
+                       (Заголовок, Модифицированность, …) — свойства, доступные для записи: не падает, но \
+                       локальная переменная НЕ создаётся, молча меняется настройка сеанса либо сама форма. \
+                       Список берётся из справки той версии платформы, что задана в конфиге сервера \
+                       (platform_path), поэтому не устаревает. Имя, занятое параметром процедуры или \
+                       реквизитом формы, свободно — оно перекрывает контекст. Возвращает JSON \
+                       {global_readonly:[…], global_writable:[…], form_readonly:[…], form_writable:[…], counts:{…}}."
+    )]
+    pub async fn reserved_names(&self) -> String {
+        let readonly_names = |props: &[platform_index::Property], readonly: bool| {
+            let mut names: Vec<String> = props
+                .iter()
+                .filter(|p| p.readonly == readonly)
+                .map(|p| p.name_ru.clone())
+                .collect();
+            names.sort();
+            names
+        };
+
+        let global_readonly = readonly_names(&self.index.global_properties, true);
+        let global_writable = readonly_names(&self.index.global_properties, false);
+        let (form_readonly, form_writable) = match self.index.find_type(FORM_TYPE) {
+            Some(ty) => (
+                readonly_names(&ty.properties, true),
+                readonly_names(&ty.properties, false),
+            ),
+            // Тип не найден — справка другой локали или битый индекс. Молчать нельзя:
+            // пустой список выглядит как «занятых имён нет».
+            None => return err_json(&format!("тип '{FORM_TYPE}' не найден в справке платформы")),
+        };
+
+        let result = serde_json::json!({
+            "counts": {
+                "global_readonly": global_readonly.len(),
+                "global_writable": global_writable.len(),
+                "form_readonly": form_readonly.len(),
+                "form_writable": form_writable.len(),
+            },
+            "global_readonly": global_readonly,
+            "global_writable": global_writable,
+            "form_readonly": form_readonly,
+            "form_writable": form_writable,
+        });
+        serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
     }
 
     #[tool(

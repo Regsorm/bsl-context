@@ -289,6 +289,7 @@ async fn validate_module_rejects_unknown_repo() {
             level: None,
             profile: None,
             module_path: None,
+            form_attributes: None,
             repo: Some("нет-такого".to_string()),
         }))
         .await;
@@ -314,6 +315,7 @@ async fn validate_module_requires_repo_when_sources_configured() {
             level: None,
             profile: None,
             module_path: None,
+            form_attributes: None,
             repo: None,
         }))
         .await;
@@ -333,6 +335,7 @@ async fn validate_module_without_sources_checks_platform_only() {
             level: None,
             profile: None,
             module_path: None,
+            form_attributes: None,
             repo: None,
         }))
         .await;
@@ -357,6 +360,7 @@ async fn validate_module_refuses_when_lite_index_not_built() {
             level: None,
             profile: None,
             module_path: None,
+            form_attributes: None,
             repo: Some("ut".to_string()),
         }))
         .await;
@@ -379,6 +383,7 @@ async fn validate_module_rejects_repo_when_no_sources_configured() {
             level: None,
             profile: None,
             module_path: None,
+            form_attributes: None,
             repo: Some("ut".to_string()),
         }))
         .await;

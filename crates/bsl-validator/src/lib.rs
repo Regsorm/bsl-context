@@ -4,6 +4,7 @@
 //! Phase 6 (отдельный модуль `expression`) — `validateExpression` через tree-sitter.
 
 pub mod check;
+pub mod context_names;
 pub mod directives;
 pub mod expression;
 pub mod module;
@@ -20,6 +21,7 @@ pub use check::{
     validate_enum, validate_method_call, EnumValidation, MethodCallValidation, SimilarValue,
     SignatureBrief,
 };
+pub use context_names::{is_form_module, FORM_TYPE};
 pub use expression::{
     validate_expression, validate_expression_at_level, validate_expression_with_profile,
     Confidence, ExprError, ExprErrorKind, ExpressionValidation, Profile,

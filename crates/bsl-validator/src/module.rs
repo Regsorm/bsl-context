@@ -25,6 +25,12 @@
 //! Проверка идёт по ТЕКСТУ, а не по AST: грамматика `tree-sitter-bsl` заводит
 //! узел `annotation` только для директив, которые знает сама, а неизвестная —
 //! ровно та, что нас интересует, — попадает в `ERROR` без выделенного имени.
+//!
+//! Присваивания и объявления `Перем`, чьё имя занято членом контекста модуля,
+//! которому нельзя присвоить (метод либо свойство «только чтение» — глобального
+//! контекста или, в модуле формы, типа `ФормаКлиентскогоПриложения`), эмиттятся
+//! как `ExprErrorKind::ShadowedContextName` (см. `crate::context_names`): такое
+//! присваивание не создаёт локальную переменную и падает в рантайме.
 
 use std::collections::HashSet;
 
@@ -32,6 +38,7 @@ use platform_index::PlatformIndex;
 
 use bsl_parse::{collect_facts, scan_declarations};
 
+use crate::context_names::check_shadowed_context_names;
 use crate::directives::{closest_directive_with_distance, is_extension_module, is_known_directive};
 use crate::expression::{
     check_global_calls, check_new_expressions, check_type_dot_members, fuzzy_confidence_for,
@@ -61,19 +68,34 @@ pub fn validate_module_at_level(
     source: &str,
     level: u8,
 ) -> ExpressionValidation {
-    validate_module_at_level_inner(index, source, level, None, None)
+    validate_module_at_level_inner(index, source, level, None, None, None, None)
 }
 
 /// Общее тело `validate_module_at_level`/`validate_module_with_symbols`.
+///
+/// `module_path` — относительный путь модуля в выгрузке; нужен, чтобы понять,
+/// что это модуль формы (`.../Forms/<Имя>/Ext/Form/Module.bsl` или
+/// `.../Form/<Имя>/Form.obj.bsl`), и включить проверку имён, занятых членами
+/// `ФормаКлиентскогоПриложения` (`crate::context_names`). `None` — правило по
+/// членам формы не применяется, находки по свойствам глобального контекста
+/// остаются.
+///
+/// `form_attributes` — имена реквизитов формы (нижний регистр), если вызывающий
+/// их знает: реквизит перекрывает имя контекста. Передан — внутри модуля формы
+/// включается и проверка имён глобального контекста; `None` — она остаётся
+/// выключенной, чтобы не ругаться на реквизит, которого валидатор не видит.
 ///
 /// `symbols`/`owner_exports` — внешний источник имён (см.
 /// [`crate::symbols::SymbolSource`]) и предзагруженный набор экспортных имён
 /// модуля объекта-владельца; оба `None` при вызове без источника — поведение
 /// не отличается от прежнего `validate_module_at_level`.
+#[allow(clippy::too_many_arguments)]
 fn validate_module_at_level_inner(
     index: &PlatformIndex,
     source: &str,
     level: u8,
+    module_path: Option<&str>,
+    form_attributes: Option<&HashSet<String>>,
     symbols: Option<&dyn SymbolSource>,
     owner_exports: Option<&HashSet<String>>,
 ) -> ExpressionValidation {
@@ -117,6 +139,17 @@ fn validate_module_at_level_inner(
         owner_exports,
         &mut errors,
     );
+    let form_module = module_path
+        .map(crate::context_names::is_form_module)
+        .unwrap_or(false);
+    check_shadowed_context_names(
+        index,
+        source,
+        &facts,
+        form_module,
+        form_attributes,
+        &mut errors,
+    );
     errors.sort_by_key(|e| (e.line, e.col));
 
     ExpressionValidation {
@@ -130,14 +163,27 @@ fn validate_module_at_level_inner(
 /// - [`Profile::Full`] — `level` берётся как передан, возвращаются все находки.
 /// - [`Profile::Strict`] — `level` форсируется в `1`, остаются только
 ///   high-confidence находки; `valid` пересчитывается.
+/// - `module_path` — см. [`validate_module_at_level_inner`]: нужен, чтобы
+///   применить правило по членам формы (`ФормаКлиентскогоПриложения`).
+/// - `form_attributes` — имена реквизитов формы, если известны; см. там же.
 pub fn validate_module_with_profile(
     index: &PlatformIndex,
     source: &str,
+    module_path: Option<&str>,
+    form_attributes: Option<&HashSet<String>>,
     level: u8,
     profile: Profile,
 ) -> ExpressionValidation {
     let effective_level = if profile == Profile::Strict { 1 } else { level };
-    let mut result = validate_module_at_level(index, source, effective_level);
+    let mut result = validate_module_at_level_inner(
+        index,
+        source,
+        effective_level,
+        module_path,
+        form_attributes,
+        None,
+        None,
+    );
 
     if profile == Profile::Strict {
         result
@@ -155,12 +201,14 @@ pub fn validate_module_with_profile(
 /// получает `symbols` и предзагруженные экспортные имена модуля
 /// объекта-владельца — для этого нужен `module_path` (относительный путь
 /// модуля в выгрузке); `None`, если он неизвестен или не нужен.
+#[allow(clippy::too_many_arguments)]
 pub fn validate_module_with_symbols(
     index: &PlatformIndex,
     source: &str,
     level: u8,
     profile: Profile,
     module_path: Option<&str>,
+    form_attributes: Option<&HashSet<String>>,
     symbols: Option<&dyn SymbolSource>,
 ) -> ExpressionValidation {
     let effective_level = if profile == Profile::Strict { 1 } else { level };
@@ -171,6 +219,8 @@ pub fn validate_module_with_symbols(
         index,
         source,
         effective_level,
+        module_path,
+        form_attributes,
         symbols,
         owner_exports.as_ref(),
     );
@@ -402,6 +452,7 @@ EndFunction
             1,
             Profile::Full,
             None,
+            None,
             Some(&source),
         );
         assert!(
@@ -427,6 +478,7 @@ EndFunction
             1,
             Profile::Full,
             Some("external/Обр/Form/Ф/Form.obj.bsl"),
+            None,
             Some(&source),
         );
         assert!(
@@ -450,6 +502,7 @@ EndFunction
             1,
             Profile::Full,
             None,
+            None,
             Some(&source),
         );
         let finding = result
@@ -470,6 +523,7 @@ EndFunction
             Profile::Full,
             None,
             None,
+            None,
         );
         let finding = result
             .errors
@@ -477,5 +531,23 @@ EndFunction
             .find(|e| matches!(e.kind, ExprErrorKind::UndeclaredMethod))
             .expect("без источника поведение должно быть прежним — находка есть");
         assert_eq!(finding.confidence, Confidence::High);
+    }
+
+    // ── validate_module_with_profile: сигнатура с module_path ──────────────
+
+    #[test]
+    fn validate_module_with_profile_accepts_module_path() {
+        // Сторожевой тест на сигнатуру: на пустом PlatformIndex реквизит формы
+        // «Результат» ни с чем не совпадает, находок нет ни при каком module_path.
+        let index = PlatformIndex::new();
+        let result = validate_module_with_profile(
+            &index,
+            "Процедура Т()\nРезультат = \"текст\";\nКонецПроцедуры\n",
+            Some("base/Catalogs/Х/Forms/Ф/Ext/Form/Module.bsl"),
+            None,
+            1,
+            Profile::Full,
+        );
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
     }
 }

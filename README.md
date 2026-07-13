@@ -44,6 +44,7 @@ findings with line, column, kind, and confidence:
 | `unknown_global_method` | high / low | Unknown global call similar to a platform method (fuzzy: strong match → high, weak → low) |
 | `undeclared_method` | high | Call is not declared in the submitted module and unknown to the platform (whole-module check only; suppressed in extension modules) |
 | `unknown_directive` | high / low | Directive name (`&НаСервере`, `&Перед`, …) not in the whitelist |
+| `shadowed_context_name` | high | Variable name is taken by a read-only context property: the assignment fails at runtime. The form-member rule needs `module_path` |
 
 high-confidence findings have a false-positive rate near zero; low-confidence ones
 depend on the accuracy of type inference and the completeness of the `hbk`.
@@ -81,6 +82,13 @@ The first and third cases cannot be recognized from the module text alone —
 false positives for `undeclared_method` are possible there. The `strict`
 profile will not filter them out (the finding has `high` confidence); when
 working with such modules it's better not to rely on this finding.
+
+Likewise, the validator does not know the form's set of attributes. An attribute
+shadows a context name (UT has forms with attributes named `Метаданные`,
+`БезопасноеХранилище`), so inside a form module the `shadowed_context_name`
+finding for global-context names is off by default. Pass the attribute list via
+`form_attributes` and it works there too: attribute names are excluded, the rest
+are checked.
 
 ### Profiles
 
@@ -264,7 +272,7 @@ If you only need part of the server's surface, list the tools you want in the
 enabled = ["validate_module", "get_constructors", "get_enum_values"]
 ```
 
-A missing section or an empty list means all nine tools are available, as before.
+A missing section or an empty list means all eleven tools are available, as before.
 Hidden tools are absent from `tools/list` and are rejected on a direct call.
 An unknown name does not break startup: it produces a warning in the log and the
 tool simply never appears.
@@ -293,6 +301,7 @@ Transport — Streamable HTTP at `http://127.0.0.1:8007/mcp` (stateless).
 | `validate_method_call` | Validate a global function's argument count |
 | `validate_module` | Validate BSL code (whole module or fragment) against the platform |
 | `rebuild_symbol_index` | Rebuild the own name index (`kind = "lite"`); paths come from the config |
+| `reserved_names` | Context-occupied names from the platform help: `global_readonly`/`form_readonly` (assignment fails at runtime), `global_writable`/`form_writable` (no variable is created — the session or the form is silently changed) |
 
 ## Connecting an MCP client
 

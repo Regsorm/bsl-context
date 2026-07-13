@@ -29,6 +29,36 @@ pub struct NewFact {
     pub byte: usize,
 }
 
+/// Присваивание простому идентификатору (`Имя = ...`) или его объявление (`Перем Имя`).
+/// Обращения `A.B = ...` и `A[i] = ...` сюда не попадают: у них левая часть —
+/// `property_access`, а не `identifier`.
+pub struct AssignFact {
+    pub name: String,
+    /// Начало идентификатора в БАЙТАХ исходного текста (для pos_at).
+    pub byte: usize,
+    /// `true` — объявление `Перем Имя`, `false` — присваивание `Имя = ...`.
+    pub declaration: bool,
+}
+
+/// Процедура/функция модуля: границы и то, что нужно знать о её именах.
+pub struct ProcScope {
+    /// Границы определения в БАЙТАХ, `[byte_start..byte_end)`.
+    pub byte_start: usize,
+    pub byte_end: usize,
+    /// Имена параметров в нижнем регистре: это локальные имена, они перекрывают
+    /// члены контекста модуля.
+    pub params: HashSet<String>,
+    /// Скомпилирована БЕЗ контекста формы (`&НаСервереБезКонтекста`,
+    /// `&НаКлиентеНаСервереБезКонтекста`): членов формы внутри не существует.
+    pub no_context: bool,
+}
+
+impl ProcScope {
+    pub fn contains(&self, byte: usize) -> bool {
+        byte >= self.byte_start && byte < self.byte_end
+    }
+}
+
 #[derive(Default)]
 pub struct AstFacts {
     /// Имена объявленных процедур/функций в нижнем регистре.
@@ -36,6 +66,15 @@ pub struct AstFacts {
     pub calls: Vec<CallFact>,
     pub dots: Vec<DotFact>,
     pub news: Vec<NewFact>,
+    /// Присваивания простому идентификатору и объявления `Перем` — для проверки,
+    /// не занято ли имя членом контекста модуля (`ShadowedContextName`).
+    pub assigns: Vec<AssignFact>,
+    /// Процедуры/функции модуля с их параметрами и признаком «без контекста».
+    pub procs: Vec<ProcScope>,
+    /// В модуле есть хотя бы одна директива компиляции (`&НаКлиенте`, `&НаСервере`, …).
+    /// Признак УПРАВЛЯЕМОЙ формы: в модуле обычной (неуправляемой) формы директив
+    /// нет вовсе, и её контекст — другой тип, с другим составом членов.
+    pub has_directives: bool,
     /// false — дерево получить не удалось (двоичный модуль, таймаут, сбой языка).
     /// Сегодня отдельно не проверяется: пустое дерево и так даёт пустые facts,
     /// проверки над ними естественно молчат. Поле — задел для вызывающего кода,
@@ -456,6 +495,16 @@ pub fn collect_facts(source: &str) -> AstFacts {
                         facts.declarations.insert(name.to_lowercase());
                     }
                 }
+                let directive = directive_of(node, src);
+                if directive.is_some() {
+                    facts.has_directives = true;
+                }
+                facts.procs.push(ProcScope {
+                    byte_start: node.start_byte(),
+                    byte_end: node.end_byte(),
+                    params: param_names(node, src),
+                    no_context: directive.is_some_and(|d| is_no_context(&d)),
+                });
             }
             "new_expression" => {
                 let mut cursor = node.walk();
@@ -568,6 +617,51 @@ pub fn collect_facts(source: &str) -> AstFacts {
                     }
                 }
             }
+            "assignment_statement" => {
+                // Левая часть — либо `identifier` (`Имя = ...`), либо `property_access`
+                // (`A.B = ...`, `A[i] = ...`) — вторые сюда не попадают.
+                if let Some(left) = node.child_by_field_name("left") {
+                    if left.kind() == "identifier" {
+                        if let Ok(name) = left.utf8_text(src) {
+                            facts.assigns.push(AssignFact {
+                                name: name.to_string(),
+                                byte: left.start_byte(),
+                                declaration: false,
+                            });
+                        }
+                    }
+                }
+            }
+            "var_statement" => {
+                // `Перем А, Б;` внутри процедуры — поле `var_name` уже отдаёт
+                // identifier-узлы напрямую, без промежуточного `variable_spec`.
+                let mut cursor = node.walk();
+                for var_name in node.children_by_field_name("var_name", &mut cursor) {
+                    if let Ok(name) = var_name.utf8_text(src) {
+                        facts.assigns.push(AssignFact {
+                            name: name.to_string(),
+                            byte: var_name.start_byte(),
+                            declaration: true,
+                        });
+                    }
+                }
+            }
+            "var_definition" => {
+                // `Перем А, Б Экспорт;` на уровне модуля — поле `variable` отдаёт
+                // `variable_spec`, а имя лежит в его поле `name`.
+                let mut cursor = node.walk();
+                for spec in node.children_by_field_name("variable", &mut cursor) {
+                    if let Some(name_node) = spec.child_by_field_name("name") {
+                        if let Ok(name) = name_node.utf8_text(src) {
+                            facts.assigns.push(AssignFact {
+                                name: name.to_string(),
+                                byte: name_node.start_byte(),
+                                declaration: true,
+                            });
+                        }
+                    }
+                }
+            }
             _ => {}
         }
 
@@ -597,6 +691,57 @@ fn simple_head<'a>(node: Option<tree_sitter::Node<'a>>, src: &[u8]) -> Option<(S
     }
     let text = ident.utf8_text(src).ok()?;
     Some((text.to_string(), ident.start_byte()))
+}
+
+/// Директива компиляции процедуры/функции без амперсанда (`НаСервере`, `Вместо`).
+///
+/// В дереве она лежит ПЕРЕД узлом определения: предыдущий сосед — `preprocessor`,
+/// внутри которого узел `annotation` вида `&НаСервере`.
+fn directive_of(node: tree_sitter::Node, src: &[u8]) -> Option<String> {
+    let prev = node.prev_sibling()?;
+    if prev.kind() != "preprocessor" {
+        return None;
+    }
+    let mut cursor = prev.walk();
+    let annotation = prev
+        .named_children(&mut cursor)
+        .find(|c| c.kind() == "annotation")?;
+    annotation
+        .utf8_text(src)
+        .ok()
+        .map(|t| t.trim_start_matches('&').to_string())
+}
+
+/// Имена параметров процедуры/функции в нижнем регистре.
+///
+/// Параметр — локальное имя: оно перекрывает член контекста модуля. В УТ так
+/// делает сама 1С (`&НаКлиенте Процедура …(УчетнаяЗаписьНастроена, Параметры)`),
+/// и присваивание такому параметру законно.
+fn param_names(node: tree_sitter::Node, src: &[u8]) -> HashSet<String> {
+    let mut names = HashSet::new();
+    let Some(params) = node.child_by_field_name("parameters") else {
+        return names;
+    };
+    let mut cursor = params.walk();
+    for param in params.children_by_field_name("parameter", &mut cursor) {
+        if let Some(name_node) = param.child_by_field_name("name") {
+            if let Ok(name) = name_node.utf8_text(src) {
+                names.insert(name.to_lowercase());
+            }
+        }
+    }
+    names
+}
+
+/// Директива компилирует процедуру БЕЗ контекста формы?
+///
+/// `&НаСервереБезКонтекста` и `&НаКлиентеНаСервереБезКонтекста` (в английской
+/// локали — `AtServerNoContext`, `AtClientAtServerNoContext`). В таких процедурах
+/// членов формы не существует: `Элементы`, `Параметры`, `Объект` — свободные имена,
+/// и форму туда передают параметром (`Элементы = Форма.Элементы;`).
+fn is_no_context(directive: &str) -> bool {
+    let d = directive.to_lowercase();
+    d.ends_with("безконтекста") || d.ends_with("nocontext")
 }
 
 /// Число аргументов голого вызова `Имя(...)`: именованные дети узла
@@ -849,21 +994,7 @@ pub fn collect_methods(source: &str) -> Vec<MethodDecl> {
                         .map(|s| s.to_string());
                     let is_export = node.child_by_field_name("export").is_some();
 
-                    // Директива компиляции — ПРЕДЫДУЩИЙ СОСЕД узла определения:
-                    // `preprocessor`, внутри которого узел `annotation` вида "&НаСервере".
-                    let directive = node.prev_sibling().and_then(|prev| {
-                        if prev.kind() != "preprocessor" {
-                            return None;
-                        }
-                        let mut cursor = prev.walk();
-                        let annotation = prev
-                            .named_children(&mut cursor)
-                            .find(|c| c.kind() == "annotation")?;
-                        annotation
-                            .utf8_text(src)
-                            .ok()
-                            .map(|t| t.trim_start_matches('&').to_string())
-                    });
+                    let directive = directive_of(node, src);
 
                     methods.push(MethodDecl {
                         name: name.to_string(),
@@ -1234,5 +1365,92 @@ mod tests {
         let methods = collect_methods("&Вместо(\"Ф\")\nПроцедура Р()\nКонецПроцедуры");
         assert_eq!(methods.len(), 1);
         assert_eq!(methods[0].directive.as_deref(), Some("Вместо"));
+    }
+
+    #[test]
+    fn assignment_to_identifier_is_collected() {
+        let facts = collect_facts("Процедура Т()\nПараметры = Новый Структура;\nКонецПроцедуры\n");
+        assert_eq!(facts.assigns.len(), 1, "assigns: {:?}", facts.assigns.iter().map(|a| &a.name).collect::<Vec<_>>());
+        assert_eq!(facts.assigns[0].name, "Параметры");
+        assert!(!facts.assigns[0].declaration);
+    }
+
+    #[test]
+    fn assignment_to_member_is_not_collected() {
+        let facts = collect_facts(
+            "Процедура Т()\nЭлементы.Список.Видимость = Ложь;\nКонецПроцедуры\n",
+        );
+        assert!(facts.assigns.is_empty(), "assigns: {:?}", facts.assigns.iter().map(|a| &a.name).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn var_statement_is_collected() {
+        let facts = collect_facts("Процедура Т()\nПерем А, Элементы;\nКонецПроцедуры\n");
+        assert_eq!(facts.assigns.len(), 2, "assigns: {:?}", facts.assigns.iter().map(|a| &a.name).collect::<Vec<_>>());
+        assert!(facts.assigns.iter().all(|a| a.declaration));
+        let names: Vec<&str> = facts.assigns.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["А", "Элементы"]);
+    }
+
+    #[test]
+    fn proc_scopes_carry_directive_and_params() {
+        // Первая процедура — без контекста формы, у второй параметр `Параметры`.
+        // Оба признака нужны проверке `ShadowedContextName`, чтобы не ругаться
+        // на законный код.
+        let src = "\
+&НаКлиентеНаСервереБезКонтекста
+Процедура УстановитьДоступность(Форма)
+Элементы = Форма.Элементы;
+КонецПроцедуры
+
+&НаКлиенте
+Процедура Обработчик(Знач Результат, Параметры)
+Параметры = Новый Структура;
+КонецПроцедуры
+";
+        let facts = collect_facts(src);
+        assert!(facts.has_directives);
+        assert_eq!(facts.procs.len(), 2);
+
+        let elements = facts
+            .assigns
+            .iter()
+            .find(|a| a.name == "Элементы")
+            .expect("присваивание Элементы собрано");
+        let scope = facts
+            .procs
+            .iter()
+            .find(|p| p.contains(elements.byte))
+            .expect("процедура найдена по байту");
+        assert!(scope.no_context, "директива БезКонтекста распознана");
+
+        let params = facts
+            .assigns
+            .iter()
+            .find(|a| a.name == "Параметры")
+            .expect("присваивание Параметры собрано");
+        let scope = facts
+            .procs
+            .iter()
+            .find(|p| p.contains(params.byte))
+            .expect("процедура найдена по байту");
+        assert!(!scope.no_context);
+        assert!(scope.params.contains("параметры"), "{:?}", scope.params);
+        assert!(scope.params.contains("результат"), "{:?}", scope.params);
+    }
+
+    #[test]
+    fn ordinary_form_module_has_no_directives() {
+        // Модуль обычной (неуправляемой) формы: директив компиляции нет вовсе.
+        let facts = collect_facts("Процедура КнопкаНажатие(Элемент)\nКонецПроцедуры\n");
+        assert!(!facts.has_directives);
+    }
+
+    #[test]
+    fn module_level_var_definition_is_collected() {
+        let facts = collect_facts("Перем Кэш Экспорт;\n");
+        assert_eq!(facts.assigns.len(), 1, "assigns: {:?}", facts.assigns.iter().map(|a| &a.name).collect::<Vec<_>>());
+        assert_eq!(facts.assigns[0].name, "Кэш");
+        assert!(facts.assigns[0].declaration);
     }
 }
