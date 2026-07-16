@@ -21,6 +21,13 @@ pub struct DotFact {
     pub member: String,
     pub head_byte: usize,
     pub member_byte: usize,
+    /// Член — ВЫЗОВ (`Модуль.Метод()`), а не обращение к свойству
+    /// (`Перечисление.Значение`). Различие существенно: процедуру общего модуля
+    /// можно только вызвать, свойств у него не бывает. Без этого признака
+    /// `ТипЭлементаФорматированногоДокумента.ПереводСтроки` (значение
+    /// платформенного перечисления, которого нет в справке) неотличимо от
+    /// обращения к общему модулю.
+    pub member_is_call: bool,
 }
 
 /// Конструктор `Новый ИмяТипа`.
@@ -69,6 +76,13 @@ pub struct AstFacts {
     /// Присваивания простому идентификатору и объявления `Перем` — для проверки,
     /// не занято ли имя членом контекста модуля (`ShadowedContextName`).
     pub assigns: Vec<AssignFact>,
+    /// Имена переменных циклов в нижнем регистре: `Для Каждого Стр Из ... Цикл`
+    /// и `Для Сч = 1 По 10 Цикл`. Цикл связывает имя, но НЕ порождает
+    /// присваивания в дереве, поэтому в `assigns` таких имён нет. Для
+    /// проверяющего кода это полноценное локальное имя: без него `Стр.Поле`
+    /// выглядит обращением к чужому объекту (замер на УТ: 39431 ложная находка
+    /// именно на переменных циклов — `КлючЗначение`, `Элемент`, `СтрокаТЧ`).
+    pub loop_vars: HashSet<String>,
     /// Процедуры/функции модуля с их параметрами и признаком «без контекста».
     pub procs: Vec<ProcScope>,
     /// В модуле есть хотя бы одна директива компиляции (`&НаКлиенте`, `&НаСервере`, …).
@@ -534,9 +548,11 @@ pub fn collect_facts(source: &str) -> AstFacts {
                 // свойство). Без второго случая опечатка в имени метода внутри
                 // цепочки не находилась бы, хотя прежняя проверка её ловила.
                 let mut cursor = node.walk();
-                let member_node = node
+                let member_raw = node
                     .named_children(&mut cursor)
-                    .find(|c| matches!(c.kind(), "property" | "method_call"))
+                    .find(|c| matches!(c.kind(), "property" | "method_call"));
+                let member_is_call = member_raw.is_some_and(|c| c.kind() == "method_call");
+                let member_node = member_raw
                     // У `method_call` именем является его первый ребёнок-identifier.
                     .and_then(|c| if c.kind() == "method_call" { c.child(0) } else { Some(c) });
                 if let Some(member_node) = member_node {
@@ -547,6 +563,7 @@ pub fn collect_facts(source: &str) -> AstFacts {
                                 member: member.to_string(),
                                 head_byte,
                                 member_byte: member_node.start_byte(),
+                                member_is_call,
                             });
                         }
                     }
@@ -566,6 +583,8 @@ pub fn collect_facts(source: &str) -> AstFacts {
                                     member: member.to_string(),
                                     head_byte,
                                     member_byte: member_node.start_byte(),
+                                    // Ветка `call_expression`: член — всегда вызов.
+                                    member_is_call: true,
                                 });
                             }
                         }
@@ -614,6 +633,24 @@ pub fn collect_facts(source: &str) -> AstFacts {
                                 byte: id_node.start_byte(),
                             });
                         }
+                    }
+                }
+            }
+            "for_each_statement" | "for_statement" => {
+                // Переменная цикла связывается самим циклом, присваивания в
+                // дереве нет: у `for_each_statement` (`Для Каждого Стр Из Т`)
+                // его нет вовсе, у `for_statement` (`Для Сч = 1 По 10`)
+                // инициализатор — не `assignment_statement`. В обеих формах
+                // переменная — ПЕРВЫЙ дочерний `identifier` (проверено печатью
+                // дерева: остальные identifier'ы лежат глубже, внутри
+                // `expression`).
+                let mut cursor = node.walk();
+                let ident = node
+                    .named_children(&mut cursor)
+                    .find(|c| c.kind() == "identifier");
+                if let Some(ident) = ident {
+                    if let Ok(name) = ident.utf8_text(src) {
+                        facts.loop_vars.insert(name.to_lowercase());
                     }
                 }
             }

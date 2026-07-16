@@ -12,7 +12,7 @@
 //! - [`CodeIndexMcpSource`] — HTTP к живому MCP-серверу `code-index` (когда
 //!   прямого доступа к файлу базы нет, например при удалённом деплое).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -40,6 +40,12 @@ pub struct LiteSource {
     index: Mutex<lite_index::LiteIndex>,
     all_names: HashSet<String>,
     global_exports: HashSet<String>,
+    /// `None` — база собрана до появления таблицы `objects`: отвечать «не знаю».
+    objects: Option<HashMap<String, HashSet<String>>>, // collection -> имена в исходном регистре
+    objects_lower: Option<HashMap<String, HashSet<String>>>, // collection -> имена в нижнем регистре
+    /// Экспортные переменные модулей приложения (нижний регистр).
+    /// `None` — база собрана до появления таблицы `global_vars`.
+    global_vars: Option<HashSet<String>>,
     db_path: PathBuf,
 }
 
@@ -53,10 +59,27 @@ impl LiteSource {
         let global_exports = index
             .all_global_export_names()
             .with_context(|| "не удалось прочитать экспорты глобальных модулей lite-индекса")?;
+        let objects = index
+            .all_objects()
+            .with_context(|| "не удалось прочитать объекты lite-индекса")?;
+        let objects_lower = objects.as_ref().map(|by_collection| {
+            by_collection
+                .iter()
+                .map(|(collection, names)| {
+                    (collection.clone(), names.iter().map(|n| n.to_lowercase()).collect())
+                })
+                .collect()
+        });
+        let global_vars = index
+            .all_global_var_names()
+            .with_context(|| "не удалось прочитать глобальные переменные lite-индекса")?;
         Ok(Self {
             index: Mutex::new(index),
             all_names,
             global_exports,
+            objects,
+            objects_lower,
+            global_vars,
             db_path: db_path.to_path_buf(),
         })
     }
@@ -79,6 +102,24 @@ impl SymbolSource for LiteSource {
                 None
             }
         }
+    }
+
+    fn object_exists(&self, collection: &str, name_lower: &str) -> Option<bool> {
+        let by_collection = self.objects_lower.as_ref()?;
+        match by_collection.get(collection) {
+            Some(names) => Some(names.contains(name_lower)),
+            // Коллекция не встретилась в выгрузке (например, в УТ нет Sequences) —
+            // объектов в ней достоверно нет.
+            None => Some(false),
+        }
+    }
+
+    fn collection_names(&self, collection: &str) -> Option<HashSet<String>> {
+        self.objects.as_ref().and_then(|by_collection| by_collection.get(collection).cloned())
+    }
+
+    fn global_variables(&self) -> Option<HashSet<String>> {
+        self.global_vars.clone()
     }
 
     fn describe(&self) -> String {
@@ -107,6 +148,15 @@ pub struct CodeIndexDbSource {
     /// `file_contents` (zstd), признак — `<Global>true</Global>`. Отдельного
     /// флага у `code-index` нет, но исходный XML он хранит.
     global_exports: HashSet<String>,
+    /// Объекты конфигурации по `meta_type` (таблица `metadata_objects`), в
+    /// исходном регистре. `None` — таблицы нет: это не BSL-индекс, либо старая
+    /// версия без неё. НИКАКОГО вывода имён из путей модулей — у объекта может
+    /// не быть ни одного модуля.
+    objects: Option<HashMap<String, HashSet<String>>>,
+    objects_lower: Option<HashMap<String, HashSet<String>>>,
+    /// Экспортные переменные модулей приложения (нижний регистр). Собираются
+    /// один раз при открытии из `file_contents` (zstd) — как и `global_exports`.
+    global_vars: HashSet<String>,
 }
 
 impl CodeIndexDbSource {
@@ -128,13 +178,82 @@ impl CodeIndexDbSource {
         drop(stmt);
 
         let global_exports = Self::collect_global_exports(&conn);
+        let objects = Self::collect_objects(&conn);
+        let objects_lower = objects.as_ref().map(|by_type| {
+            by_type
+                .iter()
+                .map(|(meta_type, names)| {
+                    (meta_type.clone(), names.iter().map(|n| n.to_lowercase()).collect())
+                })
+                .collect()
+        });
+
+        let global_vars = Self::collect_global_vars(&conn);
 
         Ok(Self {
             names,
             db_path: db_path.to_path_buf(),
             conn: Mutex::new(conn),
             global_exports,
+            objects,
+            objects_lower,
+            global_vars,
         })
+    }
+
+    /// Экспортные переменные модулей приложения. Текст модуля лежит в самой
+    /// базе (`file_contents`, zstd) — тем же путём, что и XML общих модулей для
+    /// `collect_global_exports`. Разбор строк — общий с `lite-index`, чтобы
+    /// правило чтения `Перем Имя Экспорт;` жило в одном месте.
+    /// Ошибка не фатальна: источник продолжит работать, просто без этих имён.
+    fn collect_global_vars(conn: &Connection) -> HashSet<String> {
+        Self::try_collect_global_vars(conn).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "code-index база: не удалось собрать переменные модуля приложения");
+            HashSet::new()
+        })
+    }
+
+    fn try_collect_global_vars(conn: &Connection) -> Result<HashSet<String>> {
+        let mut stmt = conn.prepare(
+            "SELECT f.path, fc.content_blob FROM files f \
+             JOIN file_contents fc ON fc.file_id = f.id \
+             WHERE f.path LIKE '%ApplicationModule.bsl' OR f.path LIKE '%SessionModule.bsl'",
+        )?;
+        let rows =
+            stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)))?;
+
+        let mut out = HashSet::new();
+        for row in rows {
+            let (path, blob) = row?;
+            let file_name = path.rsplit('/').next().unwrap_or(&path);
+            if !lite_index::is_application_module_file(file_name) {
+                continue;
+            }
+            let Ok(bytes) = zstd::stream::decode_all(&blob[..]) else {
+                continue;
+            };
+            let content = String::from_utf8_lossy(&bytes);
+            for name in lite_index::global_export_vars_from_text(&content) {
+                out.insert(name.to_lowercase());
+            }
+        }
+        Ok(out)
+    }
+
+    /// Объекты конфигурации по `meta_type` — из таблицы `metadata_objects`
+    /// (BSL-расширение `code-index`). `None` — таблицы нет (не BSL-индекс).
+    /// Единственный верный источник имён объектов: у объекта может не быть ни
+    /// одного модуля, поэтому вывод имён из `functions`/`files` здесь не годится.
+    fn collect_objects(conn: &Connection) -> Option<HashMap<String, HashSet<String>>> {
+        let mut stmt = conn.prepare("SELECT meta_type, name FROM metadata_objects").ok()?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .ok()?;
+        let mut out: HashMap<String, HashSet<String>> = HashMap::new();
+        for (meta_type, name) in rows.flatten() {
+            out.entry(meta_type).or_default().insert(name);
+        }
+        Some(out)
     }
 
     /// Экспортные имена методов глобальных общих модулей: XML общих модулей
@@ -215,6 +334,24 @@ impl SymbolSource for CodeIndexDbSource {
         Some(out)
     }
 
+    fn object_exists(&self, collection: &str, name_lower: &str) -> Option<bool> {
+        let meta_type = meta_type_for_collection(collection)?;
+        let by_type = self.objects_lower.as_ref()?;
+        match by_type.get(meta_type) {
+            Some(names) => Some(names.contains(name_lower)),
+            None => Some(false),
+        }
+    }
+
+    fn collection_names(&self, collection: &str) -> Option<HashSet<String>> {
+        let meta_type = meta_type_for_collection(collection)?;
+        self.objects.as_ref().and_then(|by_type| by_type.get(meta_type).cloned())
+    }
+
+    fn global_variables(&self) -> Option<HashSet<String>> {
+        Some(self.global_vars.clone())
+    }
+
     fn describe(&self) -> String {
         format!(
             "code-index db: {} ({} имён, {} глобальных экспортов)",
@@ -256,6 +393,16 @@ pub struct CodeIndexMcpSource {
     /// Кэш экспортов владельца по пути модуля формы: один вызов `get_file_summary`
     /// на модуль, а не на каждое имя.
     owner_cache: Mutex<std::collections::HashMap<String, HashSet<String>>>,
+    /// Кэш объектов конфигурации по коллекциям (нижний регистр). НАБОР ЦЕЛИКОМ
+    /// на коллекцию, не по одному имени — иначе первый же вопрос про общие
+    /// модули (3091 штука в УТ) ушёл бы отдельным сетевым вызовом на каждое имя.
+    objects_cache: Mutex<HashMap<String, HashSet<String>>>,
+    /// То же самое в исходном регистре — для `collection_names`.
+    objects_cache_orig: Mutex<HashMap<String, HashSet<String>>>,
+    /// Экспортные переменные модулей приложения (нижний регистр). `None` —
+    /// ещё не запрашивались; запрос один на весь срок жизни источника (замер:
+    /// 18 мс), дальше берётся отсюда.
+    global_vars_cache: Mutex<Option<HashSet<String>>>,
     /// Источник в рабочем состоянии. Сбрасывается в `false` любой ошибкой транспорта
     /// (см. `is_healthy`) — обратно уже не поднимается: источник пересоздаётся заново.
     healthy: AtomicBool,
@@ -282,6 +429,9 @@ impl CodeIndexMcpSource {
             search_cache: Mutex::new(std::collections::HashMap::new()),
             global_module_cache: Mutex::new(std::collections::HashMap::new()),
             owner_cache: Mutex::new(std::collections::HashMap::new()),
+            objects_cache: Mutex::new(HashMap::new()),
+            objects_cache_orig: Mutex::new(HashMap::new()),
+            global_vars_cache: Mutex::new(None),
             healthy: AtomicBool::new(true),
         };
         source.initialize()?;
@@ -504,6 +654,127 @@ impl CodeIndexMcpSource {
             serde_json::from_str(text).context("code-index mcp: get_file_summary: не JSON")?;
         Ok(export_names_from_summary(&summary))
     }
+
+    /// Набор имён объектов конфигурации коллекции (нижний регистр), из кэша
+    /// или сетевым запросом `bsl_sql`. Кэшируется НАБОРОМ ЦЕЛИКОМ по коллекции.
+    fn objects_for_collection(&self, collection: &str, meta_type: &str) -> Option<HashSet<String>> {
+        if let Some(cached) = self.objects_cache.lock().unwrap().get(collection) {
+            return Some(cached.clone());
+        }
+        match self.call_objects(meta_type) {
+            Ok(Some((lower, orig))) => {
+                self.objects_cache.lock().unwrap().insert(collection.to_string(), lower.clone());
+                self.objects_cache_orig.lock().unwrap().insert(collection.to_string(), orig);
+                Some(lower)
+            }
+            // truncated=true: обрезанному набору доверять нельзя — каждый необрезанный
+            // объект стал бы ложной находкой «объекта не существует».
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(error = %e, collection, "code-index mcp: ошибка bsl_sql metadata_objects");
+                self.healthy.store(false, Ordering::Relaxed);
+                None
+            }
+        }
+    }
+
+    /// Имена объектов коллекции по `meta_type` — СТРАНИЦАМИ.
+    ///
+    /// Три неочевидных условия, каждое стоило ложных находок на живом коде:
+    ///
+    /// 1. **Страницы, а не один запрос.** `bsl_sql` входит в `DEFAULT_CAP_TOOLS`
+    ///    у `code-index`: его ответ проходит через `cap_response` с бюджетом
+    ///    `[mcp].max_response_bytes` (дефолт 48 000 байт). Список общих модулей
+    ///    УТ (3091 имя) весит ~170 КБ, и страж ОПОЛОВИНИВАЕТ массив, пока тот не
+    ///    влезет: приходит 386 строк из 3091 — по алфавиту до «И». Забрать набор
+    ///    одним запросом нельзя в принципе. Страница по `PAGE` строк укладывается
+    ///    в бюджет; идём по `OFFSET`, пока страница полная.
+    /// 2. **`full_name`, а не `name`.** У `serve` есть сессионный дедуп
+    ///    (`serve_dedup.rs`): он считает отпечаток каждой СТРОКИ и молча опускает
+    ///    уже отданные в этой сессии, помечая `rows_elided_already_delivered`.
+    ///    Источник живёт одной сессией, а имена пересекаются между коллекциями
+    ///    (в УТ `Закупки` — и общий модуль, и регистр накопления;
+    ///    `ПодарочныеСертификаты` — и регистр, и справочник). Со `SELECT name`
+    ///    строка `["Закупки"]` во втором запросе была бы опущена, и реальный
+    ///    объект получил бы `Some(false)`. `full_name` уникален глобально.
+    /// 3. **`ORDER BY`** — без него порядок строк между страницами не определён и
+    ///    `OFFSET` пропустит или задвоит имена.
+    fn call_objects(&self, meta_type: &str) -> Result<Option<(HashSet<String>, HashSet<String>)>> {
+        /// Строк на страницу. 400 × ~55 байт ≈ 22 КБ — вдвое ниже дефолтного
+        /// бюджета `cap_response` (48 000). Запас на случай, если бюджет на
+        /// сервере окажется ниже дефолта: страница всё равно проверяется на
+        /// обрезку, и при ней набор признаётся недостоверным.
+        const PAGE: usize = 400;
+
+        let mut lower = HashSet::new();
+        let mut orig = HashSet::new();
+        let mut offset = 0usize;
+        loop {
+            let body = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "tools/call",
+                "params": {
+                    "name": "bsl_sql",
+                    "arguments": {
+                        "repo": self.repo,
+                        "sql": "SELECT full_name FROM metadata_objects WHERE meta_type = ?1 \
+                                ORDER BY full_name LIMIT ?2 OFFSET ?3",
+                        "params": [meta_type, PAGE, offset],
+                        "limit": PAGE + 1
+                    }
+                }
+            });
+            let resp = self.post(body).with_context(|| {
+                format!("code-index mcp: bsl_sql(metadata_objects, {meta_type}, offset={offset}) не прошёл")
+            })?;
+            let text = resp.into_string().context("code-index mcp: тело ответа")?;
+            let value = parse_sse_json(&text)
+                .ok_or_else(|| anyhow::anyhow!("code-index mcp: пустой/неразбираемый SSE-ответ"))?;
+            let Some(page) = objects_from_bsl_sql(&value) else {
+                // Страница недостоверна (обрезана/дедуплицирована) — весь набор
+                // под вопросом. Лучше молчание, чем ложные находки.
+                return Ok(None);
+            };
+            let received = page.received;
+            lower.extend(page.lower);
+            orig.extend(page.orig);
+            if received < PAGE {
+                break;
+            }
+            offset += PAGE;
+        }
+        Ok(Some((lower, orig)))
+    }
+
+    /// Экспортные переменные модулей приложения — ОДИН запрос `grep_code` за
+    /// строками объявлений. Модули целиком читать не нужно: интересны только
+    /// строки `Перем ... Экспорт`, их единицы (замер на УТ: 18 мс, 959 байт).
+    /// Раскладка `<...>/Ext/<Имя>ApplicationModule.bsl` проверена на УТ и БП.
+    fn call_global_vars(&self) -> Result<HashSet<String>> {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "grep_code",
+                "arguments": {
+                    "repo": self.repo,
+                    // Ловим ВСЕ объявления `Перем`; экспортные отберёт общий разбор.
+                    "regex": r"(?m)^\s*Перем\s",
+                    "path_glob": "**/Ext/{ManagedApplicationModule,OrdinaryApplicationModule,SessionModule,ExternalConnectionModule}.bsl",
+                    "limit": 500
+                }
+            }
+        });
+        let resp = self
+            .post(body)
+            .with_context(|| "code-index mcp: grep_code(модули приложения) не прошёл")?;
+        let text = resp.into_string().context("code-index mcp: тело ответа")?;
+        let value = parse_sse_json(&text)
+            .ok_or_else(|| anyhow::anyhow!("code-index mcp: пустой/неразбираемый SSE-ответ"))?;
+        Ok(global_vars_from_grep(&value))
+    }
 }
 
 impl SymbolSource for CodeIndexMcpSource {
@@ -538,6 +809,46 @@ impl SymbolSource for CodeIndexMcpSource {
                 tracing::warn!(error = %e, owner = %owner, "code-index mcp: ошибка get_file_summary");
                 self.healthy.store(false, Ordering::Relaxed);
                 Some(HashSet::new())
+            }
+        }
+    }
+
+    fn object_exists(&self, collection: &str, name_lower: &str) -> Option<bool> {
+        if !self.is_healthy() {
+            return None;
+        }
+        let meta_type = meta_type_for_collection(collection)?;
+        let names = self.objects_for_collection(collection, meta_type)?;
+        Some(names.contains(name_lower))
+    }
+
+    fn collection_names(&self, collection: &str) -> Option<HashSet<String>> {
+        if !self.is_healthy() {
+            return None;
+        }
+        let meta_type = meta_type_for_collection(collection)?;
+        self.objects_for_collection(collection, meta_type)?;
+        self.objects_cache_orig.lock().unwrap().get(collection).cloned()
+    }
+
+    fn global_variables(&self) -> Option<HashSet<String>> {
+        if !self.is_healthy() {
+            return None;
+        }
+        if let Some(cached) = self.global_vars_cache.lock().unwrap().as_ref() {
+            return Some(cached.clone());
+        }
+        match self.call_global_vars() {
+            Ok(names) => {
+                *self.global_vars_cache.lock().unwrap() = Some(names.clone());
+                Some(names)
+            }
+            // Ошибку сети НЕ кэшируем и роняем healthy: пустой набор здесь
+            // означал бы «таких переменных нет» и вернул бы ложные находки.
+            Err(e) => {
+                tracing::warn!(error = %e, "code-index mcp: ошибка grep_code за переменными модуля приложения");
+                self.healthy.store(false, Ordering::Relaxed);
+                None
             }
         }
     }
@@ -581,6 +892,138 @@ fn module_path_from_xml(xml_path: &str) -> Option<String> {
 fn common_module_xml_path(module_path: &str) -> Option<String> {
     let base = module_path.strip_suffix("/Ext/Module.bsl")?;
     Some(format!("{base}.xml"))
+}
+
+/// Коллекция каталога выгрузки → `meta_type` в code-index (единственное
+/// число, английское). Неизвестная коллекция → `None`.
+fn meta_type_for_collection(collection: &str) -> Option<&'static str> {
+    match collection {
+        "CommonModules" => Some("CommonModule"),
+        "Catalogs" => Some("Catalog"),
+        "Documents" => Some("Document"),
+        "InformationRegisters" => Some("InformationRegister"),
+        "AccumulationRegisters" => Some("AccumulationRegister"),
+        "AccountingRegisters" => Some("AccountingRegister"),
+        "CalculationRegisters" => Some("CalculationRegister"),
+        "Enums" => Some("Enum"),
+        // Три плана — единственный случай, где `meta_type` остаётся во
+        // множественном числе (проверено: `SELECT DISTINCT meta_type` даёт
+        // `ChartOfCharacteristicTypes` на УТ, `ChartOfAccounts` на БП).
+        // Приведение к единственному числу «для единообразия» превращает
+        // каждое обращение `ПланыВидовХарактеристик.Х` в ложную находку.
+        "ChartsOfCharacteristicTypes" => Some("ChartOfCharacteristicTypes"),
+        "ChartsOfAccounts" => Some("ChartOfAccounts"),
+        "ChartsOfCalculationTypes" => Some("ChartOfCalculationTypes"),
+        "BusinessProcesses" => Some("BusinessProcess"),
+        "Tasks" => Some("Task"),
+        "ExchangePlans" => Some("ExchangePlan"),
+        "Constants" => Some("Constant"),
+        "DataProcessors" => Some("DataProcessor"),
+        "Reports" => Some("Report"),
+        "DocumentJournals" => Some("DocumentJournal"),
+        "FilterCriteria" => Some("FilterCriterion"),
+        "Sequences" => Some("Sequence"),
+        _ => None,
+    }
+}
+
+/// Одна страница ответа `bsl_sql` со списком объектов.
+struct ObjectPage {
+    /// Имена в нижнем регистре (для поиска).
+    lower: HashSet<String>,
+    /// Имена в исходном регистре (для подсказок).
+    orig: HashSet<String>,
+    /// Сколько строк реально пришло — по нему вызывающий понимает, была ли
+    /// страница последней. Не длина `lower`: одинаковые имена схлопнутся.
+    received: usize,
+}
+
+/// Разбор страницы `bsl_sql`: `{"columns":[...],"rows":[["Catalog.Имя"],...]}`.
+/// Префикс типа снимается — наружу отдаются имена объектов.
+///
+/// Набору нельзя доверять в трёх случаях, каждый → `None` (валидатор промолчит):
+/// - `rows_truncated` — страж размера ответа `code-index` (`cap_response`,
+///   бюджет `[mcp].max_response_bytes`) ополовинил массив строк. ВНИМАНИЕ: поле
+///   `truncated` про эту обрезку НЕ знает, оно про собственный лимит `bsl_sql`.
+///   Проверять только `truncated` — значит принять 386 строк из 3091 за полный
+///   список и объявить 2705 реальных модулей несуществующими;
+/// - `truncated=true` — ответ обрезан собственным лимитом инструмента;
+/// - `rows_elided_already_delivered` — сессионный дедуп опустил строки, уже
+///   отданные в этой сессии (см. `call_objects`).
+fn objects_from_bsl_sql(value: &Value) -> Option<ObjectPage> {
+    let text = value.pointer("/result/content/0/text")?.as_str()?;
+    let parsed: Value = serde_json::from_str(text).ok()?;
+    // Маркер стража размера живёт на ВЕРХНЕМ уровне обёртки, рядом с `result`.
+    if parsed.get("response_truncated").is_some() {
+        return None;
+    }
+    let body = payload(&parsed);
+    if body.get("rows_truncated").is_some() {
+        return None;
+    }
+    if body.get("truncated").and_then(|t| t.as_bool()) == Some(true) {
+        return None;
+    }
+    if body.get("rows_elided_already_delivered").is_some() {
+        return None;
+    }
+    let rows = body.get("rows")?.as_array()?;
+    let mut lower = HashSet::new();
+    let mut orig = HashSet::new();
+    for row in rows {
+        let Some(full_name) = row.as_array().and_then(|r| r.first()).and_then(|n| n.as_str())
+        else {
+            continue;
+        };
+        // `Catalog.Номенклатура` → `Номенклатура`. Точка в имени объекта 1С
+        // невозможна, поэтому первого разделителя достаточно.
+        let name = full_name
+            .split_once('.')
+            .map(|(_, name)| name)
+            .unwrap_or(full_name);
+        lower.insert(name.to_lowercase());
+        orig.insert(name.to_string());
+    }
+    Some(ObjectPage {
+        lower,
+        orig,
+        received: rows.len(),
+    })
+}
+
+/// Разбор ответа `grep_code`: `{"files": {"<path>": ["12: <строка>", ...]}}`.
+/// Номер строки отрезаем — дальше работает разбор объявления, общий с
+/// `lite-index`: правило чтения `Перем Имя Экспорт;` должно жить в одном месте.
+fn global_vars_from_grep(value: &Value) -> HashSet<String> {
+    let Some(text) = value
+        .pointer("/result/content/0/text")
+        .and_then(|t| t.as_str())
+    else {
+        return HashSet::new();
+    };
+    let Ok(parsed) = serde_json::from_str::<Value>(text) else {
+        return HashSet::new();
+    };
+    let body = payload(&parsed);
+    let Some(files) = body.get("files").and_then(|f| f.as_object()) else {
+        return HashSet::new();
+    };
+    let mut lines = String::new();
+    for entries in files.values() {
+        for entry in entries.as_array().into_iter().flatten() {
+            let Some(raw) = entry.as_str() else {
+                continue;
+            };
+            // Формат строки — "<номер>: <содержимое>".
+            let code = raw.split_once(": ").map(|(_, rest)| rest).unwrap_or(raw);
+            lines.push_str(code);
+            lines.push('\n');
+        }
+    }
+    lite_index::global_export_vars_from_text(&lines)
+        .into_iter()
+        .map(|n| n.to_lowercase())
+        .collect()
 }
 
 /// Полезная нагрузка ответа `code-index`. С версии 0.9 инструменты заворачивают
@@ -808,6 +1251,94 @@ mod tests {
         assert_eq!(names.len(), 2);
     }
 
+    /// Разбор страницы `bsl_sql`: префикс типа снимается, имя остаётся.
+    #[test]
+    fn objects_parsed_from_full_name_rows() {
+        let value = tool_response(
+            r#"{"result":{"columns":["full_name"],"rows":[["Catalog.Номенклатура"],["Catalog.Валюты"]],"truncated":false}}"#,
+        );
+        let page = objects_from_bsl_sql(&value).expect("страница должна разобраться");
+        assert!(page.lower.contains("номенклатура"));
+        assert!(page.orig.contains("Номенклатура"));
+        assert!(
+            !page.orig.contains("Catalog.Номенклатура"),
+            "префикс типа обязан быть снят"
+        );
+        assert_eq!(page.received, 2);
+    }
+
+    /// Страж размера ответа `code-index` (`cap_response`) ополовинил массив.
+    /// Это ГЛАВНАЯ ловушка: рядом стоит `truncated:false`, и проверка только по
+    /// нему принимает 386 строк из 3091 за полный список — все остальные
+    /// реальные объекты становятся ложными находками. Замечено на живом сервере:
+    /// `ОбщегоНазначения` объявлялся несуществующим.
+    #[test]
+    fn cap_truncated_rows_make_page_untrusted() {
+        let value = tool_response(
+            r#"{"result":{"columns":["full_name"],"rows":[["Catalog.Валюты"]],"rows_total":3091,"rows_truncated":true,"truncated":false}}"#,
+        );
+        assert!(objects_from_bsl_sql(&value).is_none());
+    }
+
+    /// Тот же страж, но маркер на верхнем уровне обёртки.
+    #[test]
+    fn response_truncated_marker_makes_page_untrusted() {
+        let value = tool_response(
+            r#"{"result":{"columns":["full_name"],"rows":[["Catalog.Валюты"]],"truncated":false},"response_truncated":true}"#,
+        );
+        assert!(objects_from_bsl_sql(&value).is_none());
+    }
+
+    /// Сессионный дедуп `code-index` опустил строки → набор неполон, доверять
+    /// ему нельзя: объявить существующий объект несуществующим хуже, чем
+    /// промолчать. Запрос по `full_name` до этого доводить не должен, но защита
+    /// обязана остаться.
+    #[test]
+    fn elided_rows_make_object_set_untrusted() {
+        let value = tool_response(
+            r#"{"result":{"columns":["full_name"],"rows":[["Catalog.Валюты"]],"rows_elided_already_delivered":3}}"#,
+        );
+        assert!(objects_from_bsl_sql(&value).is_none());
+    }
+
+    /// Обрезка собственным лимитом `bsl_sql` — то же самое.
+    #[test]
+    fn truncated_rows_make_object_set_untrusted() {
+        let value = tool_response(
+            r#"{"result":{"columns":["full_name"],"rows":[["Catalog.Валюты"]],"truncated":true}}"#,
+        );
+        assert!(objects_from_bsl_sql(&value).is_none());
+    }
+
+    #[test]
+    fn meta_type_for_collection_known_and_unknown() {
+        assert_eq!(meta_type_for_collection("CommonModules"), Some("CommonModule"));
+        assert_eq!(meta_type_for_collection("Catalogs"), Some("Catalog"));
+        assert_eq!(meta_type_for_collection("Enums"), Some("Enum"));
+        assert_eq!(meta_type_for_collection("НеизвестнаяКоллекция"), None);
+    }
+
+    /// Три плана — исключение из правила «meta_type в единственном числе».
+    /// Значения сверены с живым индексом (`SELECT DISTINCT meta_type`): на УТ
+    /// есть `ChartOfCharacteristicTypes`, на БП — `ChartOfAccounts`. Единственное
+    /// число здесь дало бы `Some(false)` на КАЖДОМ обращении к плану — ложную
+    /// находку на штатном коде.
+    #[test]
+    fn meta_type_for_charts_stays_plural() {
+        assert_eq!(
+            meta_type_for_collection("ChartsOfCharacteristicTypes"),
+            Some("ChartOfCharacteristicTypes")
+        );
+        assert_eq!(
+            meta_type_for_collection("ChartsOfAccounts"),
+            Some("ChartOfAccounts")
+        );
+        assert_eq!(
+            meta_type_for_collection("ChartsOfCalculationTypes"),
+            Some("ChartOfCalculationTypes")
+        );
+    }
+
     // ── parse_sse_json ───────────────────────────────────────────────────
 
     #[test]
@@ -903,6 +1434,33 @@ mod tests {
             .expect("owner_exports должен вернуть набор");
         assert!(owner.contains("экспортныйметодобр"));
         assert!(source.describe().contains("lite.db"));
+    }
+
+    #[test]
+    fn lite_source_reports_object_exists_and_collection_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("upload");
+
+        // Перечисление без единого модуля — как большинство перечислений в УТ
+        // (909 из 1069). Единственный верный источник имени — XML, не modules.
+        write_file(
+            &root,
+            "base/Enums/ТестБезМодуля.xml",
+            "<?xml version=\"1.0\"?>\n<MetaDataObject><Enum><Properties><Name>ТестБезМодуля</Name></Properties></Enum></MetaDataObject>\n",
+        );
+
+        let db_path = tmp.path().join("lite.db");
+        lite_index::build(&root, &db_path, 0).unwrap();
+
+        let source = LiteSource::open(&db_path).unwrap();
+        assert_eq!(source.object_exists("Enums", "тестбезмодуля"), Some(true));
+        assert_eq!(source.object_exists("Enums", "нетакого"), Some(false));
+        // Коллекция, которой в выгрузке вовсе не встретилось, — объектов в ней
+        // достоверно нет (не «не знаю»).
+        assert_eq!(source.object_exists("НеизвестнаяКоллекция", "х"), Some(false));
+
+        let names = source.collection_names("Enums").expect("подсказки должны быть");
+        assert!(names.contains("ТестБезМодуля"));
     }
 
     // ── Ручная проверка на реальной базе (приёмка, шаг 3 плана) ────────────

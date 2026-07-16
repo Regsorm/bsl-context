@@ -35,3 +35,7 @@ thiserror = { workspace = true }
 clap = { workspace = true }
 chrono = { workspace = true }
 sysinfo = "0.32"
+
+[dev-dependencies]
+# Обход корпуса в регресс-тесте `corpus_config_objects` (только тесты).
+walkdir = { workspace = true }

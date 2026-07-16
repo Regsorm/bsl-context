@@ -15,7 +15,7 @@
 //! остаются опциональными: они не знают про `<Global>true</Global>`, поэтому
 //! понижают уверенность находки вместо того, чтобы снять её совсем.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -66,6 +66,31 @@ CREATE TABLE methods (
 CREATE INDEX idx_methods_name_lower ON methods(name_lower);
 CREATE INDEX idx_methods_module     ON methods(module_id);
 CREATE INDEX idx_modules_global     ON modules(is_global);
+
+-- Объект конфигурации: один XML-файл выгрузки <Коллекция>/<Имя>.xml.
+-- Модулей у объекта может не быть вовсе (в УТ 909 из 1069 перечислений),
+-- поэтому список объектов строится по XML, а не по таблице modules.
+CREATE TABLE objects (
+    id         INTEGER PRIMARY KEY,
+    collection TEXT NOT NULL,          -- CommonModules | Catalogs | Enums | ...
+    name       TEXT NOT NULL,          -- имя в исходном регистре
+    name_lower TEXT NOT NULL           -- считается в Rust: SQLite lower() НЕ сворачивает кириллицу
+);
+CREATE INDEX idx_objects_lookup ON objects(collection, name_lower);
+
+-- Экспортная переменная модуля приложения (`Перем Имя Экспорт;`).
+-- Видна БЕЗ префикса из любого клиентского модуля, поэтому для проверяющего
+-- кода это глобальное имя наравне с экспортным методом глобального общего
+-- модуля. Общий модуль переменных иметь не может (проверено на УТ: в
+-- base/CommonModules ни одной), так что источник таких имён — только модули
+-- приложения. Без них `ПараметрыПриложения.Вставить(...)` выглядит обращением
+-- к несуществующему общему модулю (замер на УТ: 123 ложные находки).
+CREATE TABLE global_vars (
+    id         INTEGER PRIMARY KEY,
+    name       TEXT NOT NULL,
+    name_lower TEXT NOT NULL
+);
+CREATE INDEX idx_global_vars_name ON global_vars(name_lower);
 "#;
 
 /// Известные каталоги-коллекции объектов метаданных (сегмент пути).
@@ -121,10 +146,21 @@ const MODULE_TYPE_BY_FILE_NAME: &[(&str, &str)] = &[
     ("CommandModule.bsl", "CommandModule"),
 ];
 
+/// Модули приложения: их экспортные переменные видны без префикса отовсюду.
+/// Имена файлов — как в выгрузке конфигурации (каталог `Ext` в корне).
+const APPLICATION_MODULE_FILE_NAMES: &[&str] = &[
+    "ManagedApplicationModule.bsl",
+    "OrdinaryApplicationModule.bsl",
+    "SessionModule.bsl",
+    "ExternalConnectionModule.bsl",
+];
+
 pub struct BuildStats {
     pub modules: usize,
     pub methods: usize,
     pub global_modules: usize,
+    pub objects: usize,
+    pub global_vars: usize,
     pub elapsed_ms: u128,
 }
 
@@ -164,13 +200,18 @@ pub fn build(root: &Path, db_path: &Path, jobs: usize) -> Result<BuildStats> {
         .map(|e| e.path().to_path_buf())
         .collect();
 
-    // 2. Глобальные общие модули: base/CommonModules/<Имя>.xml с <Global>true</Global>.
-    let global_modules = collect_global_modules(root);
+    // 2. Факты XML: глобальные общие модули и полный список объектов конфигурации —
+    // единым обходом (см. collect_xml_facts). Второй обход дерева ради одних
+    // объектов не заводим.
+    let xml_facts = collect_xml_facts(root);
+
+    // 2a. Экспортные переменные модулей приложения: видны без префикса отовсюду.
+    let global_var_names = collect_global_vars(&bsl_files);
 
     // 3. Параллельный разбор каждого модуля.
     let parsed: Vec<ParsedModule> = bsl_files
         .par_iter()
-        .filter_map(|path| parse_module(root, path, &global_modules))
+        .filter_map(|path| parse_module(root, path, &xml_facts.globals))
         .collect();
 
     // 4-5. Запись в SQLite: схема + одна транзакция для данных.
@@ -181,6 +222,8 @@ pub fn build(root: &Path, db_path: &Path, jobs: usize) -> Result<BuildStats> {
     let mut modules_count = 0usize;
     let mut methods_count = 0usize;
     let mut global_modules_count = 0usize;
+    let mut objects_count = 0usize;
+    let mut global_vars_count = 0usize;
 
     {
         let tx = conn.transaction()?;
@@ -192,6 +235,9 @@ pub fn build(root: &Path, db_path: &Path, jobs: usize) -> Result<BuildStats> {
             let mut insert_method = tx.prepare(
                 "INSERT INTO methods (module_id, name, name_lower, is_function, is_export, directive, line_start, params)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )?;
+            let mut insert_object = tx.prepare(
+                "INSERT INTO objects (collection, name, name_lower) VALUES (?1, ?2, ?3)",
             )?;
 
             for module in &parsed {
@@ -225,6 +271,19 @@ pub fn build(root: &Path, db_path: &Path, jobs: usize) -> Result<BuildStats> {
                     methods_count += 1;
                 }
             }
+
+            for (collection, name) in &xml_facts.objects {
+                insert_object.execute(params![collection, name, name.to_lowercase()])?;
+                objects_count += 1;
+            }
+
+            let mut insert_global_var = tx.prepare(
+                "INSERT INTO global_vars (name, name_lower) VALUES (?1, ?2)",
+            )?;
+            for name in &global_var_names {
+                insert_global_var.execute(params![name, name.to_lowercase()])?;
+                global_vars_count += 1;
+            }
         }
         tx.commit()?;
     }
@@ -242,16 +301,20 @@ pub fn build(root: &Path, db_path: &Path, jobs: usize) -> Result<BuildStats> {
 
     conn.execute_batch(&format!(
         "INSERT INTO meta (key, value) VALUES
-            ('schema_version', '1'),
+            ('schema_version', '2'),
             ('root', '{}'),
             ('built_at', '{}'),
             ('modules', '{}'),
             ('methods', '{}'),
+            ('objects', '{}'),
+            ('global_vars', '{}'),
             ('elapsed_ms', '{}');",
         root_abs.replace('\'', "''"),
         built_at,
         modules_count,
         methods_count,
+        objects_count,
+        global_vars_count,
         elapsed_ms,
     ))?;
 
@@ -259,13 +322,95 @@ pub fn build(root: &Path, db_path: &Path, jobs: usize) -> Result<BuildStats> {
         modules: modules_count,
         methods: methods_count,
         global_modules: global_modules_count,
+        objects: objects_count,
+        global_vars: global_vars_count,
         elapsed_ms,
     })
 }
 
-/// Имена глобальных общих модулей (`<Global>true</Global>` в `CommonModules/<Имя>.xml`).
-fn collect_global_modules(root: &Path) -> HashSet<String> {
-    let mut set = HashSet::new();
+/// Имя файла — модуль приложения? Его экспортные переменные видны без префикса
+/// из любого клиентского модуля.
+pub fn is_application_module_file(file_name: &str) -> bool {
+    APPLICATION_MODULE_FILE_NAMES
+        .iter()
+        .any(|a| a.eq_ignore_ascii_case(file_name))
+}
+
+/// Экспортные переменные уровня модуля из ТЕКСТА (`Перем ПараметрыПриложения Экспорт;`).
+///
+/// Экспортной может быть только переменная УРОВНЯ МОДУЛЯ: внутри процедуры
+/// `Экспорт` у `Перем` синтаксически невозможен. Поэтому проверять область
+/// объявления не нужно — достаточно самого слова `Экспорт` в строке.
+///
+/// Разбор строковый, а не деревом: `AssignFact` из `bsl-parse` не хранит
+/// признак экспортности, а заводить его ради четырёх файлов на конфигурацию
+/// дороже, чем разобрать сами строки. Строковых литералов в объявлении `Перем`
+/// не бывает, поэтому комментарий достаточно отрезать по `//`.
+///
+/// Публично: те же строки разбирают источники поверх `code-index`, у которых
+/// файла на диске нет — только текст, полученный по сети. Правило чтения
+/// объявления должно жить в одном месте.
+pub fn global_export_vars_from_text(text: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for line in text.lines() {
+        let code = line.split("//").next().unwrap_or("").trim();
+        let Some(sep) = code.find(char::is_whitespace) else {
+            continue;
+        };
+        let (keyword, tail) = code.split_at(sep);
+        // Сравнение через to_lowercase: eq_ignore_ascii_case кириллицу не сворачивает.
+        if keyword.to_lowercase() != "перем" {
+            continue;
+        }
+        // `Перем А Экспорт, Б Экспорт;` — `Экспорт` ставится у каждого имени.
+        for part in tail.trim_end().trim_end_matches(';').split(',') {
+            let mut words = part.split_whitespace();
+            let Some(name) = words.next() else {
+                continue;
+            };
+            if words.any(|w| w.to_lowercase() == "экспорт") {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names
+}
+
+/// Экспортные переменные всех модулей приложения выгрузки.
+fn collect_global_vars(bsl_files: &[PathBuf]) -> Vec<String> {
+    let mut names = Vec::new();
+    for path in bsl_files {
+        let is_application_module = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(is_application_module_file);
+        if !is_application_module {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        names.extend(global_export_vars_from_text(&text));
+    }
+    names
+}
+
+/// Факты по XML-выгрузке, извлекаемые ОДНИМ обходом дерева: имена глобальных
+/// общих модулей и полный список объектов конфигурации по коллекциям.
+struct XmlFacts {
+    /// Имена глобальных общих модулей (`<Global>true</Global>`).
+    globals: HashSet<String>,
+    /// Объекты конфигурации: (коллекция, имя) — по одной записи на XML-файл выгрузки.
+    objects: Vec<(String, String)>,
+}
+
+/// Собрать `XmlFacts` одним обходом дерева выгрузки — второй полный обход ради
+/// одних лишь объектов не заводим, `<Коллекция>/<Имя>.xml` и так проходит мимо
+/// при поиске глобальных общих модулей.
+fn collect_xml_facts(root: &Path) -> XmlFacts {
+    let mut globals = HashSet::new();
+    let mut objects = Vec::new();
+
     for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
         if !entry.file_type().is_file() {
             continue;
@@ -274,22 +419,38 @@ fn collect_global_modules(root: &Path) -> HashSet<String> {
         let is_xml = path
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("xml"));
-        let in_common_modules = path
-            .parent()
-            .and_then(|p| p.file_name())
-            .is_some_and(|n| n == "CommonModules");
-        if !is_xml || !in_common_modules {
+        if !is_xml {
             continue;
         }
+        let Some(parent_name) = path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str())
+        else {
+            continue;
+        };
+        // Коллекция — КАНОНИЧЕСКОЕ имя из KNOWN_COLLECTIONS (не то, что на диске),
+        // сравнение регистронезависимое, как в parse_path.
+        let Some(collection) = KNOWN_COLLECTIONS
+            .iter()
+            .find(|k| k.eq_ignore_ascii_case(parent_name))
+        else {
+            continue;
+        };
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
-        let content = std::fs::read_to_string(path).unwrap_or_default();
-        if content.contains("<Global>true</Global>") {
-            set.insert(stem.to_string());
+
+        objects.push((collection.to_string(), stem.to_string()));
+
+        // Содержимое читаем только у общих модулей — для остальных коллекций
+        // это тысячи файлов, а нужно только имя объекта.
+        if *collection == "CommonModules" {
+            let content = std::fs::read_to_string(path).unwrap_or_default();
+            if content.contains("<Global>true</Global>") {
+                globals.insert(stem.to_string());
+            }
         }
     }
-    set
+
+    XmlFacts { globals, objects }
 }
 
 /// Модуль после разбора — то, что пишется в строки `modules`/`methods`.
@@ -554,6 +715,50 @@ impl LiteIndex {
             out.insert(row?);
         }
         Ok(out)
+    }
+
+    /// Имена объектов по коллекциям. `None` — таблицы `objects` в базе нет
+    /// (индекс собран версией до неё): это «не знаю», а не «объектов нет».
+    pub fn all_objects(&self) -> Result<Option<HashMap<String, HashSet<String>>>> {
+        if !self.has_table("objects")? {
+            return Ok(None);
+        }
+
+        let mut stmt = self.conn.prepare("SELECT collection, name FROM objects")?;
+        let rows =
+            stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+        let mut out: HashMap<String, HashSet<String>> = HashMap::new();
+        for row in rows {
+            let (collection, name) = row?;
+            out.entry(collection).or_default().insert(name);
+        }
+        Ok(Some(out))
+    }
+
+    /// Имена экспортных переменных модулей приложения (нижний регистр).
+    /// `None` — таблицы `global_vars` в базе нет (индекс собран версией до неё):
+    /// это «не знаю», а не «таких переменных нет».
+    pub fn all_global_var_names(&self) -> Result<Option<HashSet<String>>> {
+        if !self.has_table("global_vars")? {
+            return Ok(None);
+        }
+        let mut stmt = self.conn.prepare("SELECT name_lower FROM global_vars")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(Some(rows.collect::<rusqlite::Result<HashSet<String>>>()?))
+    }
+
+    /// Есть ли таблица в базе? Индекс, собранный прежней версией, не содержит
+    /// таблиц, добавленных позже, — отличаем «нет таблицы» от «таблица пуста».
+    fn has_table(&self, name: &str) -> Result<bool> {
+        let found: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
     }
 }
 

@@ -45,6 +45,8 @@ findings with line, column, kind, and confidence:
 | `undeclared_method` | high | Call is not declared in the submitted module and unknown to the platform (whole-module check only; suppressed in extension modules) |
 | `unknown_directive` | high / low | Directive name (`&НаСервере`, `&Перед`, …) not in the whitelist |
 | `shadowed_context_name` | high | Variable name is taken by a read-only context property: the assignment fails at runtime. The form-member rule needs `module_path` |
+| `unknown_common_module` | high | `ModuleName.Method(...)` — no common module with that name exists in the configuration. Requires an external name source |
+| `unknown_metadata_object` | high | `Справочники.Name`, `Документы.Name`, … — no object with that name exists in the collection. Requires an external name source |
 
 high-confidence findings have a false-positive rate near zero; low-confidence ones
 depend on the accuracy of type inference and the completeness of the `hbk`.
@@ -65,10 +67,13 @@ The higher the level, the more findings — and the more potential false positiv
 
 ### What the validator cannot know
 
-The validator sees the text of a SINGLE module plus the platform context. It
-does not know the configuration's metadata, so it cannot verify that
-application procedures declared in other modules exist. The `undeclared_method`
-finding is suppressed when the name may come from outside:
+The validator sees the text of a SINGLE module plus the platform context. About
+the configuration it knows exactly what the external name source tells it (see
+"External configuration name source"): it does know the set of objects (hence
+`unknown_common_module` and `unknown_metadata_object`), but it does not know the
+VISIBILITY RULES for application procedures, so it cannot verify that a called
+procedure is reachable from here. The `undeclared_method` finding is suppressed
+when the name may come from outside:
 
 - an ordinary (non-managed) form module calls its owner's object module export
   methods without a prefix;

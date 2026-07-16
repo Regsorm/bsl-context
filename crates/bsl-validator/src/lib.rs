@@ -4,6 +4,7 @@
 //! Phase 6 (отдельный модуль `expression`) — `validateExpression` через tree-sitter.
 
 pub mod check;
+pub mod config_objects;
 pub mod context_names;
 pub mod directives;
 pub mod expression;

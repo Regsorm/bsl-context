@@ -38,6 +38,7 @@ use platform_index::PlatformIndex;
 
 use bsl_parse::{collect_facts, scan_declarations};
 
+use crate::config_objects::check_config_objects;
 use crate::context_names::check_shadowed_context_names;
 use crate::directives::{closest_directive_with_distance, is_extension_module, is_known_directive};
 use crate::expression::{
@@ -148,6 +149,18 @@ fn validate_module_at_level_inner(
         &facts,
         form_module,
         form_attributes,
+        &mut errors,
+    );
+    // Статическая сверка имён объектов конфигурации — работает на всех уровнях
+    // (level=1 тоже), type inference ей не нужен.
+    check_config_objects(
+        index,
+        source,
+        &facts,
+        module_path,
+        form_module,
+        form_attributes,
+        symbols,
         &mut errors,
     );
     errors.sort_by_key(|e| (e.line, e.col));

@@ -50,6 +50,14 @@ fn setup(root: &Path) {
         "external/Обр/Form/Ф/Form.obj.bsl",
         "&НаКлиенте\nПроцедура ПриОткрытии(Отказ)\nКонецПроцедуры\n",
     );
+
+    // Объект без единого модуля — как большинство перечислений в УТ (909 из 1069).
+    // Список объектов обязан строиться по XML, а не по таблице modules.
+    write_file(
+        root,
+        "base/Enums/ТестБезМодуля.xml",
+        "<?xml version=\"1.0\"?>\n<MetaDataObject><Enum><Properties><Name>ТестБезМодуля</Name></Properties></Enum></MetaDataObject>\n",
+    );
 }
 
 #[test]
@@ -111,4 +119,17 @@ fn build_indexes_all_modules_and_flags() {
         .owner_exports("external/Обр/Form/Ф/Form.obj.bsl")
         .unwrap();
     assert_eq!(exports, vec!["экспортныйметодобр".to_string()]);
+
+    // Объект без модуля (перечисление) обязан попасть в objects — источник
+    // тут XML, а не таблица modules.
+    let objects = index
+        .all_objects()
+        .unwrap()
+        .expect("свежесобранная база должна содержать таблицу objects");
+    let enums = objects.get("Enums").expect("коллекция Enums должна быть в наборе");
+    assert!(
+        enums.contains("ТестБезМодуля"),
+        "объект без модуля не попал в objects, получено: {:?}",
+        enums
+    );
 }

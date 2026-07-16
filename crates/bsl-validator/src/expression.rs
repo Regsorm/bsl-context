@@ -135,6 +135,16 @@ pub enum ExprErrorKind {
     /// доступное для записи, → Low (присваивание компилируется, но не создаёт
     /// переменную).
     ShadowedContextName,
+    /// Обращение `ИмяМодуля.Метод(...)` вне явного контекста объекта, где
+    /// `ИмяМодуля` не найдено среди общих модулей конфигурации (внешний
+    /// источник [`crate::symbols::SymbolSource`] ответил `Some(false)`).
+    /// Эмиттится только из `crate::config_objects`.
+    UnknownCommonModule,
+    /// Обращение `Менеджер.Имя` к менеджеру объектов конфигурации
+    /// (`Справочники`, `Документы`, …), где `Имя` не найдено в
+    /// соответствующей коллекции каталога выгрузки (внешний источник ответил
+    /// `Some(false)`). Эмиттится только из `crate::config_objects`.
+    UnknownMetadataObject,
 }
 
 impl ExprErrorKind {
@@ -156,9 +166,15 @@ impl ExprErrorKind {
     /// безопасный fallback.
     pub fn confidence(self) -> Confidence {
         match self {
+            // `UnknownCommonModule`/`UnknownMetadataObject` — точная сверка со
+            // списком объектов реальной конфигурации (`crate::config_objects`),
+            // не эвристика: тот же уровень надёжности, что у сверки со
+            // справкой платформы.
             ExprErrorKind::UnknownEnumValue
             | ExprErrorKind::WrongArgumentCount
-            | ExprErrorKind::UndeclaredMethod => Confidence::High,
+            | ExprErrorKind::UndeclaredMethod
+            | ExprErrorKind::UnknownCommonModule
+            | ExprErrorKind::UnknownMetadataObject => Confidence::High,
             ExprErrorKind::UnknownTypeMember
             | ExprErrorKind::UnknownNewType
             | ExprErrorKind::UnknownGlobalMethod
@@ -743,7 +759,7 @@ fn similarity(a: &str, b: &str) -> f32 {
     1.0 - (lev(a, b) as f32 / max_len as f32)
 }
 
-fn lev(a: &str, b: &str) -> usize {
+pub(crate) fn lev(a: &str, b: &str) -> usize {
     let av: Vec<char> = a.chars().collect();
     let bv: Vec<char> = b.chars().collect();
     let (n, m) = (av.len(), bv.len());
