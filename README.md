@@ -47,9 +47,23 @@ findings with line, column, kind, and confidence:
 | `shadowed_context_name` | high | Variable name is taken by a read-only context property: the assignment fails at runtime. The form-member rule needs `module_path` |
 | `unknown_common_module` | high | `ModuleName.Method(...)` — no common module with that name exists in the configuration. Requires an external name source |
 | `unknown_metadata_object` | high | `Справочники.Name`, `Документы.Name`, … — no object with that name exists in the collection. Requires an external name source |
+| `temp_table_without_index` | high | A temporary table takes part in a join but has no `ИНДЕКСИРОВАТЬ ПО` |
+| `or_in_join_condition` | high | `ИЛИ` splits a join condition, so no index can be used |
+| `join_with_subquery` | low | Join with a subquery instead of an indexed temporary table |
+| `physical_register_table` | low | Reading a balance register's movement table instead of its virtual table. Requires an external name source |
+| `virtual_table_without_filter` | low | A virtual table is called without a filter on its dimensions. Requires an external name source |
+| `join_on_unindexed_field` | low | The joined table has neither a standard index nor «Индексировать» on the join field. Requires an external name source |
 
 high-confidence findings have a false-positive rate near zero; low-confidence ones
 depend on the accuracy of type inference and the completeness of the `hbk`.
+
+### Query optimality
+
+The last six findings come from parsing the 1C query language inside string
+literals. A query whose text is built by concatenation with variables, or one the
+parser could not read, is not analysed at all — an incomplete parse must not
+produce findings. On the UT configuration (14905 modules) 97.3% of the 23260
+queries found in the code are parsed.
 
 ### Validation levels
 

@@ -71,12 +71,30 @@ CREATE INDEX idx_modules_global     ON modules(is_global);
 -- Модулей у объекта может не быть вовсе (в УТ 909 из 1069 перечислений),
 -- поэтому список объектов строится по XML, а не по таблице modules.
 CREATE TABLE objects (
-    id         INTEGER PRIMARY KEY,
-    collection TEXT NOT NULL,          -- CommonModules | Catalogs | Enums | ...
-    name       TEXT NOT NULL,          -- имя в исходном регистре
-    name_lower TEXT NOT NULL           -- считается в Rust: SQLite lower() НЕ сворачивает кириллицу
+    id            INTEGER PRIMARY KEY,
+    collection    TEXT NOT NULL,       -- CommonModules | Catalogs | Enums | ...
+    name          TEXT NOT NULL,       -- имя в исходном регистре
+    name_lower    TEXT NOT NULL,       -- считается в Rust: SQLite lower() НЕ сворачивает кириллицу
+    register_type TEXT                 -- Balance | Turnovers, только у регистров накопления
 );
 CREATE INDEX idx_objects_lookup ON objects(collection, name_lower);
+
+-- Состав объекта: реквизиты, измерения, ресурсы. Нужен правилам оптимальности
+-- запросов: по нему видно, есть ли отбор по измерению виртуальной таблицы и
+-- индексировано ли поле, попавшее в условие.
+--
+-- Заполняется только для коллекций, которые могут быть источником запроса
+-- (см. COLLECTIONS_WITH_FIELDS): читать XML всех тысяч объектов ради, скажем,
+-- общих картинок незачем.
+CREATE TABLE object_fields (
+    id         INTEGER PRIMARY KEY,
+    object_id  INTEGER NOT NULL REFERENCES objects(id) ON DELETE CASCADE,
+    name       TEXT NOT NULL,
+    name_lower TEXT NOT NULL,
+    kind       TEXT NOT NULL,          -- attribute | dimension | resource
+    indexing   TEXT                    -- Index | IndexWithAdditionalOrder; NULL — не индексировано
+);
+CREATE INDEX idx_object_fields_object ON object_fields(object_id);
 
 -- Экспортная переменная модуля приложения (`Перем Имя Экспорт;`).
 -- Видна БЕЗ префикса из любого клиентского модуля, поэтому для проверяющего
@@ -237,7 +255,11 @@ pub fn build(root: &Path, db_path: &Path, jobs: usize) -> Result<BuildStats> {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             )?;
             let mut insert_object = tx.prepare(
-                "INSERT INTO objects (collection, name, name_lower) VALUES (?1, ?2, ?3)",
+                "INSERT INTO objects (collection, name, name_lower, register_type) VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            let mut insert_field = tx.prepare(
+                "INSERT INTO object_fields (object_id, name, name_lower, kind, indexing) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
             )?;
 
             for module in &parsed {
@@ -272,9 +294,25 @@ pub fn build(root: &Path, db_path: &Path, jobs: usize) -> Result<BuildStats> {
                 }
             }
 
-            for (collection, name) in &xml_facts.objects {
-                insert_object.execute(params![collection, name, name.to_lowercase()])?;
+            for object in &xml_facts.objects {
+                insert_object.execute(params![
+                    object.collection,
+                    object.name,
+                    object.name.to_lowercase(),
+                    object.register_type,
+                ])?;
                 objects_count += 1;
+
+                let object_id = tx.last_insert_rowid();
+                for field in &object.fields {
+                    insert_field.execute(params![
+                        object_id,
+                        field.name,
+                        field.name.to_lowercase(),
+                        field.kind,
+                        field.indexing,
+                    ])?;
+                }
             }
 
             let mut insert_global_var = tx.prepare(
@@ -301,7 +339,7 @@ pub fn build(root: &Path, db_path: &Path, jobs: usize) -> Result<BuildStats> {
 
     conn.execute_batch(&format!(
         "INSERT INTO meta (key, value) VALUES
-            ('schema_version', '2'),
+            ('schema_version', '3'),
             ('root', '{}'),
             ('built_at', '{}'),
             ('modules', '{}'),
@@ -400,9 +438,70 @@ fn collect_global_vars(bsl_files: &[PathBuf]) -> Vec<String> {
 struct XmlFacts {
     /// Имена глобальных общих модулей (`<Global>true</Global>`).
     globals: HashSet<String>,
-    /// Объекты конфигурации: (коллекция, имя) — по одной записи на XML-файл выгрузки.
-    objects: Vec<(String, String)>,
+    /// Объекты конфигурации — по одной записи на XML-файл выгрузки.
+    objects: Vec<XmlObject>,
 }
+
+/// Разбор XML объекта для интеграционных тестов: (вид регистра, поля).
+///
+/// Сам разбор приватен — снаружи с ним работать незачем, но проверять его на
+/// фрагментах настоящей выгрузки необходимо: раскладка тегов оказалась не той,
+/// какой выглядела на первый взгляд.
+pub fn parse_object_xml_for_tests(content: &str) -> (Option<String>, Vec<(String, String, Option<String>)>) {
+    let (register_type, fields) = parse_object_xml(content);
+    let fields = fields
+        .into_iter()
+        .map(|f| (f.name, f.kind.to_string(), f.indexing))
+        .collect();
+    (register_type, fields)
+}
+
+/// Состав объекта, как он лежит в индексе.
+///
+/// Тип нарочно «плоский», без зависимости от валидатора: `lite-index` о
+/// проверках ничего не знает, а перекладку в `ObjectSchema` делает источник.
+pub struct ObjectFields {
+    /// `Balance` / `Turnovers` — только у регистров накопления.
+    pub register_type: Option<String>,
+    /// (имя, вид, признак индексирования): вид — `attribute` | `dimension` | `resource`.
+    pub fields: Vec<(String, String, Option<String>)>,
+}
+
+/// Объект конфигурации со составом, если состав читался.
+struct XmlObject {
+    collection: String,
+    name: String,
+    /// `Balance` / `Turnovers` — только у регистров накопления.
+    register_type: Option<String>,
+    fields: Vec<XmlField>,
+}
+
+struct XmlField {
+    name: String,
+    /// `attribute` | `dimension` | `resource`.
+    kind: &'static str,
+    /// `<Indexing>`, если не `DontIndex` (последнее в выгрузку не пишется).
+    indexing: Option<String>,
+}
+
+/// Коллекции, у которых читается состав: только те, что могут стоять
+/// источником запроса. Для остальных достаточно имени объекта, а чтение XML —
+/// это тысячи файлов на ровном месте.
+const COLLECTIONS_WITH_FIELDS: &[&str] = &[
+    "Catalogs",
+    "Documents",
+    "InformationRegisters",
+    "AccumulationRegisters",
+    "AccountingRegisters",
+    "CalculationRegisters",
+    "ChartsOfCharacteristicTypes",
+    "ChartsOfAccounts",
+    "ChartsOfCalculationTypes",
+    "BusinessProcesses",
+    "Tasks",
+    "ExchangePlans",
+    "DocumentJournals",
+];
 
 /// Собрать `XmlFacts` одним обходом дерева выгрузки — второй полный обход ради
 /// одних лишь объектов не заводим, `<Коллекция>/<Имя>.xml` и так проходит мимо
@@ -438,19 +537,156 @@ fn collect_xml_facts(root: &Path) -> XmlFacts {
             continue;
         };
 
-        objects.push((collection.to_string(), stem.to_string()));
+        // Содержимое читаем у общих модулей (нужен признак глобальности) и у
+        // коллекций, которые бывают источником запроса (нужен состав). Для
+        // остальных достаточно имени файла.
+        let mut register_type = None;
+        let mut fields = Vec::new();
 
-        // Содержимое читаем только у общих модулей — для остальных коллекций
-        // это тысячи файлов, а нужно только имя объекта.
         if *collection == "CommonModules" {
             let content = std::fs::read_to_string(path).unwrap_or_default();
             if content.contains("<Global>true</Global>") {
                 globals.insert(stem.to_string());
             }
+        } else if COLLECTIONS_WITH_FIELDS.contains(collection) {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                let parsed = parse_object_xml(&content);
+                register_type = parsed.0;
+                fields = parsed.1;
+            }
         }
+
+        objects.push(XmlObject {
+            collection: collection.to_string(),
+            name: stem.to_string(),
+            register_type,
+            fields,
+        });
     }
 
     XmlFacts { globals, objects }
+}
+
+/// Разобрать XML объекта: вид регистра и состав полей.
+///
+/// Событийный разбор, а не поиск подстрок. Раскладка проверена на реальной
+/// выгрузке УТ и НЕ такая, какой кажется:
+///
+/// ```xml
+/// <Attribute uuid="…">
+///     <Properties>
+///         <Name>Контрагент</Name>
+///         <Indexing>DontIndex</Indexing>
+///     </Properties>
+/// </Attribute>
+/// ```
+///
+/// То есть `<Name>` и `<Indexing>` — внуки `<Attribute>`, а не прямые потомки;
+/// отсюда `depth == field_depth + 2`. Глубина нужна ещё и потому, что `<Name>`
+/// встречается во вложенных элементах (`ChoiceParameterLinks`, `Synonym`).
+///
+/// Реквизиты табличных частей пропускаются: `<TabularSection>` содержит свои
+/// `<Attribute>`, и в составе самого объекта им не место.
+fn parse_object_xml(content: &str) -> (Option<String>, Vec<XmlField>) {
+    use quick_xml::events::Event;
+    use quick_xml::Reader;
+
+    let mut reader = Reader::from_str(content);
+    reader.config_mut().trim_text(true);
+
+    let mut register_type: Option<String> = None;
+    let mut fields: Vec<XmlField> = Vec::new();
+
+    // Текущее поле: (глубина элемента, вид, имя, indexing).
+    let mut current: Option<(usize, &'static str, Option<String>, Option<String>)> = None;
+    // Глубина `<TabularSection>`, пока мы внутри неё.
+    let mut tabular_depth: Option<usize> = None;
+    // Что писать в ближайший текстовый узел.
+    let mut want: Option<&'static str> = None;
+    let mut depth = 0usize;
+    let mut buf = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                depth += 1;
+                let tag = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
+                match tag.as_str() {
+                    "TabularSection" if tabular_depth.is_none() => tabular_depth = Some(depth),
+                    "Attribute" | "Dimension" | "Resource" if tabular_depth.is_none() => {
+                        let kind = match tag.as_str() {
+                            "Attribute" => "attribute",
+                            "Dimension" => "dimension",
+                            _ => "resource",
+                        };
+                        current = Some((depth, kind, None, None));
+                    }
+                    "Name" if current.as_ref().is_some_and(|(d, ..)| depth == d + 2) => {
+                        want = Some("name");
+                    }
+                    "Indexing" if current.as_ref().is_some_and(|(d, ..)| depth == d + 2) => {
+                        want = Some("indexing");
+                    }
+                    // Вид регистра лежит в свойствах самого объекта, не в поле.
+                    "RegisterType" if current.is_none() => want = Some("register_type"),
+                    _ => {}
+                }
+            }
+            Ok(Event::Text(e)) => {
+                let Some(target) = want.take() else { continue };
+                let text = e.unescape().unwrap_or_default().trim().to_string();
+                if text.is_empty() {
+                    continue;
+                }
+                match target {
+                    "register_type" => register_type = Some(text),
+                    "name" => {
+                        if let Some((_, _, name, _)) = current.as_mut() {
+                            *name = Some(text);
+                        }
+                    }
+                    "indexing" => {
+                        if let Some((_, _, _, indexing)) = current.as_mut() {
+                            // `DontIndex` означает «не индексировано» — не храним,
+                            // чтобы отсутствие значения читалось однозначно.
+                            if text != "DontIndex" {
+                                *indexing = Some(text);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::End(_)) => {
+                if let Some((field_depth, kind, name, indexing)) = current.take() {
+                    if depth == field_depth {
+                        if let Some(name) = name {
+                            fields.push(XmlField {
+                                name,
+                                kind,
+                                indexing,
+                            });
+                        }
+                    } else {
+                        current = Some((field_depth, kind, name, indexing));
+                    }
+                }
+                if tabular_depth == Some(depth) {
+                    tabular_depth = None;
+                }
+                depth = depth.saturating_sub(1);
+                want = None;
+            }
+            Ok(Event::Eof) => break,
+            // Битый XML — отдаём то, что успели собрать: правило само решит,
+            // хватает ли ему этого. Ронять сборку индекса из-за одного файла нельзя.
+            Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    (register_type, fields)
 }
 
 /// Модуль после разбора — то, что пишется в строки `modules`/`methods`.
@@ -733,6 +969,88 @@ impl LiteIndex {
             out.entry(collection).or_default().insert(name);
         }
         Ok(Some(out))
+    }
+
+    /// Состав одного объекта: вид регистра и поля с признаком индексирования.
+    ///
+    /// Состав СЛИВАЕТСЯ по всем копиям объекта. Один объект встречается в
+    /// выгрузке многократно — в базовой конфигурации и в каждом расширении,
+    /// которое его дополняет (замер на УТ: у `Documents.ЗаказКлиента` 19 копий,
+    /// 95 полей в базовой и ещё 2…56 в расширениях; всего таких имён 734).
+    /// Взять первую попавшуюся строку значило бы вернуть пару реквизитов из
+    /// случайного расширения вместо всего состава.
+    ///
+    /// Поле, объявленное в нескольких копиях, считается индексированным, если
+    /// индекс есть хотя бы в одной: пропустить существующий индекс безопаснее,
+    /// чем выдумать отсутствующий и дать ложную находку.
+    ///
+    /// `None` — таблицы `object_fields` в базе нет (индекс собран схемой 2 или
+    /// раньше) либо такого объекта нет: и то и другое означает «не знаю»,
+    /// и правило на этом обязано молчать. Пересобрать индекс — `rebuild_symbol_index`.
+    pub fn object_schema(&self, collection: &str, name_lower: &str) -> Result<Option<ObjectFields>> {
+        if !self.has_table("object_fields")? {
+            return Ok(None);
+        }
+
+        let mut stmt = self.conn.prepare(
+            "SELECT o.register_type, f.name, f.kind, f.indexing \
+             FROM objects o LEFT JOIN object_fields f ON f.object_id = o.id \
+             WHERE o.collection = ?1 AND o.name_lower = ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![collection, name_lower], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+
+        let mut register_type: Option<String> = None;
+        // Порядок полей сохраняем: он повторяет порядок в выгрузке.
+        let mut order: Vec<(String, String)> = Vec::new();
+        let mut merged: HashMap<(String, String), (String, Option<String>)> = HashMap::new();
+        let mut found = false;
+
+        for row in rows {
+            let (reg, name, kind, indexing) = row?;
+            found = true;
+            if register_type.is_none() {
+                register_type = reg;
+            }
+            let (Some(name), Some(kind)) = (name, kind) else {
+                continue; // копия без состава
+            };
+            let key = (kind.clone(), name.to_lowercase());
+            match merged.get_mut(&key) {
+                Some((_, existing)) => {
+                    if existing.is_none() {
+                        *existing = indexing;
+                    }
+                }
+                None => {
+                    order.push(key.clone());
+                    merged.insert(key, (name, indexing));
+                }
+            }
+        }
+
+        if !found {
+            return Ok(None);
+        }
+
+        let fields = order
+            .into_iter()
+            .filter_map(|key| {
+                let (name, indexing) = merged.remove(&key)?;
+                Some((name, key.0, indexing))
+            })
+            .collect();
+
+        Ok(Some(ObjectFields {
+            register_type,
+            fields,
+        }))
     }
 
     /// Имена экспортных переменных модулей приложения (нижний регистр).

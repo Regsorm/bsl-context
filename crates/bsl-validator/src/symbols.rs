@@ -8,6 +8,51 @@
 
 use std::collections::HashSet;
 
+/// Поле объекта конфигурации: реквизит, измерение или ресурс.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectField {
+    pub name: String,
+    /// Значение `<Indexing>` из выгрузки (`Index`, `IndexWithAdditionalOrder`).
+    /// `None` — поле не индексировано: в выгрузке `DontIndex` не записывается.
+    pub indexing: Option<String>,
+}
+
+impl ObjectField {
+    pub fn is_indexed(&self) -> bool {
+        self.indexing.is_some()
+    }
+}
+
+/// Состав объекта конфигурации — ровно то, что нужно правилам оптимальности
+/// запросов, без полей «на будущее».
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObjectSchema {
+    pub attributes: Vec<ObjectField>,
+    pub dimensions: Vec<ObjectField>,
+    pub resources: Vec<ObjectField>,
+    /// Вид регистра накопления: `Balance` (остатки) или `Turnovers` (обороты).
+    /// Только для регистров накопления; у прочих объектов `None`.
+    pub register_type: Option<String>,
+}
+
+impl ObjectSchema {
+    /// Регистр остатков — у него есть виртуальные таблицы `Остатки`
+    /// и `ОстаткиИОбороты`, ради которых физическую таблицу читать не нужно.
+    pub fn is_balance_register(&self) -> bool {
+        self.register_type.as_deref() == Some("Balance")
+    }
+
+    /// Найти поле среди реквизитов, измерений и ресурсов.
+    /// Имя сворачивается в Rust: SQLite-подобный `lower()` кириллицу не берёт.
+    pub fn field(&self, name_lower: &str) -> Option<&ObjectField> {
+        self.attributes
+            .iter()
+            .chain(self.dimensions.iter())
+            .chain(self.resources.iter())
+            .find(|f| f.name.to_lowercase() == name_lower)
+    }
+}
+
 pub trait SymbolSource: Send + Sync {
     /// Экспортный метод ГЛОБАЛЬНОГО общего модуля — такой зовут без префикса
     /// откуда угодно, находкой он быть не может.
@@ -39,6 +84,17 @@ pub trait SymbolSource: Send + Sync {
     /// Все имена объектов коллекции (в ИСХОДНОМ регистре) — для подсказки
     /// «возможно, вы имели в виду». `None` — подсказки не будет.
     fn collection_names(&self, _collection: &str) -> Option<HashSet<String>> {
+        None
+    }
+
+    /// Состав объекта: реквизиты, измерения, ресурсы, признак индексирования,
+    /// вид регистра. Нужен правилам оптимальности запросов.
+    ///
+    /// `None` — источник не умеет ответить, и правило обязано промолчать
+    /// ЦЕЛИКОМ. Разница с `Some(schema)`, где нужного поля не нашлось,
+    /// принципиальна: во втором случае мы знаем состав и вправе делать выводы,
+    /// в первом — не знаем ничего.
+    fn object_schema(&self, _collection: &str, _name_lower: &str) -> Option<ObjectSchema> {
         None
     }
 

@@ -163,6 +163,10 @@ fn validate_module_at_level_inner(
         symbols,
         &mut errors,
     );
+    // Правила оптимальности запросов. Разбираются по ОРИГИНАЛЬНОМУ тексту:
+    // в `cleaned` от запроса остались одни пробелы. Метаданные конфигурации
+    // этим правилам не нужны.
+    crate::query_rules::check_query_rules(source, symbols, &mut errors);
     errors.sort_by_key(|e| (e.line, e.col));
 
     ExpressionValidation {

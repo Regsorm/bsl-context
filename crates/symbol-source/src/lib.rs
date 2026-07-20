@@ -22,7 +22,7 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OpenFlags};
 use serde_json::Value;
 
-use bsl_validator::SymbolSource;
+use bsl_validator::{ObjectField, ObjectSchema, SymbolSource};
 
 // ── LiteSource ──────────────────────────────────────────────────────────────
 
@@ -118,6 +118,30 @@ impl SymbolSource for LiteSource {
         self.objects.as_ref().and_then(|by_collection| by_collection.get(collection).cloned())
     }
 
+    fn object_schema(&self, collection: &str, name_lower: &str) -> Option<ObjectSchema> {
+        let found = match self.index.lock().unwrap().object_schema(collection, name_lower) {
+            Ok(found) => found?,
+            Err(e) => {
+                tracing::warn!(error = %e, collection, "lite-index: ошибка object_schema");
+                return None;
+            }
+        };
+
+        let mut schema = ObjectSchema {
+            register_type: found.register_type,
+            ..Default::default()
+        };
+        for (name, kind, indexing) in found.fields {
+            let field = ObjectField { name, indexing };
+            match kind.as_str() {
+                "dimension" => schema.dimensions.push(field),
+                "resource" => schema.resources.push(field),
+                _ => schema.attributes.push(field),
+            }
+        }
+        Some(schema)
+    }
+
     fn global_variables(&self) -> Option<HashSet<String>> {
         self.global_vars.clone()
     }
@@ -154,9 +178,18 @@ pub struct CodeIndexDbSource {
     /// не быть ни одного модуля.
     objects: Option<HashMap<String, HashSet<String>>>,
     objects_lower: Option<HashMap<String, HashSet<String>>>,
+    /// `meta_type` → (имя в нижнем регистре → имя в исходном). Нужна, чтобы
+    /// спросить состав объекта точечным SQL: сравнивать регистр в SQLite
+    /// нельзя — его `lower()` кириллицу не сворачивает.
+    objects_orig_by_lower: Option<HashMap<String, HashMap<String, String>>>,
     /// Экспортные переменные модулей приложения (нижний регистр). Собираются
     /// один раз при открытии из `file_contents` (zstd) — как и `global_exports`.
     global_vars: HashSet<String>,
+    /// Состав объектов, лениво. В отличие от имён, `attributes_json` тяжёлый
+    /// (у документа УТ — сотни реквизитов), а спрашивают его лишь про те
+    /// объекты, что встретились источниками запроса. `None` в значении —
+    /// «объект есть, состава у него нет», такой ответ тоже кэшируется.
+    schema_cache: Mutex<HashMap<String, Option<ObjectSchema>>>,
 }
 
 impl CodeIndexDbSource {
@@ -188,6 +221,19 @@ impl CodeIndexDbSource {
                 .collect()
         });
 
+        let objects_orig_by_lower = objects.as_ref().map(|by_type| {
+            by_type
+                .iter()
+                .map(|(meta_type, names)| {
+                    let map = names
+                        .iter()
+                        .map(|name| (name.to_lowercase(), name.clone()))
+                        .collect();
+                    (meta_type.clone(), map)
+                })
+                .collect()
+        });
+
         let global_vars = Self::collect_global_vars(&conn);
 
         Ok(Self {
@@ -197,7 +243,9 @@ impl CodeIndexDbSource {
             global_exports,
             objects,
             objects_lower,
+            objects_orig_by_lower,
             global_vars,
+            schema_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -254,6 +302,20 @@ impl CodeIndexDbSource {
             out.entry(meta_type).or_default().insert(name);
         }
         Some(out)
+    }
+
+    /// Состав одного объекта из `metadata_objects.attributes_json`.
+    /// Ошибка запроса и отсутствие структуры неразличимы намеренно: и то и
+    /// другое означает «состава не знаю», а правило на этом молчит.
+    fn query_schema(&self, meta_type: &str, name: &str) -> Option<ObjectSchema> {
+        let conn = self.conn.lock().ok()?;
+        let mut stmt = conn
+            .prepare("SELECT attributes_json FROM metadata_objects WHERE meta_type = ?1 AND name = ?2")
+            .ok()?;
+        let json: Option<String> = stmt
+            .query_row(params![meta_type, name], |row| row.get(0))
+            .ok()?;
+        object_schema_from_json(&json?)
     }
 
     /// Экспортные имена методов глобальных общих модулей: XML общих модулей
@@ -348,6 +410,26 @@ impl SymbolSource for CodeIndexDbSource {
         self.objects.as_ref().and_then(|by_type| by_type.get(meta_type).cloned())
     }
 
+    fn object_schema(&self, collection: &str, name_lower: &str) -> Option<ObjectSchema> {
+        let meta_type = meta_type_for_collection(collection)?;
+        // Исходный регистр имени — иначе точечный SQL не найдёт строку.
+        let orig = self
+            .objects_orig_by_lower
+            .as_ref()?
+            .get(meta_type)?
+            .get(name_lower)?
+            .clone();
+
+        let key = format!("{meta_type}.{orig}");
+        if let Some(cached) = self.schema_cache.lock().unwrap().get(&key) {
+            return cached.clone();
+        }
+
+        let schema = self.query_schema(meta_type, &orig);
+        self.schema_cache.lock().unwrap().insert(key, schema.clone());
+        schema
+    }
+
     fn global_variables(&self) -> Option<HashSet<String>> {
         Some(self.global_vars.clone())
     }
@@ -399,6 +481,10 @@ pub struct CodeIndexMcpSource {
     objects_cache: Mutex<HashMap<String, HashSet<String>>>,
     /// То же самое в исходном регистре — для `collection_names`.
     objects_cache_orig: Mutex<HashMap<String, HashSet<String>>>,
+    /// Состав объектов, по одному запросу на объект. Здесь набор целиком на
+    /// коллекцию не годится: `attributes_json` у документа УТ — килобайты, и
+    /// пара тысяч документов одним ответом заведомо упрётся в бюджет размера.
+    schema_cache: Mutex<HashMap<String, Option<ObjectSchema>>>,
     /// Экспортные переменные модулей приложения (нижний регистр). `None` —
     /// ещё не запрашивались; запрос один на весь срок жизни источника (замер:
     /// 18 мс), дальше берётся отсюда.
@@ -431,6 +517,7 @@ impl CodeIndexMcpSource {
             owner_cache: Mutex::new(std::collections::HashMap::new()),
             objects_cache: Mutex::new(HashMap::new()),
             objects_cache_orig: Mutex::new(HashMap::new()),
+            schema_cache: Mutex::new(HashMap::new()),
             global_vars_cache: Mutex::new(None),
             healthy: AtomicBool::new(true),
         };
@@ -754,6 +841,34 @@ impl CodeIndexMcpSource {
         Ok(Some((lower, orig)))
     }
 
+    /// Состав одного объекта: `bsl_sql` по `full_name`. Ответ — одна строка,
+    /// в бюджет размера он укладывается заведомо, поэтому постраничности здесь
+    /// нет; проверки честности всё равно делаются — обрезанный `attributes_json`
+    /// выглядел бы как объект без половины полей.
+    fn call_schema(&self, full_name: &str) -> Result<Option<ObjectSchema>> {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "tools/call",
+            "params": {
+                "name": "bsl_sql",
+                "arguments": {
+                    "repo": self.repo,
+                    "sql": "SELECT attributes_json FROM metadata_objects WHERE full_name = ?1",
+                    "params": [full_name],
+                    "limit": 1
+                }
+            }
+        });
+        let resp = self
+            .post(body)
+            .with_context(|| format!("code-index mcp: bsl_sql(attributes_json, {full_name}) не прошёл"))?;
+        let text = resp.into_string().context("code-index mcp: тело ответа")?;
+        let value = parse_sse_json(&text)
+            .ok_or_else(|| anyhow::anyhow!("code-index mcp: пустой/неразбираемый SSE-ответ"))?;
+        Ok(schema_from_bsl_sql(&value))
+    }
+
     /// Экспортные переменные модулей приложения — ОДИН запрос `grep_code` за
     /// строками объявлений. Модули целиком читать не нужно: интересны только
     /// строки `Перем ... Экспорт`, их единицы (замер на УТ: 18 мс, 959 байт).
@@ -836,6 +951,46 @@ impl SymbolSource for CodeIndexMcpSource {
         let meta_type = meta_type_for_collection(collection)?;
         self.objects_for_collection(collection, meta_type)?;
         self.objects_cache_orig.lock().unwrap().get(collection).cloned()
+    }
+
+    fn object_schema(&self, collection: &str, name_lower: &str) -> Option<ObjectSchema> {
+        if !self.is_healthy() {
+            return None;
+        }
+        let meta_type = meta_type_for_collection(collection)?;
+        // Имя в исходном регистре: `full_name` в базе записан как в выгрузке,
+        // а свернуть кириллицу средствами SQL нельзя.
+        self.objects_for_collection(collection, meta_type)?;
+        let orig = self
+            .objects_cache_orig
+            .lock()
+            .unwrap()
+            .get(collection)?
+            .iter()
+            .find(|name| name.to_lowercase() == name_lower)
+            .cloned()?;
+
+        let full_name = format!("{meta_type}.{orig}");
+        if let Some(cached) = self.schema_cache.lock().unwrap().get(&full_name) {
+            return cached.clone();
+        }
+
+        match self.call_schema(&full_name) {
+            Ok(schema) => {
+                self.schema_cache
+                    .lock()
+                    .unwrap()
+                    .insert(full_name, schema.clone());
+                schema
+            }
+            // Ошибку сети не кэшируем и роняем healthy: «состава нет» здесь
+            // означало бы, что поля не индексированы, и дало бы ложные находки.
+            Err(e) => {
+                tracing::warn!(error = %e, "code-index mcp: ошибка bsl_sql за составом объекта");
+                self.healthy.store(false, Ordering::Relaxed);
+                None
+            }
+        }
     }
 
     fn global_variables(&self) -> Option<HashSet<String>> {
@@ -932,6 +1087,74 @@ fn meta_type_for_collection(collection: &str) -> Option<&'static str> {
         "Sequences" => Some("Sequence"),
         _ => None,
     }
+}
+
+/// Разобрать `metadata_objects.attributes_json` в состав объекта.
+///
+/// Формат задаёт code-index (`bsl-extension/src/xml/object_attributes.rs`):
+/// секции `attributes` / `dimensions` / `resources`, у поля — `name` и
+/// необязательное `indexing`; `DontIndex` в выгрузку не пишется, поэтому
+/// отсутствие ключа означает «поле не индексировано». Вид регистра лежит в
+/// `properties.RegisterType`.
+fn object_schema_from_json(text: &str) -> Option<ObjectSchema> {
+    let value: Value = serde_json::from_str(text).ok()?;
+    let section = |key: &str| -> Vec<ObjectField> {
+        value
+            .get(key)
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|field| {
+                        Some(ObjectField {
+                            name: field.get("name")?.as_str()?.to_string(),
+                            indexing: field
+                                .get("indexing")
+                                .and_then(|i| i.as_str())
+                                .map(|s| s.to_string()),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    Some(ObjectSchema {
+        attributes: section("attributes"),
+        dimensions: section("dimensions"),
+        resources: section("resources"),
+        register_type: value
+            .pointer("/properties/RegisterType")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+    })
+}
+
+/// Разбор ответа `bsl_sql` с одной колонкой `attributes_json`.
+///
+/// Проверки честности те же, что у списка объектов: обрезанный ответ дал бы
+/// объект без части полей, а правило про неиндексированное поле приняло бы это
+/// за «поле не индексировано».
+fn schema_from_bsl_sql(value: &Value) -> Option<ObjectSchema> {
+    let text = value.pointer("/result/content/0/text")?.as_str()?;
+    let parsed: Value = serde_json::from_str(text).ok()?;
+    if parsed.get("response_truncated").is_some() {
+        return None;
+    }
+    let body = payload(&parsed);
+    if body.get("rows_truncated").is_some()
+        || body.get("truncated").and_then(|t| t.as_bool()) == Some(true)
+        || body.get("rows_elided_already_delivered").is_some()
+    {
+        return None;
+    }
+    let json = body
+        .get("rows")?
+        .as_array()?
+        .first()?
+        .as_array()?
+        .first()?
+        .as_str()?;
+    object_schema_from_json(json)
 }
 
 /// Одна страница ответа `bsl_sql` со списком объектов.

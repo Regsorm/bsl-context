@@ -1055,6 +1055,297 @@ pub fn collect_methods(source: &str) -> Vec<MethodDecl> {
     methods
 }
 
+// ── Тексты запросов на языке запросов 1С ──────────────────────────────────
+
+/// Кусок текста запроса, непрерывный и в собранном тексте, и в тексте модуля.
+///
+/// Куски нужны потому, что значение строкового литерала BSL не совпадает с его
+/// записью в файле: символ продолжения `|` и отступ перед ним в значение не
+/// входят, `""` даёт одну кавычку, а конкатенация склеивает части, лежащие в
+/// модуле далеко друг от друга. Без такой карты находку нельзя показать на
+/// строке модуля — а находка без координаты бесполезна.
+pub struct QuerySpan {
+    /// Смещение куска в собранном тексте запроса, в БАЙТАХ.
+    pub text_offset: usize,
+    /// Смещение того же куска в тексте модуля, в БАЙТАХ.
+    pub module_byte: usize,
+    pub len: usize,
+}
+
+/// Текст запроса, собранный из одного или нескольких строковых литералов.
+pub struct QueryText {
+    /// Значение, которое платформа отдаст движку запросов.
+    pub text: String,
+    pub spans: Vec<QuerySpan>,
+    /// Начало первого литерала в модуле — координата запроса как целого.
+    pub byte: usize,
+}
+
+impl QueryText {
+    /// Смещение внутри собранного текста → смещение в тексте модуля.
+    ///
+    /// Смещение, попавшее на стык кусков (символ продолжения, пропущенный
+    /// комментарий), отдаёт конец ближайшего куска слева: приблизительная
+    /// позиция полезнее потерянной.
+    pub fn map_offset(&self, text_offset: usize) -> usize {
+        let mut best = self.byte;
+        for span in &self.spans {
+            if text_offset < span.text_offset {
+                break;
+            }
+            best = if text_offset < span.text_offset + span.len {
+                span.module_byte + (text_offset - span.text_offset)
+            } else {
+                span.module_byte + span.len
+            };
+        }
+        best
+    }
+}
+
+/// Строковый литерал модуля вместе с картой кусков, попадающих в его значение.
+struct Literal {
+    /// Байт открывающей кавычки.
+    start: usize,
+    /// Байт сразу за закрывающей кавычкой.
+    end: usize,
+    /// Куски значения: (смещение в модуле, длина).
+    parts: Vec<(usize, usize)>,
+}
+
+/// Собрать тексты запросов, записанные в модуле строковыми литералами.
+///
+/// Запрос узнаётся по первому слову собранного значения, а не по тому, куда оно
+/// присваивается: одним механизмом покрываются `Запрос.Текст = "ВЫБРАТЬ …"`,
+/// `Новый Запрос("ВЫБРАТЬ …")`, накопление через `+=` и текст схемы компоновки.
+///
+/// Конкатенация с не-литералом (`"ВЫБРАТЬ " + ИмяПоля + " ИЗ …"`) даёт запрос,
+/// текст которого известен лишь частично. Такой запрос НЕ возвращается вовсе:
+/// подстановка чего-либо на место неизвестного куска порождает находки на
+/// месте, которого в запросе нет.
+///
+/// Разбор идёт по оригинальному тексту, а не по замаскированному
+/// (`mask_strings_and_comments`) — там от запроса остаются одни пробелы.
+/// Блоки `#Удаление` снимаются заранее: их код в конфигурацию не попадает.
+pub fn collect_query_texts(source: &str) -> Vec<QueryText> {
+    // Двоичный .bsl (EDT-защищённые модули поставщика) — см. collect_facts.
+    if source.as_bytes().iter().take(8192).any(|&b| b == 0) {
+        return Vec::new();
+    }
+
+    let cleaned = strip_extension_directives(source);
+    let bytes = cleaned.as_bytes();
+    let literals = scan_literals(bytes);
+
+    let mut queries = Vec::new();
+    let mut i = 0;
+    while i < literals.len() {
+        // Плюс слева означает, что начало текста вычисляется, а не записано.
+        let mut dirty = preceded_by_plus(bytes, literals[i].start);
+        let mut last = i;
+
+        loop {
+            let after = skip_ws_and_comments(bytes, literals[last].end);
+            if after >= bytes.len() || bytes[after] != b'+' {
+                break;
+            }
+            let next = skip_ws_and_comments(bytes, after + 1);
+            if last + 1 < literals.len() && literals[last + 1].start == next {
+                last += 1;
+                continue;
+            }
+            // За плюсом стоит не литерал — часть текста запроса неизвестна.
+            dirty = true;
+            break;
+        }
+
+        if !dirty {
+            if let Some(query) = assemble_query(bytes, &literals[i..=last]) {
+                queries.push(query);
+            }
+        }
+        i = last + 1;
+    }
+
+    queries
+}
+
+/// Найти строковые литералы вместе с картой кусков их значения.
+///
+/// Границы литерала определяются ровно так же, как в `mask_strings_and_comments`
+/// (включая `""` и комментарий между строками-продолжениями) — расхождение двух
+/// разборов означало бы, что валидатор и извлечение запросов видят разный код.
+fn scan_literals(bytes: &[u8]) -> Vec<Literal> {
+    let mut literals = Vec::new();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        // Однострочный комментарий — литералов внутри нет.
+        if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i] != b'"' {
+            i += 1;
+            continue;
+        }
+
+        let start = i;
+        let mut parts: Vec<(usize, usize)> = Vec::new();
+        // Текущий непрерывный кусок значения: (начало, длина).
+        let mut part: Option<(usize, usize)> = None;
+        let mut j = i + 1;
+
+        while j < bytes.len() {
+            if bytes[j] == b'"' {
+                if j + 1 < bytes.len() && bytes[j + 1] == b'"' {
+                    // Удвоенная кавычка: в значение попадает одна.
+                    match &mut part {
+                        Some((_, len)) => *len += 1,
+                        None => part = Some((j, 1)),
+                    }
+                    if let Some(p) = part.take() {
+                        parts.push(p);
+                    }
+                    j += 2;
+                    continue;
+                }
+                j += 1;
+                break;
+            }
+
+            if bytes[j] == b'\n' {
+                // Перевод строки — часть значения, а вот отступ, символ
+                // продолжения `|` и комментарий между строками — нет.
+                match &mut part {
+                    Some((_, len)) => *len += 1,
+                    None => part = Some((j, 1)),
+                }
+                if let Some(p) = part.take() {
+                    parts.push(p);
+                }
+                j += 1;
+                // Начало строки литерала: отступ, символ продолжения `|` и
+                // комментарии между строками в значение не входят. Комментарий
+                // съедается вместе со своим переводом строки — иначе он оставил
+                // бы в тексте запроса пустую строку, которой в значении нет.
+                loop {
+                    while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+                        j += 1;
+                    }
+                    if j + 1 < bytes.len() && bytes[j] == b'/' && bytes[j + 1] == b'/' {
+                        while j < bytes.len() && bytes[j] != b'\n' {
+                            j += 1;
+                        }
+                        if j < bytes.len() {
+                            j += 1;
+                        }
+                        continue;
+                    }
+                    if j < bytes.len() && bytes[j] == b'|' {
+                        j += 1;
+                    }
+                    break;
+                }
+                continue;
+            }
+
+            match &mut part {
+                Some((_, len)) => *len += 1,
+                None => part = Some((j, 1)),
+            }
+            j += 1;
+        }
+
+        if let Some(p) = part.take() {
+            parts.push(p);
+        }
+        literals.push(Literal {
+            start,
+            end: j,
+            parts,
+        });
+        i = j;
+    }
+
+    literals
+}
+
+/// Пропустить пробелы, переводы строк и однострочные комментарии вправо.
+fn skip_ws_and_comments(bytes: &[u8], mut i: usize) -> usize {
+    loop {
+        while i < bytes.len() && (bytes[i] as char).is_ascii_whitespace() {
+            i += 1;
+        }
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        return i;
+    }
+}
+
+/// Стоит ли слева от литерала знак конкатенации.
+fn preceded_by_plus(bytes: &[u8], start: usize) -> bool {
+    let mut i = start;
+    while i > 0 {
+        i -= 1;
+        if (bytes[i] as char).is_ascii_whitespace() {
+            continue;
+        }
+        return bytes[i] == b'+';
+    }
+    false
+}
+
+/// Склеить значение группы литералов и отсеять всё, что не является запросом.
+fn assemble_query(bytes: &[u8], group: &[Literal]) -> Option<QueryText> {
+    let mut text = String::new();
+    let mut spans = Vec::new();
+
+    for literal in group {
+        for &(module_byte, len) in &literal.parts {
+            let chunk = std::str::from_utf8(&bytes[module_byte..module_byte + len]).ok()?;
+            spans.push(QuerySpan {
+                text_offset: text.len(),
+                module_byte,
+                len,
+            });
+            text.push_str(chunk);
+        }
+    }
+
+    if !looks_like_query(&text) {
+        return None;
+    }
+
+    Some(QueryText {
+        text,
+        spans,
+        byte: group[0].start,
+    })
+}
+
+/// Начинается ли значение с ключевого слова, с которого может начинаться запрос.
+///
+/// Проверяется именно первое слово: подстроки вроде «выбрать» где-то в середине
+/// сообщения пользователю запросом не являются.
+fn looks_like_query(text: &str) -> bool {
+    let head: String = text
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    matches!(
+        head.to_uppercase().as_str(),
+        "ВЫБРАТЬ" | "SELECT" | "УНИЧТОЖИТЬ" | "DROP"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1489,5 +1780,101 @@ mod tests {
         assert_eq!(facts.assigns.len(), 1, "assigns: {:?}", facts.assigns.iter().map(|a| &a.name).collect::<Vec<_>>());
         assert_eq!(facts.assigns[0].name, "Кэш");
         assert!(facts.assigns[0].declaration);
+    }
+
+    // ── Тексты запросов ───────────────────────────────────────────────────
+
+    #[test]
+    fn multiline_query_drops_continuation_bars() {
+        let src = "Запрос.Текст = \"ВЫБРАТЬ\n\t|\tТовары.Ссылка\n\t|ИЗ\n\t|\tСправочник.Товары КАК Товары\";";
+        let queries = collect_query_texts(src);
+        assert_eq!(queries.len(), 1, "запрос не найден");
+        assert_eq!(
+            queries[0].text,
+            "ВЫБРАТЬ\n\tТовары.Ссылка\nИЗ\n\tСправочник.Товары КАК Товары"
+        );
+    }
+
+    #[test]
+    fn offsets_point_back_into_the_module() {
+        let src = "Запрос.Текст = \"ВЫБРАТЬ\n\t|\tТовары.Ссылка\n\t|ИЗ\n\t|\tСправочник.Товары КАК Товары\";";
+        let queries = collect_query_texts(src);
+        let query = &queries[0];
+
+        // Каждое ключевое слово должно указывать на своё место в модуле.
+        for word in ["ВЫБРАТЬ", "ИЗ", "Справочник.Товары"] {
+            let in_text = query.text.find(word).expect("слово потеряно в тексте запроса");
+            let in_module = query.map_offset(in_text);
+            assert!(
+                src[in_module..].starts_with(word),
+                "смещение для {word} указывает не туда: {:?}",
+                &src[in_module..(in_module + 20).min(src.len())]
+            );
+        }
+    }
+
+    #[test]
+    fn concatenation_of_literals_is_assembled() {
+        let src = "Текст = \"ВЫБРАТЬ Т.Ссылка \"\n\t+ \"ИЗ Справочник.Товары КАК Т\";";
+        let queries = collect_query_texts(src);
+        assert_eq!(queries.len(), 1, "склейка литералов не сработала");
+        assert_eq!(queries[0].text, "ВЫБРАТЬ Т.Ссылка ИЗ Справочник.Товары КАК Т");
+
+        let at_from = queries[0].text.find("ИЗ").unwrap();
+        assert!(src[queries[0].map_offset(at_from)..].starts_with("ИЗ"));
+    }
+
+    #[test]
+    fn concatenation_with_variable_is_skipped() {
+        // Часть текста вычисляется — разбирать нечего, находки были бы на
+        // месте, которого в запросе нет.
+        let src = "Текст = \"ВЫБРАТЬ \" + ИмяПоля + \" ИЗ Справочник.Товары КАК Т\";";
+        assert!(collect_query_texts(src).is_empty());
+    }
+
+    #[test]
+    fn plain_strings_are_not_queries() {
+        let src = "Сообщить(\"Не удалось выбрать элемент\");\nТ = \"ИЗ отчёта\";";
+        assert!(collect_query_texts(src).is_empty());
+    }
+
+    #[test]
+    fn query_in_constructor_argument_is_found() {
+        let queries = collect_query_texts("З = Новый Запрос(\"ВЫБРАТЬ 1\");");
+        assert_eq!(queries.len(), 1);
+        assert_eq!(queries[0].text, "ВЫБРАТЬ 1");
+    }
+
+    #[test]
+    fn doubled_quote_becomes_single() {
+        let queries = collect_query_texts("Т = \"ВЫБРАТЬ \"\"Да\"\" КАК Флаг\";");
+        assert_eq!(queries.len(), 1);
+        assert_eq!(queries[0].text, "ВЫБРАТЬ \"Да\" КАК Флаг");
+    }
+
+    #[test]
+    fn comment_between_continuation_lines_is_dropped() {
+        // Комментарий между строками-продолжениями литерал не закрывает и в
+        // значение не входит.
+        let src = "Т = \"ВЫБРАТЬ\n\t// временно\n\t|\t1\";";
+        let queries = collect_query_texts(src);
+        assert_eq!(queries.len(), 1);
+        assert_eq!(queries[0].text, "ВЫБРАТЬ\n\t1");
+    }
+
+    #[test]
+    fn query_inside_deleted_block_is_ignored() {
+        // Код блока `#Удаление` в конфигурацию не попадает.
+        let src = "#Удаление\nТ = \"ВЫБРАТЬ 1\";\n#КонецУдаления\n";
+        assert!(collect_query_texts(src).is_empty());
+    }
+
+    #[test]
+    fn two_queries_side_by_side() {
+        let src = "А = \"ВЫБРАТЬ 1\";\nБ = \"ВЫБРАТЬ 2\";";
+        let queries = collect_query_texts(src);
+        assert_eq!(queries.len(), 2, "соседние запросы склеились или потерялись");
+        assert_eq!(queries[0].text, "ВЫБРАТЬ 1");
+        assert_eq!(queries[1].text, "ВЫБРАТЬ 2");
     }
 }

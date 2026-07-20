@@ -145,6 +145,34 @@ pub enum ExprErrorKind {
     /// соответствующей коллекции каталога выгрузки (внешний источник ответил
     /// `Some(false)`). Эмиттится только из `crate::config_objects`.
     UnknownMetadataObject,
+    /// Запрос кладёт результат во временную таблицу (`ПОМЕСТИТЬ`) без
+    /// `ИНДЕКСИРОВАТЬ ПО`, а дальше эта таблица участвует в соединении.
+    /// Соединение с неиндексированной временной таблицей платформа выполняет
+    /// перебором. Эмиттится только из `crate::query_rules`.
+    TempTableWithoutIndex,
+    /// В условии соединения (`ПО`) есть `ИЛИ`: оптимизатор не может
+    /// воспользоваться индексом и переходит к перебору соединяемых наборов.
+    /// Эмиттится только из `crate::query_rules`.
+    OrInJoinCondition,
+    /// Соединение с подзапросом вместо временной таблицы: подзапрос не
+    /// индексируется и вычисляется заново. Эмиттится только из
+    /// `crate::query_rules`.
+    JoinWithSubquery,
+    /// Чтение физической таблицы регистра остатков вместо виртуальной
+    /// (`Остатки`, `ОстаткиИОбороты`). В таблице движений измерений в
+    /// кластерном индексе нет — отбор по ним идёт полным просмотром, тогда как
+    /// виртуальная таблица читает таблицу итогов, где измерения в индексе.
+    /// Эмиттится только из `crate::query_rules`.
+    PhysicalRegisterTable,
+    /// Виртуальная таблица вызвана без отбора: платформа рассчитает итоги по
+    /// всему регистру, а лишние строки отсеются уже после. Эмиттится только из
+    /// `crate::query_rules`.
+    VirtualTableWithoutFilter,
+    /// Соединение по полю, у которого нет ни стандартного индекса, ни свойства
+    /// «Индексировать». Множество индексов замкнуто (см. справочник
+    /// `1c-standard-indexes.md`), поэтому вывод здесь точный, а не
+    /// предположительный. Эмиттится только из `crate::query_rules`.
+    JoinOnUnindexedField,
 }
 
 impl ExprErrorKind {
@@ -170,16 +198,37 @@ impl ExprErrorKind {
             // списком объектов реальной конфигурации (`crate::config_objects`),
             // не эвристика: тот же уровень надёжности, что у сверки со
             // справкой платформы.
+            // Правила запросов: находка следует из структуры разобранного
+            // текста, а не из эвристики. `TempTableWithoutIndex` и
+            // `OrInJoinCondition` — High: обе конструкции видны в тексте
+            // однозначно, догадок в них нет.
             ExprErrorKind::UnknownEnumValue
             | ExprErrorKind::WrongArgumentCount
             | ExprErrorKind::UndeclaredMethod
             | ExprErrorKind::UnknownCommonModule
-            | ExprErrorKind::UnknownMetadataObject => Confidence::High,
+            | ExprErrorKind::UnknownMetadataObject
+            // Из находок про запросы в `strict` попадают только эти две.
+            // Они не про корректность, а про скорость, и профиль `strict`
+            // у потребителя означает «блокировать сборку»: блокировать стоит
+            // лишь то, что исправляется одной строкой и почти никогда не бывает
+            // лишним — индекс временной таблицы и разбор `ИЛИ` в условии связи.
+            | ExprErrorKind::TempTableWithoutIndex
+            | ExprErrorKind::OrInJoinCondition => Confidence::High,
+            // Соединение с подзапросом иногда оправдано (маленький набор,
+            // однократное вычисление) — оставляем на усмотрение читающего.
             ExprErrorKind::UnknownTypeMember
             | ExprErrorKind::UnknownNewType
             | ExprErrorKind::UnknownGlobalMethod
             | ExprErrorKind::UnknownDirective
-            | ExprErrorKind::ShadowedContextName => Confidence::Low,
+            | ExprErrorKind::ShadowedContextName
+            // Остальные находки про запросы. Вывод в них точный (множество
+            // индексов замкнуто, вид регистра известен), но исправление может
+            // потребовать переписать половину запроса — а на малых объёмах
+            // выигрыша не будет вовсе. Это решение автора кода, не гейта.
+            | ExprErrorKind::JoinWithSubquery
+            | ExprErrorKind::VirtualTableWithoutFilter
+            | ExprErrorKind::PhysicalRegisterTable
+            | ExprErrorKind::JoinOnUnindexedField => Confidence::Low,
         }
     }
 }

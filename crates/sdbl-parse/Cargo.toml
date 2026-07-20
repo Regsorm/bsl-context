@@ -1,0 +1,13 @@
+[package]
+name = "sdbl-parse"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Разбор подмножества языка запросов 1С (SDBL): источники, соединения, временные таблицы, условия"
+
+[dependencies]
+
+# Только для корпусной приёмки: тексты запросов берутся из реальных модулей.
+# В саму библиотеку разбор BSL не входит — она работает с готовым текстом.
+[dev-dependencies]
+bsl-parse = { path = "../bsl-parse" }

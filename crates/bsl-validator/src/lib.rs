@@ -9,6 +9,7 @@ pub mod context_names;
 pub mod directives;
 pub mod expression;
 pub mod module;
+pub mod query_rules;
 pub mod scope;
 pub mod symbols;
 
@@ -32,4 +33,4 @@ pub use module::{
     validate_module_with_symbols,
 };
 pub use scope::{extract_scope_map, extract_type_annotations, Scope, ScopeMap};
-pub use symbols::SymbolSource;
+pub use symbols::{ObjectField, ObjectSchema, SymbolSource};
