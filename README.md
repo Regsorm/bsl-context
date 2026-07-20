@@ -84,23 +84,29 @@ The higher the level, the more findings — and the more potential false positiv
 The validator sees the text of a SINGLE module plus the platform context. About
 the configuration it knows exactly what the external name source tells it (see
 "External configuration name source"): it does know the set of objects (hence
-`unknown_common_module` and `unknown_metadata_object`), but it does not know the
-VISIBILITY RULES for application procedures, so it cannot verify that a called
-procedure is reachable from here. The `undeclared_method` finding is suppressed
-when the name may come from outside:
+`unknown_common_module`, `unknown_metadata_object` and the query optimality
+rules). What no source knows is the VISIBILITY RULES for application procedures:
+whether a procedure is exported, whether its module is reachable from here,
+whether the context matches (server/client).
 
-- an ordinary (non-managed) form module calls its owner's object module export
-  methods without a prefix;
-- an extension module calls procedures of the module it extends (such a module
-  is recognized by the `&Перед`, `&После`, `&Вместо`, `&ИзменениеИКонтроль`
-  directives, and strict checking is disabled for it);
-- a global common module (`Глобальный = Истина`) is called without a prefix
-  from any module.
+So an `undeclared_method` finding has three different fates when the name comes
+from outside the module:
 
-The first and third cases cannot be recognized from the module text alone —
-false positives for `undeclared_method` are possible there. The `strict`
-profile will not filter them out (the finding has `high` confidence); when
-working with such modules it's better not to rely on this finding.
+| Case | What the name source does |
+|------|---------------------------|
+| An export method of a GLOBAL common module (`Глобальный = Истина`) — called without a prefix from anywhere | the finding is **dropped entirely** |
+| An export method of the owner object module of an external data processor — visible to an ordinary form module without a prefix (requires `module_path`) | the finding is **dropped entirely** |
+| The name is declared somewhere in the configuration, but whether it is visible from here is unknown | the finding **stays with `low` confidence**, i.e. it is hidden in the `strict` profile |
+
+Extension modules are a case of their own: they call procedures of the module
+they extend, are recognized by the `&Перед`, `&После`, `&Вместо`,
+`&ИзменениеИКонтроль` directives, and strict checking is disabled for them
+entirely — no name source involved.
+
+Without a name source none of the three cases is recognized: findings keep
+`high` confidence and the `strict` profile will not filter them out. How much
+this changes the picture — see the measurement in "External configuration name
+source".
 
 Likewise, the validator does not know the form's set of attributes. An attribute
 shadows a context name (UT has forms with attributes named `Метаданные`,
@@ -120,14 +126,18 @@ The `profile` parameter (or `default_profile` in the config):
 
 ## Architecture
 
-A Cargo workspace of five crates:
+A Cargo workspace of nine crates:
 
 | Crate | Purpose |
 |-------|---------|
 | `hbk-reader` | Reads the binary `shcntx_ru.hbk` container |
 | `hbk-parser` | Parses help HTML pages (types, methods, enumerations) |
 | `platform-index` | Platform index: loading, storage, search |
-| `bsl-validator` | BSL expression validator (tree-sitter) |
+| `bsl-parse` | BSL parsing on top of tree-sitter: procedures, calls, query texts |
+| `sdbl-parse` | Parser for the 1C query language (SDBL), recursive descent |
+| `bsl-validator` | BSL expression validator and query optimality rules |
+| `lite-index` | Built-in lightweight index of configuration names (SQLite) |
+| `symbol-source` | Three configuration name sources: `lite`, `code_index_db`, `code_index_mcp` |
 | `server` | HTTP MCP server (axum + rmcp), config, PID lock |
 
 ## Requirements
