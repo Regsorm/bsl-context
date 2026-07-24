@@ -36,6 +36,23 @@ pub struct NewFact {
     pub byte: usize,
 }
 
+/// Вызов метода у менеджера объекта конфигурации:
+/// `Справочники.Сотрудники.НайтиПоРеквизиту(...)`. Получатель метода —
+/// двухсегментная голова `Коллекция.Объект`, поэтому [`simple_head`] его не
+/// берёт и обычного [`DotFact`] на метод не возникает. Отдельный факт нужен,
+/// чтобы сверить имя метода с методами типа-менеджера объекта
+/// (`СправочникМенеджер.<Имя справочника>` и т.п.) в валидаторе.
+pub struct ManagerCallFact {
+    /// Коллекция менеджеров (первый сегмент): `Справочники`, `Документы`, …
+    pub collection: String,
+    /// Имя объекта конфигурации (второй сегмент): `Сотрудники`.
+    pub object: String,
+    /// Имя вызванного метода (третий сегмент): `НайтиПоРеквизиту`.
+    pub method: String,
+    /// Начало идентификатора метода в БАЙТАХ исходного текста (для `pos_at`).
+    pub method_byte: usize,
+}
+
 /// Присваивание простому идентификатору (`Имя = ...`) или его объявление (`Перем Имя`).
 /// Обращения `A.B = ...` и `A[i] = ...` сюда не попадают: у них левая часть —
 /// `property_access`, а не `identifier`.
@@ -73,6 +90,9 @@ pub struct AstFacts {
     pub calls: Vec<CallFact>,
     pub dots: Vec<DotFact>,
     pub news: Vec<NewFact>,
+    /// Вызовы методов у менеджеров объектов конфигурации
+    /// (`Справочники.Сотрудники.НайтиПоРеквизиту(...)`). См. [`ManagerCallFact`].
+    pub manager_calls: Vec<ManagerCallFact>,
     /// Присваивания простому идентификатору и объявления `Перем` — для проверки,
     /// не занято ли имя членом контекста модуля (`ShadowedContextName`).
     pub assigns: Vec<AssignFact>,
@@ -570,14 +590,15 @@ pub fn collect_facts(source: &str) -> AstFacts {
                 }
             }
             "call_expression" => {
-                if let Some((head, head_byte)) = simple_head(node.child(0), src) {
-                    let mut cursor = node.walk();
-                    let method_call_node = node
-                        .named_children(&mut cursor)
-                        .find(|c| c.kind() == "method_call");
-                    if let Some(mc) = method_call_node {
-                        if let Some(member_node) = mc.child(0) {
-                            if let Ok(member) = member_node.utf8_text(src) {
+                let mut cursor = node.walk();
+                let method_call_node = node
+                    .named_children(&mut cursor)
+                    .find(|c| c.kind() == "method_call");
+                if let Some(mc) = method_call_node {
+                    if let Some(member_node) = mc.child(0) {
+                        if let Ok(member) = member_node.utf8_text(src) {
+                            let receiver = node.child(0);
+                            if let Some((head, head_byte)) = simple_head(receiver, src) {
                                 facts.dots.push(DotFact {
                                     head,
                                     member: member.to_string(),
@@ -585,6 +606,19 @@ pub fn collect_facts(source: &str) -> AstFacts {
                                     member_byte: member_node.start_byte(),
                                     // Ветка `call_expression`: член — всегда вызов.
                                     member_is_call: true,
+                                });
+                            } else if let Some((collection, object)) =
+                                two_segment_head(receiver, src)
+                            {
+                                // Двухсегментный получатель `Коллекция.Объект` —
+                                // `simple_head` его не берёт, DotFact на метод не
+                                // рождается. Отдельный факт: метод вызван у
+                                // менеджера объекта конфигурации.
+                                facts.manager_calls.push(ManagerCallFact {
+                                    collection,
+                                    object,
+                                    method: member.to_string(),
+                                    method_byte: member_node.start_byte(),
                                 });
                             }
                         }
@@ -728,6 +762,29 @@ fn simple_head<'a>(node: Option<tree_sitter::Node<'a>>, src: &[u8]) -> Option<(S
     }
     let text = ident.utf8_text(src).ok()?;
     Some((text.to_string(), ident.start_byte()))
+}
+
+/// Двухсегментная голова обращения `<Идентификатор1>.<Идентификатор2>`
+/// (`Справочники.Сотрудники`): узел `access`/`property_access`, у которого
+/// первый сегмент — сам простая односегментная голова, а второй — узел
+/// `property` (без вызова). Возвращает (первый сегмент, второй сегмент).
+///
+/// Более длинные цепочки (`А.Б.В`) и головы с вызовом внутри (`Х().Y`) под
+/// правило не подходят: у них первый сегмент составной, `simple_head` вернёт
+/// `None`. Нужна только для распознавания `Коллекция.Объект` как получателя
+/// метода менеджера.
+fn two_segment_head(node: Option<tree_sitter::Node>, src: &[u8]) -> Option<(String, String)> {
+    let node = node?;
+    if !matches!(node.kind(), "access" | "property_access") {
+        return None;
+    }
+    let (head, _) = simple_head(node.child(0), src)?;
+    let mut cursor = node.walk();
+    let property = node
+        .named_children(&mut cursor)
+        .find(|c| c.kind() == "property")?;
+    let object = property.utf8_text(src).ok()?.to_string();
+    Some((head, object))
 }
 
 /// Директива компиляции процедуры/функции без амперсанда (`НаСервере`, `Вместо`).

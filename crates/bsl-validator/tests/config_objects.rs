@@ -734,3 +734,245 @@ fn form_context_member_head_is_silent() {
     );
     assert!(result.errors.is_empty(), "{:?}", result.errors);
 }
+
+// ── (в) Метод у менеджера объекта: `Справочники.Х.Метод(...)` ──────────────
+//
+// Источник — отдельная заглушка `ManagerStub` с настраиваемым `method_exists`:
+// нужно проверить и путь «метод объявлен в конфигурации → молчим».
+
+/// Заглушка для проверки метода менеджера: знает состав `Catalogs` и умеет
+/// отвечать «метод объявлен где-то в конфигурации» флагом `methods_exist`.
+struct ManagerStub {
+    /// Имена справочников в нижнем регистре.
+    catalogs: HashSet<String>,
+    /// Что вернёт `method_exists` на любой запрос.
+    methods_exist: bool,
+}
+
+impl ManagerStub {
+    fn new() -> Self {
+        Self {
+            catalogs: ["номенклатура"].into_iter().map(String::from).collect(),
+            methods_exist: false,
+        }
+    }
+}
+
+impl SymbolSource for ManagerStub {
+    fn method_exists(&self, _name_lower: &str) -> bool {
+        self.methods_exist
+    }
+
+    fn object_exists(&self, collection: &str, name_lower: &str) -> Option<bool> {
+        match collection {
+            "Catalogs" => Some(self.catalogs.contains(name_lower)),
+            _ => None,
+        }
+    }
+
+    fn describe(&self) -> String {
+        "manager-stub".to_string()
+    }
+}
+
+/// Синтетический индекс с типом-менеджером справочника
+/// (`СправочникМенеджер.<Имя справочника>`) и его настоящими методами.
+fn index_with_catalog_manager() -> PlatformIndex {
+    let mut index = PlatformIndex::new();
+    let method = |ru: &str| Method {
+        name_ru: ru.into(),
+        name_en: String::new(),
+        description: String::new(),
+        return_type: String::new(),
+        signatures: Vec::new(),
+    };
+    index.insert_type(Type {
+        name_ru: "СправочникМенеджер.<Имя справочника>".into(),
+        name_en: "CatalogManager.<Catalog name>".into(),
+        description: String::new(),
+        methods: vec![
+            method("Выбрать"),
+            method("НайтиПоКоду"),
+            method("НайтиПоНаименованию"),
+            method("НайтиПоРеквизиту"),
+            method("ПустаяСсылка"),
+            method("СоздатьЭлемент"),
+        ],
+        properties: Vec::new(),
+        constructors: Vec::new(),
+        enum_values: Vec::new(),
+    });
+    index
+}
+
+fn check_manager(source: &ManagerStub, code: &str) -> Vec<bsl_validator::ExprError> {
+    let index = index_with_catalog_manager();
+    validate_module_with_symbols(
+        &index,
+        &format!("Процедура Тест()\n{code}\nКонецПроцедуры\n"),
+        1,
+        Profile::Full,
+        None,
+        None,
+        Some(source),
+    )
+    .errors
+}
+
+/// Выдуманный метод-опечатка `НайтиПоРеквизитам` (нет такого; есть
+/// `НайтиПоРеквизиту`) — находка `UnknownManagerMethod`, High, с подсказкой на
+/// настоящий метод. Ровно случай из issue #1.
+#[test]
+fn invented_manager_method_is_reported() {
+    let errors = check_manager(
+        &ManagerStub::new(),
+        "М = Справочники.Номенклатура.НайтиПоРеквизитам(ПараметрыОтбора);",
+    );
+    let finding = errors
+        .iter()
+        .find(|e| e.kind == ExprErrorKind::UnknownManagerMethod)
+        .unwrap_or_else(|| panic!("ожидалась находка UnknownManagerMethod: {errors:?}"));
+    assert_eq!(finding.confidence, Confidence::High, "{finding:?}");
+    assert_eq!(finding.suggestion.as_deref(), Some("НайтиПоРеквизиту"));
+}
+
+/// High-находка проходит строгий профиль (для слабых моделей типа DeepSeek).
+#[test]
+fn invented_manager_method_survives_strict_profile() {
+    let index = index_with_catalog_manager();
+    let source = ManagerStub::new();
+    let result = validate_module_with_symbols(
+        &index,
+        "Процедура Тест()\nМ = Справочники.Номенклатура.НайтиПоРеквизитам(П);\nКонецПроцедуры\n",
+        1,
+        Profile::Strict,
+        None,
+        None,
+        Some(&source),
+    );
+    assert!(
+        result
+            .errors
+            .iter()
+            .any(|e| e.kind == ExprErrorKind::UnknownManagerMethod),
+        "{:?}",
+        result.errors
+    );
+}
+
+/// Настоящий метод менеджера `НайтиПоРеквизиту` — молчание.
+#[test]
+fn real_manager_method_is_silent() {
+    let errors = check_manager(
+        &ManagerStub::new(),
+        "М = Справочники.Номенклатура.НайтиПоРеквизиту(\"Код\", 1);",
+    );
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+/// Далёкое имя `ЗагрузитьКурсы` (метод модуля менеджера, справке неизвестен и ни
+/// на что не похож) — молчание: не опечатка платформенного метода.
+#[test]
+fn unrelated_manager_method_name_is_silent() {
+    let errors = check_manager(
+        &ManagerStub::new(),
+        "Справочники.Номенклатура.ЗагрузитьКурсы();",
+    );
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+/// Имя близко к методу менеджера, НО объявлено где-то в конфигурации
+/// (`method_exists = true`) — экспорт модуля менеджера, а не опечатка. Молчание.
+#[test]
+fn manager_method_declared_in_config_is_silent() {
+    let mut source = ManagerStub::new();
+    source.methods_exist = true;
+    let errors = check_manager(
+        &source,
+        "М = Справочники.Номенклатура.НайтиПоРеквизитам(П);",
+    );
+    assert!(
+        !errors
+            .iter()
+            .any(|e| e.kind == ExprErrorKind::UnknownManagerMethod),
+        "{errors:?}"
+    );
+}
+
+/// Объекта нет в конфигурации — метод не проверяем (первичная ошибка это сам
+/// объект, `UnknownMetadataObject`); находки `UnknownManagerMethod` быть не должно.
+#[test]
+fn unknown_object_suppresses_manager_method_finding() {
+    let errors = check_manager(
+        &ManagerStub::new(),
+        "М = Справочники.НетТакогоСправочника.НайтиПоРеквизитам(П);",
+    );
+    assert!(
+        !errors
+            .iter()
+            .any(|e| e.kind == ExprErrorKind::UnknownManagerMethod),
+        "{errors:?}"
+    );
+}
+
+/// Голова — не менеджер объектов конфигурации (`ТаблицаЗначений.Колонки`), а
+/// обращение к переменной. Метод менеджера тут проверять не за что — молчание.
+#[test]
+fn non_manager_head_is_silent_for_manager_method() {
+    let errors = check_manager(&ManagerStub::new(), "ТЗ.Колонки.Дабавить();");
+    assert!(
+        !errors
+            .iter()
+            .any(|e| e.kind == ExprErrorKind::UnknownManagerMethod),
+        "{errors:?}"
+    );
+}
+
+/// На НАСТОЯЩЕЙ справке платформы: случай из issue ловится для разных видов
+/// менеджеров, а настоящие методы молчат — то есть префиксы типов-менеджеров
+/// из `MANAGER_COLLECTIONS` реально разрешаются. `#[ignore]`: требует
+/// `BSL_CONTEXT_PLATFORM_PATH`.
+#[test]
+#[ignore]
+fn manager_method_on_real_index() {
+    let Some(index) = real_platform_index() else {
+        eprintln!("skip: BSL_CONTEXT_PLATFORM_PATH не задан");
+        return;
+    };
+    // Заглушка, подтверждающая существование объектов нужных коллекций.
+    struct AllExist;
+    impl SymbolSource for AllExist {
+        fn method_exists(&self, _n: &str) -> bool {
+            false
+        }
+        fn object_exists(&self, _collection: &str, _name_lower: &str) -> Option<bool> {
+            Some(true)
+        }
+        fn describe(&self) -> String {
+            "all-exist".to_string()
+        }
+    }
+    // (код, ожидается_ли_находка)
+    for (code, expect) in [
+        ("М = Справочники.Х.НайтиПоРеквизитам(П);", true),
+        ("М = Справочники.Х.НайтиПоРеквизиту(\"Код\", 1);", false),
+        ("М = Документы.Х.НайтиПоНомеру(Н);", false),
+        ("М = Документы.Х.НайтиПоНомеруу(Н);", true),
+        ("Н = РегистрыНакопления.Х.СоздатьНаборЗаписей();", false),
+    ] {
+        let result = validate_module_with_symbols(
+            &index,
+            &format!("Процедура Тест()\n{code}\nКонецПроцедуры\n"),
+            1,
+            Profile::Full,
+            None,
+            None,
+            Some(&AllExist),
+        );
+        let fired = result
+            .errors
+            .iter()
+            .any(|e| e.kind == ExprErrorKind::UnknownManagerMethod);
+        assert_eq!(fired, expect, "{code} → {:?}", result.errors);
+    }
+}

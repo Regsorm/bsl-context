@@ -23,7 +23,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use bsl_validator::{validate_module_with_symbols, ExprErrorKind, Profile};
+use bsl_validator::{validate_module_with_symbols, Confidence, ExprErrorKind, Profile};
 use platform_index::load_from_hbk;
 use symbol_source::LiteSource;
 
@@ -169,4 +169,66 @@ fn config_objects_on_real_ut_corpus() {
         "находок {} при пороге {MAX_FINDINGS} — гейты молчания сломаны, смотрите список выше",
         findings.len()
     );
+}
+
+/// Позитивный smoke на РЕАЛЬНОМ источнике имён (LiteSource УТ) + настоящей
+/// справке: сквозной путь `validate_module_with_symbols`, как у пользователя из
+/// issue #1 (там источник — `code_index_mcp`, механика та же: `object_exists`
+/// подтверждает объект, `method_exists` знает методы конфигурации).
+///
+/// Проверяет: выдуманный `НайтиПоРеквизитам` у существующего справочника ловится
+/// (High, с подсказкой), а настоящий `НайтиПоРеквизиту` — молчит.
+/// `#[ignore]`: нужен корпус, lite-БД и справка платформы.
+#[test]
+#[ignore]
+fn manager_method_positive_on_real_source() {
+    let Some(hbk) = hbk_path() else {
+        eprintln!("skip: BSL_CONTEXT_PLATFORM_PATH не задан");
+        return;
+    };
+    if !Path::new(LITE_DB).exists() {
+        eprintln!("skip: базы {LITE_DB} нет");
+        return;
+    }
+    let index = load_from_hbk(&hbk).expect("не удалось прочитать справку платформы");
+    let source = LiteSource::open(Path::new(LITE_DB)).expect("не удалось открыть lite-индекс");
+
+    // Номенклатура — реальный справочник УТ, значит `object_exists` вернёт true.
+    let bad = validate_module_with_symbols(
+        &index,
+        "Процедура Тест()\nМ = Справочники.Номенклатура.НайтиПоРеквизитам(П);\nКонецПроцедуры\n",
+        3,
+        Profile::Full,
+        Some("base/CommonModules/МойМодуль/Ext/Module.bsl"),
+        None,
+        Some(&source),
+    );
+    let finding = bad
+        .errors
+        .iter()
+        .find(|e| e.kind == ExprErrorKind::UnknownManagerMethod)
+        .unwrap_or_else(|| panic!("ожидалась UnknownManagerMethod: {:?}", bad.errors));
+    assert_eq!(finding.confidence, Confidence::High, "{finding:?}");
+    assert_eq!(finding.suggestion.as_deref(), Some("НайтиПоРеквизиту"));
+    println!("FIRE (реальный источник): {}", finding.message);
+
+    // Настоящий метод менеджера — молчание.
+    let good = validate_module_with_symbols(
+        &index,
+        "Процедура Тест()\nМ = Справочники.Номенклатура.НайтиПоРеквизиту(\"Код\", 1);\nКонецПроцедуры\n",
+        3,
+        Profile::Full,
+        Some("base/CommonModules/МойМодуль/Ext/Module.bsl"),
+        None,
+        Some(&source),
+    );
+    assert!(
+        !good
+            .errors
+            .iter()
+            .any(|e| e.kind == ExprErrorKind::UnknownManagerMethod),
+        "настоящий метод не должен давать находку: {:?}",
+        good.errors
+    );
+    println!("SILENT (реальный источник): НайтиПоРеквизиту — находок нет");
 }

@@ -145,6 +145,15 @@ pub enum ExprErrorKind {
     /// соответствующей коллекции каталога выгрузки (внешний источник ответил
     /// `Some(false)`). Эмиттится только из `crate::config_objects`.
     UnknownMetadataObject,
+    /// Вызов `Коллекция.Объект.Метод(...)` (`Справочники.Сотрудники.НайтиПоРеквизитам`),
+    /// где `Метод` не найден среди методов типа-менеджера объекта в справке
+    /// платформы (`СправочникМенеджер.<Имя справочника>` и т.п.), не объявлен
+    /// нигде в конфигурации (экспорт модуля менеджера) и при этом близок по
+    /// написанию к настоящему методу менеджера — то есть это опечатка.
+    /// Confidence проставляется явно по двухпороговой эвристике
+    /// `fuzzy_confidence_for` (как у `UnknownGlobalMethod`). Эмиттится только из
+    /// `crate::config_objects`.
+    UnknownManagerMethod,
     /// Запрос кладёт результат во временную таблицу (`ПОМЕСТИТЬ`) без
     /// `ИНДЕКСИРОВАТЬ ПО`, а дальше эта таблица участвует в соединении.
     /// Соединение с неиндексированной временной таблицей платформа выполняет
@@ -219,6 +228,9 @@ impl ExprErrorKind {
             ExprErrorKind::UnknownTypeMember
             | ExprErrorKind::UnknownNewType
             | ExprErrorKind::UnknownGlobalMethod
+            // Confidence реально ставится явно по fuzzy (см. `crate::config_objects`);
+            // здесь — безопасный fallback, как у `UnknownGlobalMethod`.
+            | ExprErrorKind::UnknownManagerMethod
             | ExprErrorKind::UnknownDirective
             | ExprErrorKind::ShadowedContextName
             // Остальные находки про запросы. Вывод в них точный (множество

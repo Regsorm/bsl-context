@@ -17,38 +17,48 @@
 
 use std::collections::HashSet;
 
-use platform_index::PlatformIndex;
+use platform_index::{PlatformIndex, Type};
 
 use bsl_parse::AstFacts;
 
 use crate::context_names::FORM_TYPE;
-use crate::expression::{fuzzy_confidence_for, lev, pos_at, ExprError, ExprErrorKind};
+use crate::expression::{fuzzy_confidence_for, lev, pos_at, Confidence, ExprError, ExprErrorKind};
 use crate::symbols::SymbolSource;
 
-/// Менеджер объектов конфигурации в коде → коллекция каталога выгрузки.
+/// Менеджер объектов конфигурации в коде → (коллекция каталога выгрузки,
+/// префикс типа-менеджера ОБЪЕКТА в справке платформы).
+///
 /// Только русские имена: конфигурации, с которыми работает сервер, русские.
 /// Таблица сверена с живым индексом; в частности, три плана в `meta_type`
 /// остаются во множественном числе — соответствие держит symbol-source.
-const MANAGER_COLLECTIONS: &[(&str, &str)] = &[
-    ("Справочники", "Catalogs"),
-    ("Документы", "Documents"),
-    ("РегистрыСведений", "InformationRegisters"),
-    ("РегистрыНакопления", "AccumulationRegisters"),
-    ("РегистрыБухгалтерии", "AccountingRegisters"),
-    ("РегистрыРасчета", "CalculationRegisters"),
-    ("Перечисления", "Enums"),
-    ("ПланыВидовХарактеристик", "ChartsOfCharacteristicTypes"),
-    ("ПланыСчетов", "ChartsOfAccounts"),
-    ("ПланыВидовРасчета", "ChartsOfCalculationTypes"),
-    ("БизнесПроцессы", "BusinessProcesses"),
-    ("Задачи", "Tasks"),
-    ("ПланыОбмена", "ExchangePlans"),
-    ("Константы", "Constants"),
-    ("Обработки", "DataProcessors"),
-    ("Отчеты", "Reports"),
-    ("ЖурналыДокументов", "DocumentJournals"),
-    ("КритерииОтбора", "FilterCriteria"),
-    ("Последовательности", "Sequences"),
+///
+/// Третий столбец — префикс типа менеджера КОНКРЕТНОГО объекта
+/// (`Справочники.Х` → тип `СправочникМенеджер.<Имя справочника>`). По нему
+/// [`manager_object_type`] находит тип в справке и берёт его методы для проверки
+/// вызова `Коллекция.Объект.Метод(...)`. Префикс в единственном числе (тип
+/// одного объекта), тогда как коллекция глобального контекста — во множественном
+/// (`СправочникиМенеджер`). Если префикс в справке не найден — проверка метода
+/// молчит (безопасный отказ, без ложной находки).
+const MANAGER_COLLECTIONS: &[(&str, &str, &str)] = &[
+    ("Справочники", "Catalogs", "СправочникМенеджер"),
+    ("Документы", "Documents", "ДокументМенеджер"),
+    ("РегистрыСведений", "InformationRegisters", "РегистрСведенийМенеджер"),
+    ("РегистрыНакопления", "AccumulationRegisters", "РегистрНакопленияМенеджер"),
+    ("РегистрыБухгалтерии", "AccountingRegisters", "РегистрБухгалтерииМенеджер"),
+    ("РегистрыРасчета", "CalculationRegisters", "РегистрРасчетаМенеджер"),
+    ("Перечисления", "Enums", "ПеречислениеМенеджер"),
+    ("ПланыВидовХарактеристик", "ChartsOfCharacteristicTypes", "ПланВидовХарактеристикМенеджер"),
+    ("ПланыСчетов", "ChartsOfAccounts", "ПланСчетовМенеджер"),
+    ("ПланыВидовРасчета", "ChartsOfCalculationTypes", "ПланВидовРасчетаМенеджер"),
+    ("БизнесПроцессы", "BusinessProcesses", "БизнесПроцессМенеджер"),
+    ("Задачи", "Tasks", "ЗадачаМенеджер"),
+    ("ПланыОбмена", "ExchangePlans", "ПланОбменаМенеджер"),
+    ("Константы", "Constants", "КонстантаМенеджер"),
+    ("Обработки", "DataProcessors", "ОбработкаМенеджер"),
+    ("Отчеты", "Reports", "ОтчетМенеджер"),
+    ("ЖурналыДокументов", "DocumentJournals", "ЖурналДокументовМенеджер"),
+    ("КритерииОтбора", "FilterCriteria", "КритерийОтбораМенеджер"),
+    ("Последовательности", "Sequences", "ПоследовательностьМенеджер"),
 ];
 
 /// Имена контекста, которых нет в справке платформы, но которые реальны в коде:
@@ -181,6 +191,72 @@ pub(crate) fn check_config_objects(
             );
         }
     }
+
+    // ── (в) Метод у менеджера объекта: `Справочники.Сотрудники.НайтиПоРеквизиту(...)` ──
+    // Получатель метода — двухсегментная голова `Коллекция.Объект`, поэтому вызов
+    // попал не в `facts.dots`, а в `facts.manager_calls` (см. `ManagerCallFact`).
+    for call in &facts.manager_calls {
+        let collection_lower = call.collection.to_lowercase();
+        // Имя коллекции связано локально или перекрыто реквизитом формы —
+        // это переменная, а не менеджер объектов конфигурации.
+        if bound.contains(&collection_lower) {
+            continue;
+        }
+        if form_attributes.is_some_and(|a| a.contains(&collection_lower)) {
+            continue;
+        }
+        let Some((collection, prefix)) = manager_collection_with_prefix(&call.collection) else {
+            continue; // голова — не менеджер объектов конфигурации
+        };
+        // Объект должен реально существовать. Если нет — первичная ошибка это сам
+        // объект (её даёт ветка (б) как `UnknownMetadataObject`); метод не трогаем,
+        // чтобы не выдать вторую находку на ту же строку. `None` (источник не знает)
+        // тоже пропускаем: без подтверждённого объекта проверять метод небезопасно.
+        let object_lower = call.object.to_lowercase();
+        if symbols.object_exists(collection, &object_lower) != Some(true) {
+            continue;
+        }
+        // Тип-менеджер объекта из справки платформы (`СправочникМенеджер.<Имя>`).
+        let Some(manager_type) = manager_object_type(index, prefix) else {
+            continue; // вид менеджера не описан в справке — молчим
+        };
+        let method_lower = call.method.to_lowercase();
+        // Метод есть у менеджера в справке (или это его свойство) — законный вызов.
+        if type_has_member(manager_type, &method_lower) {
+            continue;
+        }
+        // Метод объявлен где-то в конфигурации — почти всегда экспорт модуля
+        // менеджера этого объекта (`Справочники.Валюты.ЗагрузитьКурсы()`), которого
+        // справка платформы не знает. Это НЕ опечатка — молчим. Главный отсекатель
+        // ложных находок на реальном коде.
+        if symbols.method_exists(&method_lower) {
+            continue;
+        }
+        // Осталось: метода нет ни у менеджера в справке, ни в конфигурации. Находкой
+        // считаем, только если имя близко к настоящему методу менеджера — тогда это
+        // опечатка (`НайтиПоРеквизитам` → `НайтиПоРеквизиту`). Далёкое имя молча
+        // пропускаем: возможна невидимая источнику процедура, ложная находка хуже.
+        let Some((suggestion, confidence)) = closest_manager_method(manager_type, &call.method)
+        else {
+            continue;
+        };
+        let (line, col) = pos_at(src, call.method_byte);
+        errors.push(ExprError::new_with_confidence(
+            line,
+            col,
+            ExprErrorKind::UnknownManagerMethod,
+            // Имя из самого кода (`Справочники.Номенклатура`), а НЕ `manager_type.name_ru`:
+            // у шаблонного типа справки оно вида «СправочникМенеджер.<Имя справочника>
+            // (CatalogManager.<Catalog name>)» — в сообщении это мусор.
+            format!(
+                "У '{}.{}' нет метода '{}'. Возможно, вы имели в виду '{}'.",
+                call.collection, call.object, call.method, suggestion
+            ),
+            confidence,
+            Some(suggestion),
+            Vec::new(),
+        ));
+    }
 }
 
 /// Имена, связанные локально ГДЕ-ЛИБО в модуле: любое присваивание простому
@@ -252,8 +328,65 @@ fn collection_for_manager(head: &str) -> Option<&'static str> {
     let head_lower = head.to_lowercase();
     MANAGER_COLLECTIONS
         .iter()
-        .find(|(name, _)| name.to_lowercase() == head_lower)
-        .map(|(_, collection)| *collection)
+        .find(|(name, _, _)| name.to_lowercase() == head_lower)
+        .map(|(_, collection, _)| *collection)
+}
+
+/// Как [`collection_for_manager`], но возвращает ещё и префикс типа-менеджера
+/// объекта (третий столбец таблицы) — нужен проверке вызова метода менеджера.
+fn manager_collection_with_prefix(head: &str) -> Option<(&'static str, &'static str)> {
+    let head_lower = head.to_lowercase();
+    MANAGER_COLLECTIONS
+        .iter()
+        .find(|(name, _, _)| name.to_lowercase() == head_lower)
+        .map(|(_, collection, prefix)| (*collection, *prefix))
+}
+
+/// Тип менеджера конкретного объекта вида по префиксу справки платформы:
+/// `СправочникМенеджер` → тип `СправочникМенеджер.<Имя справочника>`. В справке
+/// такой шаблонный тип на каждый вид ровно один — берём первый по префиксу.
+/// `None` — вид в справке не описан (проверка обязана промолчать).
+///
+/// Ключи `index.types` — `name_ru` в нижнем регистре; ищем начинающийся на
+/// `<префикс>.` (точка обязательна: `СправочникМенеджер.` не должен совпасть
+/// с гипотетическим `СправочникМенеджерЧтоТо`).
+fn manager_object_type<'a>(index: &'a PlatformIndex, prefix: &str) -> Option<&'a Type> {
+    let needle = format!("{}.", prefix.to_lowercase());
+    index
+        .types
+        .iter()
+        .find(|(key, _)| key.starts_with(&needle))
+        .map(|(_, ty)| ty)
+}
+
+/// Есть ли у типа член (метод или свойство) с таким именем (регистронезависимо,
+/// оба языка)?
+fn type_has_member(ty: &Type, member_lower: &str) -> bool {
+    ty.methods.iter().any(|m| {
+        m.name_ru.to_lowercase() == member_lower || m.name_en.to_lowercase() == member_lower
+    }) || ty.properties.iter().any(|p| {
+        p.name_ru.to_lowercase() == member_lower || p.name_en.to_lowercase() == member_lower
+    })
+}
+
+/// Ближайший МЕТОД типа-менеджера к `name` с уверенностью по двухпороговой
+/// эвристике [`fuzzy_confidence_for`] (та же, что у `UnknownGlobalMethod`).
+/// `None` — ни на один метод не похоже: это не опечатка платформенного метода,
+/// а, скорее всего, метод модуля менеджера, которого справка не знает, — молчим.
+/// Сверяется только русское имя: методы менеджеров в справке англ. имени не имеют.
+fn closest_manager_method(ty: &Type, name: &str) -> Option<(String, Confidence)> {
+    let name_lower = name.to_lowercase();
+    let mut best: Option<(String, usize)> = None;
+    for m in &ty.methods {
+        let distance = lev(&name_lower, &m.name_ru.to_lowercase());
+        match &best {
+            Some((_, best_distance)) if distance >= *best_distance => {}
+            _ => best = Some((m.name_ru.clone(), distance)),
+        }
+    }
+    let (candidate, distance) = best?;
+    let confidence = fuzzy_confidence_for(name, &candidate, distance)?;
+    Some((candidate, confidence))
 }
 
 /// Заведомо ОТСУТСТВУЕТ неявный контекст объекта — то есть правило про общий
@@ -359,4 +492,41 @@ fn emit(
         suggestion,
         Vec::new(),
     ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Справка платформы, если она доступна в окружении.
+    fn real_index() -> Option<PlatformIndex> {
+        let root = std::env::var("BSL_CONTEXT_PLATFORM_PATH").ok()?;
+        let root = std::path::Path::new(&root);
+        let hbk = [
+            root.join("shcntx_ru.hbk"),
+            root.join("bin").join("shcntx_ru.hbk"),
+        ]
+        .into_iter()
+        .find(|p| p.exists())?;
+        platform_index::load_from_hbk(&hbk).ok()
+    }
+
+    /// КАЖДЫЙ префикс типа-менеджера из `MANAGER_COLLECTIONS` разрешается в тип
+    /// настоящей справки. Иначе проверка метода для этого вида молча не сработает
+    /// (не ложная находка, но упущенная опечатка) — префикс сверен с 1С неверно.
+    /// `#[ignore]`: нужен `BSL_CONTEXT_PLATFORM_PATH`.
+    #[test]
+    #[ignore]
+    fn every_manager_prefix_resolves_on_real_index() {
+        let Some(index) = real_index() else {
+            eprintln!("skip: BSL_CONTEXT_PLATFORM_PATH не задан");
+            return;
+        };
+        for (collection, _, prefix) in MANAGER_COLLECTIONS {
+            assert!(
+                manager_object_type(&index, prefix).is_some(),
+                "префикс '{prefix}' (коллекция {collection}) не разрешился в тип-менеджер справки",
+            );
+        }
+    }
 }

@@ -47,6 +47,7 @@ findings with line, column, kind, and confidence:
 | `shadowed_context_name` | high | Variable name is taken by a read-only context property: the assignment fails at runtime. The form-member rule needs `module_path` |
 | `unknown_common_module` | high | `ModuleName.Method(...)` — no common module with that name exists in the configuration. Requires an external name source |
 | `unknown_metadata_object` | high | `Справочники.Name`, `Документы.Name`, … — no object with that name exists in the collection. Requires an external name source |
+| `unknown_manager_method` | high / low | `Справочники.Name.Method(...)` — the object manager has no such method, and the name is close to a real help method (a typo like `НайтиПоРеквизитам` → `НайтиПоРеквизиту`). A method declared in the manager module is left alone. Requires an external name source |
 | `temp_table_without_index` | high | A temporary table takes part in a join but has no `ИНДЕКСИРОВАТЬ ПО` |
 | `or_in_join_condition` | high | `ИЛИ` splits a join condition, so no index can be used |
 | `join_with_subquery` | low | Join with a subquery instead of an indexed temporary table |
