@@ -40,6 +40,7 @@ use bsl_parse::{collect_facts, scan_declarations};
 
 use crate::config_objects::check_config_objects;
 use crate::context_names::check_shadowed_context_names;
+use crate::declarations::{check_declarations, check_module_structure};
 use crate::directives::{closest_directive_with_distance, is_extension_module, is_known_directive};
 use crate::expression::{
     check_global_calls, check_new_expressions, check_type_dot_members, fuzzy_confidence_for,
@@ -122,6 +123,12 @@ fn validate_module_at_level_inner(
     user_symbols.extend(scan_declarations(source));
 
     scan_directives(&cleaned, &mut errors);
+
+    // Объявления и структура модуля. Разбор текстовый, дерево здесь не
+    // участвует намеренно: именно эти модули оно и не разбирает (см. модуль
+    // `crate::declarations`).
+    check_declarations(source, &cleaned, &mut errors);
+    check_module_structure(source, &cleaned, &mut errors);
 
     // Модуль расширения компилируется вместе с расширяемым и напрямую зовёт его
     // процедуры. Их текста у валидатора нет, поэтому вывод «вызов не объявлен —

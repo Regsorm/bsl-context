@@ -182,6 +182,19 @@ pub enum ExprErrorKind {
     /// `1c-standard-indexes.md`), поэтому вывод здесь точный, а не
     /// предположительный. Эмиттится только из `crate::query_rules`.
     JoinOnUnindexedField,
+    /// Имя объявленной процедуры/функции совпало с ключевым словом языка
+    /// (`Выполнить`) либо с глобальной функцией платформы (`Найти`). Модуль не
+    /// компилируется: «Ожидается имя процедуры». Эмиттится только из
+    /// `crate::declarations`.
+    ReservedProcedureName,
+    /// Процедура или функция с таким именем в модуле уже объявлена. Модуль не
+    /// компилируется. Эмиттится только из `crate::declarations`.
+    DuplicateDeclaration,
+    /// Лишний или недостающий `КонецПроцедуры`/`КонецФункции`. Лишний конец
+    /// блока платформа считает концом модуля («Обнаружено логическое завершение
+    /// исходного текста модуля»), и весь код ниже теряется. Эмиттится только из
+    /// `crate::declarations`.
+    UnbalancedModuleBlock,
 }
 
 impl ExprErrorKind {
@@ -222,7 +235,13 @@ impl ExprErrorKind {
             // лишь то, что исправляется одной строкой и почти никогда не бывает
             // лишним — индекс временной таблицы и разбор `ИЛИ` в условии связи.
             | ExprErrorKind::TempTableWithoutIndex
-            | ExprErrorKind::OrInJoinCondition => Confidence::High,
+            | ExprErrorKind::OrInJoinCondition
+            // Находки `crate::declarations`. Это не эвристика и не про скорость:
+            // модуль с такой находкой платформа не компилирует вовсе. Гейт обязан
+            // их блокировать, поэтому High и место в `strict`.
+            | ExprErrorKind::ReservedProcedureName
+            | ExprErrorKind::DuplicateDeclaration
+            | ExprErrorKind::UnbalancedModuleBlock => Confidence::High,
             // Соединение с подзапросом иногда оправдано (маленький набор,
             // однократное вычисление) — оставляем на усмотрение читающего.
             ExprErrorKind::UnknownTypeMember
