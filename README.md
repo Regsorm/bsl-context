@@ -48,6 +48,9 @@ findings with line, column, kind, and confidence:
 | `unknown_common_module` | high | `ModuleName.Method(...)` — no common module with that name exists in the configuration. Requires an external name source |
 | `unknown_metadata_object` | high | `Справочники.Name`, `Документы.Name`, … — no object with that name exists in the collection. Requires an external name source |
 | `unknown_manager_method` | high / low | `Справочники.Name.Method(...)` — the object manager has no such method, and the name is close to a real help method (a typo like `НайтиПоРеквизитам` → `НайтиПоРеквизиту`). A method declared in the manager module is left alone. Requires an external name source |
+| `reserved_procedure_name` | high | The procedure name is a language keyword (`Выполнить`) or a name the platform rejects (`Найти`). The module does not compile: "Ожидается имя процедуры" |
+| `duplicate_declaration` | high | A procedure or function with this name is already declared in the module |
+| `unbalanced_module_block` | high | An extra or missing `КонецПроцедуры`/`КонецФункции`. An extra block end is read by the platform as the end of the module, so everything below is lost |
 | `temp_table_without_index` | high | A temporary table takes part in a join but has no `ИНДЕКСИРОВАТЬ ПО` |
 | `or_in_join_condition` | high | `ИЛИ` splits a join condition, so no index can be used |
 | `join_with_subquery` | low | Join with a subquery instead of an indexed temporary table |
@@ -57,6 +60,20 @@ findings with line, column, kind, and confidence:
 
 high-confidence findings have a false-positive rate near zero; low-confidence ones
 depend on the accuracy of type inference and the completeness of the `hbk`.
+
+### Module structure
+
+Three of the findings above (`reserved_procedure_name`, `duplicate_declaration`,
+`unbalanced_module_block`) catch a module the platform refuses to compile at all
+— previously such a module passed validation as sound and the error surfaced only
+when the processing was opened. They read the module as text rather than through
+the syntax tree: a broken module is exactly what `tree-sitter-bsl` cannot parse,
+and declarations around an `ERROR` node are lost. All three are `high`, so they
+belong to the `strict` profile and work as a build gate.
+
+```json
+{"module": "Процедура Найти()\nКонецПроцедуры\n", "level": 3, "profile": "strict"}
+```
 
 ### Query optimality
 
