@@ -63,7 +63,7 @@ depend on the accuracy of type inference and the completeness of the `hbk`.
 The last six findings come from parsing the 1C query language inside string
 literals. A query whose text is built by concatenation with variables, or one the
 parser could not read, is not analysed at all — an incomplete parse must not
-produce findings. On the UT configuration (14905 modules) 97.3% of the 23260
+produce findings. On a typical 1C configuration (14905 modules) 97.3% of the 23260
 queries found in the code are parsed.
 
 ### Validation levels
@@ -110,7 +110,7 @@ this changes the picture — see the measurement in "External configuration name
 source".
 
 Likewise, the validator does not know the form's set of attributes. An attribute
-shadows a context name (UT has forms with attributes named `Метаданные`,
+shadows a context name (configurations do have forms with attributes named `Метаданные`,
 `БезопасноеХранилище`), so inside a form module the `shadowed_context_name`
 finding for global-context names is off by default. Pass the attribute list via
 `form_attributes` and it works there too: attribute names are excluded, the rest
@@ -197,7 +197,7 @@ that: it answers three questions — "does the configuration declare such a meth
 "is it an exported method of a GLOBAL common module", and "which exported methods does
 the owner object module of an external data processor have".
 
-Measured on the UT configuration (14905 modules): without a source — 1420 high-confidence
+Measured on a typical 1C configuration (14905 modules): without a source — 1420 high-confidence
 `undeclared_method` findings; with one — 44, of which exactly one is real.
 
 Three ways to connect it, same result:
@@ -206,7 +206,7 @@ Three ways to connect it, same result:
 # 1. Own lightweight index. The server stays self-contained.
 [symbol_source]
 kind = "lite"
-root = 'C:\RepoUT'                          # configuration dump directory
+root = 'C:\Repo1C'                          # configuration dump directory
 db_path = 'C:\tools\bsl-context\ut_lite.db' # database file; the directory is created for you
 ```
 
@@ -220,7 +220,7 @@ fails, the previous database stays intact. The same can be done from the command
 # 2. Reading the code-index database directly (same machine only).
 [symbol_source]
 kind = "code_index_db"
-db_path = 'C:\RepoUT\.code-index\index.db'
+db_path = 'C:\Repo1C\.code-index\index.db'
 ```
 
 ```toml
@@ -254,13 +254,13 @@ Instead of the single `[symbol_source]` section, list them:
 [[symbol_sources]]
 repo = "ut"                    # configuration alias — this is the tools' `repo` argument
 kind = "lite"
-root = 'C:\RepoUT'
-db_path = 'C:\tools\bsl-context\ut_lite.db'
+root = 'C:\Repo1C'
+db_path = 'C:\tools\bsl-context\trade_lite.db'
 
 [[symbol_sources]]
 repo = "bp"
 kind = "code_index_db"
-db_path = 'C:\RepoBP\.code-index\index.db'
+db_path = 'C:\Repo1C-second\.code-index\index.db'
 
 [[symbol_sources]]
 repo = "zup"

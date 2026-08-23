@@ -16,7 +16,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const CORPUS: &str = r"C:\RepoUT-test";
+/// Каталог с выгрузкой конфигурации. Путь у каждого свой, поэтому берётся
+/// из окружения; без него тест пропускается.
+const CORPUS_ENV: &str = "BSL_CONTEXT_CORPUS_PATH";
 
 fn collect_bsl(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(dir) else {
@@ -51,10 +53,15 @@ fn window_at(text: &str, offset: usize) -> String {
 }
 
 #[test]
-#[ignore = "требует выгрузку УТ в C:\\RepoUT-test"]
+#[ignore = "требует выгрузку конфигурации; путь — в BSL_CONTEXT_CORPUS_PATH"]
 fn parses_real_ut_queries() {
-    let root = Path::new(CORPUS);
-    assert!(root.is_dir(), "корпус не найден: {CORPUS}");
+    let Ok(corpus) = std::env::var(CORPUS_ENV) else {
+        eprintln!("skip: не задан {CORPUS_ENV}");
+        return;
+    };
+    let root = std::path::PathBuf::from(&corpus);
+    assert!(root.is_dir(), "корпус не найден: {corpus}");
+    let root = root.as_path();
 
     let mut files = Vec::new();
     collect_bsl(root, &mut files);

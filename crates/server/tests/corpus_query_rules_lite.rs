@@ -7,7 +7,7 @@
 //! Индекс должен быть схемы 3 (в нём есть `object_fields`):
 //!
 //! ```pwsh
-//! cargo run -p lite-index --release --bin bsl-lite-index -- build --root C:\RepoUT-test --db C:\Temp\ut_lite_v3.db
+//! cargo run -p lite-index --release --bin bsl-lite-index -- build --root <выгрузка> --db C:\Temp\lite_v3.db
 //! $env:BSL_CONTEXT_PLATFORM_PATH = 'C:\Program Files\1cv8\8.3.27.1786'
 //! cargo test -p bsl-context-server --test corpus_query_rules_lite --release -- --ignored --nocapture
 //! ```
@@ -20,7 +20,9 @@ use bsl_validator::{validate_module_with_symbols, ExprErrorKind, Profile};
 use platform_index::PlatformIndex;
 use symbol_source::LiteSource;
 
-const CORPUS: &str = r"C:\RepoUT-test";
+/// Каталог с выгрузкой конфигурации. Путь у каждого свой, поэтому берётся
+/// из окружения; без него тест пропускается.
+const CORPUS_ENV: &str = "BSL_CONTEXT_CORPUS_PATH";
 const LITE_DB: &str = r"C:\Temp\ut_lite_v3.db";
 
 /// Пороги: не «допустимая ошибка», а «выше этого — правило сорвалось».
@@ -63,8 +65,13 @@ fn is_query_rule(kind: ExprErrorKind) -> bool {
 #[test]
 #[ignore = "требует выгрузку УТ и lite-индекс схемы 3"]
 fn query_rules_with_metadata_on_real_ut_corpus() {
-    let root = Path::new(CORPUS);
-    assert!(root.is_dir(), "корпус не найден: {CORPUS}");
+    let Ok(corpus) = std::env::var(CORPUS_ENV) else {
+        eprintln!("skip: не задан {CORPUS_ENV}");
+        return;
+    };
+    let root = std::path::PathBuf::from(&corpus);
+    assert!(root.is_dir(), "корпус не найден: {corpus}");
+    let root = root.as_path();
     let db = Path::new(LITE_DB);
     assert!(db.is_file(), "нет lite-индекса {LITE_DB} — соберите его схемой 3");
 

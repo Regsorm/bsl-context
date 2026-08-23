@@ -20,7 +20,9 @@ use std::path::{Path, PathBuf};
 use bsl_validator::{validate_module_with_profile, ExprErrorKind, Profile};
 use platform_index::PlatformIndex;
 
-const CORPUS: &str = r"C:\RepoUT-test";
+/// Каталог с выгрузкой конфигурации. Путь у каждого свой, поэтому берётся
+/// из окружения; без него тест пропускается.
+const CORPUS_ENV: &str = "BSL_CONTEXT_CORPUS_PATH";
 
 /// Пороги. Не «сколько допустимо ошибиться», а «выше этого — точно что-то
 /// сломалось»: цифры выставлены по факту первого чистого замера.
@@ -52,10 +54,15 @@ fn is_query_rule(kind: ExprErrorKind) -> bool {
 }
 
 #[test]
-#[ignore = "требует выгрузку УТ в C:\\RepoUT-test"]
+#[ignore = "требует выгрузку конфигурации; путь — в BSL_CONTEXT_CORPUS_PATH"]
 fn query_rules_on_real_ut_corpus() {
-    let root = Path::new(CORPUS);
-    assert!(root.is_dir(), "корпус не найден: {CORPUS}");
+    let Ok(corpus) = std::env::var(CORPUS_ENV) else {
+        eprintln!("skip: не задан {CORPUS_ENV}");
+        return;
+    };
+    let root = std::path::PathBuf::from(&corpus);
+    assert!(root.is_dir(), "корпус не найден: {corpus}");
+    let root = root.as_path();
 
     let mut files = Vec::new();
     collect_bsl(root, &mut files);

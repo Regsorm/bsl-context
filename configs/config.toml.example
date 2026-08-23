@@ -57,14 +57,14 @@ default_validation_level = 1
 #
 # [symbol_source]
 # kind = "lite"
-# root = 'C:\RepoUT'                            # каталог выгрузки конфигурации
+# root = 'C:\Repo1C'                            # каталог выгрузки конфигурации
 # db_path = 'C:\bsl-context-rs\ut_lite.db'      # файл базы
 #
 # Вариант 2 — прямое чтение базы code-index (только на этой же машине):
 #
 # [symbol_source]
 # kind = "code_index_db"
-# db_path = 'C:\RepoUT\.code-index\index.db'
+# db_path = 'C:\Repo1C\.code-index\index.db'
 #
 # Вариант 3 — через запущенный сервис code-index (машина любая):
 #
@@ -85,13 +85,13 @@ default_validation_level = 1
 # [[symbol_sources]]
 # repo = "ut"
 # kind = "lite"
-# root = 'C:\RepoUT'
+# root = 'C:\Repo1C'
 # db_path = 'C:\tools\bsl-context\ut_lite.db'
 #
 # [[symbol_sources]]
 # repo = "bp"
 # kind = "code_index_db"
-# db_path = 'C:\RepoBP_SS\.code-index\index.db'
+# db_path = 'C:\Repo1C-second\.code-index\index.db'
 #
 # [[symbol_sources]]
 # repo = "zup"

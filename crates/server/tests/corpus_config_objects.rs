@@ -2,8 +2,8 @@
 //!
 //! Код рабочей конфигурации заведомо корректен — он в проде. Значит любая
 //! находка `UnknownCommonModule`/`UnknownMetadataObject` на нём есть либо
-//! настоящий дефект (такие встречаются: `глЗначениеПеременной` из УТ 10.3
-//! пережил переход на УТ 11), либо ложное срабатывание. Разделить их может
+//! настоящий дефект (такие встречаются: `глЗначениеПеременной` из прежней редакции
+//! пережил переход в текущую), либо ложное срабатывание. Разделить их может
 //! только человек, поэтому тест ничего не утверждает про «ноль находок» — он
 //! печатает КАЖДУЮ находку с путём и строкой, чтобы её можно было проверить
 //! глазами, и падает при превышении порога.
@@ -27,7 +27,9 @@ use bsl_validator::{validate_module_with_symbols, Confidence, ExprErrorKind, Pro
 use platform_index::load_from_hbk;
 use symbol_source::LiteSource;
 
-const CORPUS: &str = r"C:\RepoUT-test";
+/// Каталог с выгрузкой конфигурации. Путь у каждого свой, поэтому берётся
+/// из окружения; без него тест пропускается.
+const CORPUS_ENV: &str = "BSL_CONTEXT_CORPUS_PATH";
 // Схема 3 (в ней появился состав объектов). Прежняя база `ut_lite_v2.db` этому
 // тесту тоже годилась бы — он читает только имена, — но держать два индекса
 // одной конфигурации незачем, а по несуществующему пути тест молча пропускался.
@@ -66,9 +68,13 @@ fn config_objects_on_real_ut_corpus() {
         eprintln!("skip: BSL_CONTEXT_PLATFORM_PATH не задан");
         return;
     };
-    let corpus = Path::new(CORPUS);
+    let Ok(corpus_path) = std::env::var(CORPUS_ENV) else {
+        eprintln!("skip: не задан {CORPUS_ENV}");
+        return;
+    };
+    let corpus = Path::new(&corpus_path);
     if !corpus.exists() {
-        eprintln!("skip: корпуса {CORPUS} нет");
+        eprintln!("skip: корпуса {corpus_path} нет");
         return;
     }
     if !Path::new(LITE_DB).exists() {
@@ -140,7 +146,7 @@ fn config_objects_on_real_ut_corpus() {
         }
     }
 
-    println!("\n=== Регресс объектов конфигурации на {CORPUS} ===");
+    println!("\n=== Регресс объектов конфигурации на {corpus_path} ===");
     println!("Проверено модулей: {checked}");
     println!("Находок всего: {}", findings.len());
     for (kind, count) in &by_kind {

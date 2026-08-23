@@ -20,7 +20,7 @@ fn merges_object_copies_from_extensions() {
     let path = Path::new(DB);
     assert!(
         path.is_file(),
-        "нет базы {DB} — соберите: bsl-lite-index build --root C:\\RepoUT-test --db {DB}"
+        "нет базы {DB} — соберите: bsl-lite-index build --root <выгрузка> --db {DB}"
     );
     let index = lite_index::LiteIndex::open(path).expect("база не открылась");
 

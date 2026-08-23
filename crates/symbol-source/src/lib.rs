@@ -1408,10 +1408,10 @@ mod tests {
     #[test]
     fn repo_check_known_repo() {
         let v = tool_response(
-            r#"{"repo":"ut-test","path":"C:/RepoUT-test","db":{"total_functions":261548}}"#,
+            r#"{"repo":"corpus","path":"C:/Repo1C","db":{"total_functions":261548}}"#,
         );
         assert!(matches!(
-            repo_check_from_get_stats(&v, "ut-test"),
+            repo_check_from_get_stats(&v, "corpus"),
             RepoCheck::Known
         ));
     }
@@ -1734,7 +1734,12 @@ mod tests {
 
     #[test]
     fn code_index_db_source_returns_owner_exports() {
-        let db = std::path::Path::new(r"C:\RepoUT-test\.code-index\index.db");
+        let db = std::path::PathBuf::from(
+            std::env::var("BSL_CONTEXT_CORPUS_PATH").unwrap_or_default(),
+        )
+        .join(".code-index")
+        .join("index.db");
+        let db = db.as_path();
         if !db.exists() {
             eprintln!("skip: базы code-index нет");
             return;
@@ -1752,7 +1757,12 @@ mod tests {
 
     #[test]
     fn code_index_db_source_knows_global_exports() {
-        let db = std::path::Path::new(r"C:\RepoUT-test\.code-index\index.db");
+        let db = std::path::PathBuf::from(
+            std::env::var("BSL_CONTEXT_CORPUS_PATH").unwrap_or_default(),
+        )
+        .join(".code-index")
+        .join("index.db");
+        let db = db.as_path();
         if !db.exists() {
             eprintln!("skip: базы code-index нет");
             return;

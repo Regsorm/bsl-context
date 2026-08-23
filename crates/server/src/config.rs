@@ -265,8 +265,8 @@ mod tests {
 
     #[test]
     fn symbol_source_root_parsed() {
-        let cfg: Config = toml::from_str("[symbol_source]\nkind = \"lite\"\ndb_path = \"a.db\"\nroot = \"C:/RepoUT\"\n").unwrap();
-        assert_eq!(cfg.symbol_source.root.as_deref(), Some(std::path::Path::new("C:/RepoUT")));
+        let cfg: Config = toml::from_str("[symbol_source]\nkind = \"lite\"\ndb_path = \"a.db\"\nroot = \"C:/Repo1C\"\n").unwrap();
+        assert_eq!(cfg.symbol_source.root.as_deref(), Some(std::path::Path::new("C:/Repo1C")));
     }
 
     #[test]

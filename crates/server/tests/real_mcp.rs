@@ -233,7 +233,7 @@ async fn rebuild_symbol_index_refuses_when_source_is_not_lite() {
     // code-index): пересобирать через этот инструмент нечего, это чужой индекс.
     let mut cfg = bsl_context_server::config::SymbolSourceConfig::default();
     cfg.kind = "code_index_db".to_string();
-    cfg.db_path = Some(std::path::PathBuf::from(r"C:\RepoUT\.code-index\index.db"));
+    cfg.db_path = Some(std::path::PathBuf::from(r"C:\Repo1C\.code-index\index.db"));
     let srv = srv.with_sources(vec![("ut".to_string(), cfg, None)]);
 
     let json = srv
@@ -247,8 +247,9 @@ async fn rebuild_symbol_index_refuses_when_source_is_not_lite() {
 #[tokio::test]
 async fn rebuild_symbol_index_builds_database_and_creates_directory() {
     let Some(srv) = make_server().await else { eprintln!("skip: hbk не найден"); return; };
-    let root = std::path::Path::new(r"C:\RepoWMS");
-    if !root.exists() { eprintln!("skip: корпуса RepoWMS нет"); return; }
+    let corpus = std::env::var("BSL_CONTEXT_CORPUS_PATH").unwrap_or_default();
+    let root = std::path::Path::new(&corpus);
+    if !root.exists() { eprintln!("skip: корпуса нет — задайте BSL_CONTEXT_CORPUS_PATH"); return; }
     // Каталога заведомо нет — инструмент обязан его создать.
     let dir = std::env::temp_dir().join("bslctx_rebuild_test").join("nested");
     let _ = std::fs::remove_dir_all(dir.parent().unwrap());
