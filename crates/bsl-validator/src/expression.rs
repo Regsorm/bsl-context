@@ -45,6 +45,20 @@ pub struct ExpressionValidation {
     /// Поле обязано быть в ответе: без него `valid: true` на неразобранном
     /// модуле читается как «замечаний нет», хотя проверка не проводилась.
     pub tree_parsed: bool,
+    /// Были ли доступны имена конфигурации (внешний источник). `false` —
+    /// проверка выполнена только против платформенного контекста: находки по
+    /// платформе (`UnknownGlobalMethod`, число аргументов, члены типов,
+    /// системные перечисления, синтаксис) достоверны, а всё, что опирается на
+    /// имена ПРИКЛАДНЫХ объектов, проверено не было.
+    ///
+    /// Признак нужен машиночитаемым: без него частичная проверка неотличима от
+    /// полной, и пустой список находок читается как «замечаний нет».
+    pub symbols_available: bool,
+    /// Почему проверка неполная. Заполняется только при `symbols_available:
+    /// false` и объясняет причину человеку — разбирать текст программно не
+    /// нужно, для этого есть само поле `symbols_available`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub degraded_reason: Option<String>,
     pub errors: Vec<ExprError>,
 }
 
@@ -345,12 +359,24 @@ pub fn validate_expression_at_level(
     let mut errors = Vec::new();
     check_type_dot_members(index, source, &facts.dots, scope_map.as_ref(), &mut errors);
     check_new_expressions(index, source, &facts.news, &mut errors);
-    check_global_calls(index, source, &facts.calls, None, false, None, None, &mut errors);
+    check_global_calls(
+        index,
+        source,
+        &facts.calls,
+        None,
+        false,
+        None,
+        None,
+        false,
+        &mut errors,
+    );
     errors.sort_by_key(|e| (e.line, e.col));
 
     ExpressionValidation {
         valid: errors.is_empty(),
         tree_parsed: facts.parsed,
+        symbols_available: true,
+        degraded_reason: None,
         errors,
     }
 }
@@ -567,6 +593,13 @@ pub(crate) fn check_new_expressions(
 /// Используется ТОЛЬКО внутри `strict_unknown`, чтобы закрыть два случая
 /// false-positive — экспорт глобального общего модуля и метод модуля
 /// объекта-владельца (`owner_exports`, предзагруженный набор lowercase-имён).
+///
+/// `symbols_degraded` — источник имён был настроен, но недоступен (не поднят,
+/// отвалился). Отличается от `symbols: None` при ненастроенном источнике:
+/// имена конфигурации ожидались и не пришли, поэтому вывод «метод не объявлен
+/// нигде» здесь недостоверен — находка остаётся (иначе теряется выдуманный
+/// вызов вроде `СЕГОДНЯ()`), но с пониженной уверенностью и честным текстом.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn check_global_calls(
     index: &PlatformIndex,
     src: &str,
@@ -575,6 +608,7 @@ pub(crate) fn check_global_calls(
     strict_unknown: bool,
     symbols: Option<&dyn SymbolSource>,
     owner_exports: Option<&HashSet<String>>,
+    symbols_degraded: bool,
     errors: &mut Vec<ExprError>,
 ) {
     // Методы собственного объекта/формы/менеджера зовутся из его модуля без
@@ -655,6 +689,28 @@ pub(crate) fn check_global_calls(
                         format!(
                             "Метод '{}' не объявлен в этом модуле. В конфигурации он есть, \
                              но отсюда может быть не виден — проверьте правила видимости.",
+                            call.name
+                        ),
+                        Confidence::Low,
+                        None,
+                        Vec::new(),
+                    ));
+                } else if symbols_degraded {
+                    // Имена конфигурации ожидались, но источник недоступен.
+                    // Выбрасывать находку нельзя — сюда попадают выдуманные
+                    // глобальные вызовы (`СЕГОДНЯ()`), ради которых проверка и
+                    // нужна. Оставлять High тоже нельзя: без имён конфигурации
+                    // сюда же попадает каждый вызов процедуры глобального
+                    // общего модуля — на УТ это 1420 находок.
+                    let (line, col) = pos_at(src, call.byte);
+                    errors.push(ExprError::new_with_confidence(
+                        line,
+                        col,
+                        ExprErrorKind::UndeclaredMethod,
+                        format!(
+                            "Метод '{}' не объявлен в этом модуле и не найден в платформенном \
+                             контексте. Имена конфигурации не проверялись — источник имён \
+                             недоступен, поэтому метод может быть объявлен в другом модуле.",
                             call.name
                         ),
                         Confidence::Low,

@@ -70,7 +70,7 @@ pub fn validate_module_at_level(
     source: &str,
     level: u8,
 ) -> ExpressionValidation {
-    validate_module_at_level_inner(index, source, level, None, None, None, None)
+    validate_module_at_level_inner(index, source, level, None, None, None, None, false)
 }
 
 /// Общее тело `validate_module_at_level`/`validate_module_with_symbols`.
@@ -91,6 +91,11 @@ pub fn validate_module_at_level(
 /// [`crate::symbols::SymbolSource`]) и предзагруженный набор экспортных имён
 /// модуля объекта-владельца; оба `None` при вызове без источника — поведение
 /// не отличается от прежнего `validate_module_at_level`.
+///
+/// `symbols_degraded` — источник имён настроен, но недоступен (см.
+/// [`validate_module_degraded`]). Влияет только на уверенность находок
+/// `UndeclaredMethod`; при `symbols: Some(_)` не имеет смысла и передаётся
+/// `false`.
 #[allow(clippy::too_many_arguments)]
 fn validate_module_at_level_inner(
     index: &PlatformIndex,
@@ -100,6 +105,7 @@ fn validate_module_at_level_inner(
     form_attributes: Option<&HashSet<String>>,
     symbols: Option<&dyn SymbolSource>,
     owner_exports: Option<&HashSet<String>>,
+    symbols_degraded: bool,
 ) -> ExpressionValidation {
     // Модуль расширения: блоки `#Удаление … #КонецУдаления` в скомпилированный
     // модуль не попадают, но могут обрывать строковый литерал на середине —
@@ -145,6 +151,7 @@ fn validate_module_at_level_inner(
         strict_unknown,
         symbols,
         owner_exports,
+        symbols_degraded,
         &mut errors,
     );
     let form_module = module_path
@@ -179,6 +186,8 @@ fn validate_module_at_level_inner(
     ExpressionValidation {
         valid: errors.is_empty(),
         tree_parsed: facts.parsed,
+        symbols_available: !symbols_degraded,
+        degraded_reason: None,
         errors,
     }
 }
@@ -208,6 +217,7 @@ pub fn validate_module_with_profile(
         form_attributes,
         None,
         None,
+        false,
     );
 
     if profile == Profile::Strict {
@@ -248,6 +258,7 @@ pub fn validate_module_with_symbols(
         form_attributes,
         symbols,
         owner_exports.as_ref(),
+        false,
     );
 
     if profile == Profile::Strict {
@@ -257,6 +268,62 @@ pub fn validate_module_with_symbols(
         result.valid = result.errors.is_empty();
     }
 
+    result
+}
+
+/// Проверка модуля, когда источник имён конфигурации настроен, но недоступен.
+///
+/// Отказывать здесь нельзя: платформенный индекс загружен и полностью
+/// работоспособен, а проверки против него (несуществующий глобальный метод,
+/// число аргументов, члены платформенных типов, системные перечисления,
+/// синтаксис) от имён конфигурации не зависят. Отказ отнимал у потребителя и
+/// их — ровно так в готовую обработку проходили `СЕГОДНЯ()` и
+/// `Справочник.Номенклатура.ПустаяСсылка()`.
+///
+/// Отличие от [`validate_module_with_profile`] (источник не настроен вовсе):
+/// находки `UndeclaredMethod` понижаются до [`Confidence::Low`] и получают
+/// текст, прямо говорящий, что имена конфигурации не проверялись. Выбрасывать
+/// их нельзя — именно сюда попадает выдуманный глобальный вызов; оставлять
+/// `High` тоже нельзя — без имён конфигурации туда же попадает каждый вызов
+/// процедуры глобального общего модуля (на УТ это давало 1420 находок).
+///
+/// `reason` — причина недоступности для человека; уходит в
+/// `degraded_reason`, а машиночитаемым признаком служит `symbols_available:
+/// false`.
+///
+/// Под [`Profile::Strict`] (только high-confidence находки) понижённые находки
+/// в ответ не попадут — это осознанный выбор профиля, а не потеря: строгий
+/// профиль по определению отдаёт лишь то, в чём валидатор уверен.
+#[allow(clippy::too_many_arguments)]
+pub fn validate_module_degraded(
+    index: &PlatformIndex,
+    source: &str,
+    level: u8,
+    profile: Profile,
+    module_path: Option<&str>,
+    form_attributes: Option<&HashSet<String>>,
+    reason: String,
+) -> ExpressionValidation {
+    let effective_level = if profile == Profile::Strict { 1 } else { level };
+    let mut result = validate_module_at_level_inner(
+        index,
+        source,
+        effective_level,
+        module_path,
+        form_attributes,
+        None,
+        None,
+        true,
+    );
+
+    if profile == Profile::Strict {
+        result
+            .errors
+            .retain(|e| e.confidence == Confidence::High);
+        result.valid = result.errors.is_empty();
+    }
+
+    result.degraded_reason = Some(reason);
     result
 }
 
@@ -536,6 +603,39 @@ EndFunction
             .find(|e| matches!(e.kind, ExprErrorKind::UndeclaredMethod))
             .expect("метод есть в конфигурации — находка должна остаться");
         assert_eq!(finding.confidence, Confidence::Low);
+    }
+
+    /// §4 п.2 ТЗ: источник настроен, но недоступен — находка остаётся (иначе
+    /// теряется выдуманный вызов), но с пониженной уверенностью и с текстом,
+    /// прямо говорящим, что имена конфигурации не проверялись.
+    #[test]
+    fn degraded_downgrades_undeclared_and_marks_answer() {
+        let index = PlatformIndex::new();
+        let result = validate_module_degraded(
+            &index,
+            module_with_unknown_call(),
+            1,
+            Profile::Full,
+            None,
+            None,
+            "источник имён недоступен".to_string(),
+        );
+        assert!(!result.symbols_available, "признак неполноты обязателен");
+        assert_eq!(
+            result.degraded_reason.as_deref(),
+            Some("источник имён недоступен")
+        );
+        let finding = result
+            .errors
+            .iter()
+            .find(|e| matches!(e.kind, ExprErrorKind::UndeclaredMethod))
+            .expect("находка должна остаться — иначе теряется выдуманный вызов");
+        assert_eq!(finding.confidence, Confidence::Low);
+        assert!(
+            finding.message.contains("Имена конфигурации не проверялись"),
+            "текст должен называть причину: {}",
+            finding.message
+        );
     }
 
     #[test]

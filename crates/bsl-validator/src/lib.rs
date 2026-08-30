@@ -30,8 +30,8 @@ pub use expression::{
     Confidence, ExprError, ExprErrorKind, ExpressionValidation, Profile,
 };
 pub use module::{
-    validate_module, validate_module_at_level, validate_module_with_profile,
-    validate_module_with_symbols,
+    validate_module, validate_module_at_level, validate_module_degraded,
+    validate_module_with_profile, validate_module_with_symbols,
 };
 pub use scope::{extract_scope_map, extract_type_annotations, Scope, ScopeMap};
 pub use symbols::{ObjectField, ObjectSchema, SymbolSource};
