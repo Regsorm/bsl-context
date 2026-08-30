@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use bsl_validator::{
-    validate_enum, validate_method_call, validate_module_with_profile,
+    validate_enum, validate_method_call, validate_module_degraded, validate_module_with_profile,
     validate_module_with_symbols, Profile, SymbolSource, FORM_TYPE,
 };
 use platform_index::{format, Definition, PlatformIndex, SearchEngine};
@@ -39,6 +39,10 @@ pub struct SourceSlot {
     /// Когда пробовали переподключиться в последний раз. Без отступа каждый
     /// `validate_module` при лежащем code-index ждал бы таймаут соединения.
     last_reconnect: std::sync::Mutex<Option<std::time::Instant>>,
+    /// Текст последней неудачной попытки подключения. Нужен инструменту
+    /// `symbol_sources_status`: без него причину отказа можно было узнать
+    /// только чтением журнала сервера.
+    last_error: std::sync::Mutex<Option<String>>,
 }
 
 /// Отступ между попытками переподключения. Секунды, а не мгновенно: источник
@@ -48,16 +52,24 @@ pub struct SourceSlot {
 const RECONNECT_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(15);
 
 impl SourceSlot {
+    /// `built` — результат первой попытки подключения (см.
+    /// [`crate::sources::build_symbol_source`]): текст ошибки сохраняется в
+    /// слоте и отдаётся инструментом `symbol_sources_status`.
     pub fn new(
         config: crate::config::SymbolSourceConfig,
-        source: Option<Arc<dyn SymbolSource>>,
+        built: Result<Option<Arc<dyn SymbolSource>>, String>,
     ) -> Self {
+        let (source, last_error) = match built {
+            Ok(source) => (source, None),
+            Err(msg) => (None, Some(msg)),
+        };
         Self {
             config,
             source: tokio::sync::RwLock::new(source),
             rebuilding: AtomicBool::new(false),
             reconnecting: AtomicBool::new(false),
             last_reconnect: std::sync::Mutex::new(None),
+            last_error: std::sync::Mutex::new(last_error),
         }
     }
 
@@ -68,6 +80,11 @@ impl SourceSlot {
             Some(at) => at.elapsed() >= RECONNECT_COOLDOWN,
             None => true,
         }
+    }
+
+    /// Текст последней неудачной попытки подключения, если она была.
+    fn last_error(&self) -> Option<String> {
+        self.last_error.lock().unwrap().clone()
     }
 }
 
@@ -124,11 +141,15 @@ impl BslContextServer {
     /// (пересборка индекса конкретной конфигурации).
     pub fn with_sources(
         mut self,
-        slots: Vec<(String, crate::config::SymbolSourceConfig, Option<Arc<dyn SymbolSource>>)>,
+        slots: Vec<(
+            String,
+            crate::config::SymbolSourceConfig,
+            Result<Option<Arc<dyn SymbolSource>>, String>,
+        )>,
     ) -> Self {
         let map = slots
             .into_iter()
-            .map(|(name, config, source)| (name, SourceSlot::new(config, source)))
+            .map(|(name, config, built)| (name, SourceSlot::new(config, built)))
             .collect();
         self.sources = Arc::new(map);
         self
@@ -235,8 +256,11 @@ impl BslContextServer {
     /// несуществующую поломку в уже исправном code-index.
     ///
     /// Возвращает `true`, если после попытки в слоте лежит здоровый источник.
-    async fn try_reconnect(&self, repo: &str, slot: &SourceSlot) -> bool {
-        if !slot.reconnect_due() || slot.reconnecting.swap(true, Ordering::SeqCst) {
+    ///
+    /// `force` — не смотреть на отступ (инструмент `reconnect_symbol_source`:
+    /// человек или конвейер попросил явно, значит ждать нечего).
+    async fn try_reconnect(&self, repo: &str, slot: &SourceSlot, force: bool) -> bool {
+        if (!force && !slot.reconnect_due()) || slot.reconnecting.swap(true, Ordering::SeqCst) {
             return false;
         }
         *slot.last_reconnect.lock().unwrap() = Some(std::time::Instant::now());
@@ -246,16 +270,24 @@ impl BslContextServer {
         // tokio им занимать нельзя.
         let built = tokio::task::spawn_blocking(move || crate::sources::build_symbol_source(&cfg))
             .await
-            .unwrap_or(None);
+            .unwrap_or_else(|e| Err(format!("поток подключения источника упал: {e}")));
 
         let ok = match built {
-            Some(source) => {
+            Ok(Some(source)) => {
                 tracing::info!(repo, "источник имён конфигурации переподключён");
                 *slot.source.write().await = Some(source);
+                *slot.last_error.lock().unwrap() = None;
                 true
             }
-            None => {
-                tracing::warn!(repo, "переподключить источник имён не удалось");
+            Ok(None) => {
+                // Штатное «источника нет»: kind = "none" либо lite-индекс ещё
+                // не собран. Ошибкой это не является, но и источника нет.
+                *slot.last_error.lock().unwrap() = None;
+                false
+            }
+            Err(msg) => {
+                tracing::warn!(repo, error = %msg, "переподключить источник имён не удалось");
+                *slot.last_error.lock().unwrap() = Some(msg);
                 false
             }
         };
@@ -343,6 +375,33 @@ impl BslContextServer {
 /// Отказ инструмента: не паника и не пустой ответ, а внятная причина.
 fn err_json(message: &str) -> String {
     serde_json::json!({"ok": false, "message": message}).to_string()
+}
+
+/// Проверка модуля, когда источник имён настроен, но недоступен.
+///
+/// Собрана в одном месте, потому что случаев четыре (источник не поднят,
+/// lite-индекс не собран, источник нездоров, источник отвалился по ходу
+/// проверки), а ответ у всех один: находки против платформенного контекста
+/// плюс `symbols_available: false` и причина.
+fn degraded_json(
+    index: &PlatformIndex,
+    source: &str,
+    level: u8,
+    profile: Profile,
+    module_path: Option<&str>,
+    form_attributes: Option<&HashSet<String>>,
+    reason: String,
+) -> String {
+    let result = validate_module_degraded(
+        index,
+        source,
+        level,
+        profile,
+        module_path,
+        form_attributes,
+        reason,
+    );
+    serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
 }
 
 // ── Параметры tools ────────────────────────────────────────────────────────
@@ -462,6 +521,13 @@ pub struct ValidateModuleParams {
 #[serde(default)]
 pub struct RebuildSymbolIndexParams {
     /// Алиас конфигурации, чей lite-индекс пересобрать (`repo` в `[[symbol_sources]]`).
+    pub repo: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct ReconnectSymbolSourceParams {
+    /// Алиас конфигурации, чей источник имён переподключить (`repo` в `[[symbol_sources]]`).
     pub repo: Option<String>,
 }
 
@@ -674,39 +740,68 @@ impl BslContextServer {
             }
         };
         if stale {
-            self.try_reconnect(repo, slot).await;
+            self.try_reconnect(repo, slot, false).await;
         }
         let guard = slot.source.read().await;
         let source = match guard.as_ref() {
             Some(source) => source,
             // Слот настроен, но источник не поднят: для lite сборка ещё не запускалась,
-            // для остальных — создание источника упало на старте (смотри лог сервера).
-            // Тихая валидация без имён здесь недопустима — именно так на УТ получалась
-            // 1420 ложных находок «метод не объявлен» на каждый вызов процедуры.
+            // для остальных — подключение не удалось (текст последней ошибки в слоте).
+            // Отказывать нельзя: платформенный индекс исправен, и проверки против него
+            // от имён конфигурации не зависят — именно так в готовый код проходили
+            // выдуманные вызовы. Проверяем против одной платформы, пометив ответ
+            // признаком неполноты; находки «метод не объявлен» при этом понижаются до
+            // Low — без имён конфигурации туда попадает каждый вызов процедуры
+            // глобального общего модуля (на УТ это давало 1420 находок).
             None => {
-                return if slot.config.kind == "lite" {
-                    err_json(&format!(
+                let reason = if slot.config.kind == "lite" {
+                    format!(
                         "индекс имён конфигурации \"{repo}\" не собран — вызовите \
-                         rebuild_symbol_index с repo=\"{repo}\""
-                    ))
+                         rebuild_symbol_index с repo=\"{repo}\". Проверка выполнена только \
+                         против платформенного контекста."
+                    )
                 } else {
-                    err_json(&format!(
+                    let cause = slot
+                        .last_error()
+                        .map(|e| format!(" Последняя ошибка: {e}."))
+                        .unwrap_or_default();
+                    format!(
                         "источник имён конфигурации \"{repo}\" не подключён; переподключение \
-                         пробовали, оно не удалось — смотрите ошибку в журнале сервера. \
-                         Следующая попытка — при вызове не раньше чем через {} с.",
+                         пробовали, оно не удалось.{cause} Следующая попытка — при вызове не \
+                         раньше чем через {} с (или сразу через reconnect_symbol_source). \
+                         Проверка выполнена только против платформенного контекста.",
                         RECONNECT_COOLDOWN.as_secs()
-                    ))
+                    )
                 };
+                return degraded_json(
+                    &self.index,
+                    &p.source,
+                    level,
+                    profile,
+                    p.module_path.as_deref(),
+                    form_attributes.as_ref(),
+                    reason,
+                );
             }
         };
         if !source.is_healthy() {
-            return err_json(&format!(
-                "источник имён конфигурации \"{repo}\" недоступен: {}. Переподключение \
-                 пробовали, оно не удалось — проверьте code-index; следующая попытка \
-                 будет при вызове не раньше чем через {} с.",
-                source.describe(),
-                RECONNECT_COOLDOWN.as_secs()
-            ));
+            return degraded_json(
+                &self.index,
+                &p.source,
+                level,
+                profile,
+                p.module_path.as_deref(),
+                form_attributes.as_ref(),
+                format!(
+                    "источник имён конфигурации \"{repo}\" недоступен: {}. Переподключение \
+                     пробовали, оно не удалось — проверьте code-index; следующая попытка \
+                     будет при вызове не раньше чем через {} с (или сразу через \
+                     reconnect_symbol_source). Проверка выполнена только против \
+                     платформенного контекста.",
+                    source.describe(),
+                    RECONNECT_COOLDOWN.as_secs()
+                ),
+            );
         }
         let result = validate_module_with_symbols(
             &self.index,
@@ -719,12 +814,23 @@ impl BslContextServer {
         );
         if !source.is_healthy() {
             // Отвалился во время самой валидации (code-index упал на полпути) — часть
-            // имён могла быть заменена пустыми ответами. Лучше явный отказ, чем
-            // заведомо неполный результат.
-            return err_json(&format!(
-                "источник имён конфигурации \"{repo}\" недоступен: {}. Проверьте code-index.",
-                source.describe()
-            ));
+            // имён могла быть заменена пустыми ответами, и в `result` могли попасть
+            // находки, порождённые именно этим. Отдавать его нельзя; считаем заново
+            // против одной платформы — там таких находок не будет по построению.
+            return degraded_json(
+                &self.index,
+                &p.source,
+                level,
+                profile,
+                p.module_path.as_deref(),
+                form_attributes.as_ref(),
+                format!(
+                    "источник имён конфигурации \"{repo}\" отвалился во время проверки: {}. \
+                     Результат пересчитан только против платформенного контекста — проверьте \
+                     code-index.",
+                    source.describe()
+                ),
+            );
         }
         serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
     }
@@ -796,6 +902,99 @@ impl BslContextServer {
             "form_writable": form_writable,
         });
         serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    #[tool(
+        description = "Состояние источников имён конфигураций: по каждому настроенному repo — \
+                       подключён ли он сейчас, здоров ли, и текст последней ошибки подключения. \
+                       Нужен перед началом работы с конкретной конфигурацией: если источник не \
+                       поднят, validate_module проверит модуль только против платформенного \
+                       контекста (ответ с symbols_available: false), и имена прикладных объектов \
+                       проверены не будут. Параметров нет. Возвращает JSON \
+                       {ok, sources:[{repo, kind, connected, healthy, state, last_error}]}, где \
+                       state — 'ok' | 'not_connected' | 'unhealthy'."
+    )]
+    pub async fn symbol_sources_status(&self) -> String {
+        let mut out = Vec::with_capacity(self.sources.len());
+        for (repo, slot) in self.sources.iter() {
+            let guard = slot.source.read().await;
+            let (connected, healthy, describe) = match guard.as_ref() {
+                Some(source) => (true, source.is_healthy(), Some(source.describe())),
+                None => (false, false, None),
+            };
+            let state = match (connected, healthy) {
+                (true, true) => "ok",
+                (true, false) => "unhealthy",
+                _ => "not_connected",
+            };
+            out.push(serde_json::json!({
+                "repo": repo,
+                "kind": slot.config.kind,
+                "connected": connected,
+                "healthy": healthy,
+                "state": state,
+                // Для нездорового источника причина — в его собственном описании
+                // (что именно ответил code-index), для неподнятого — в слоте.
+                "last_error": describe
+                    .filter(|_| !healthy)
+                    .or_else(|| slot.last_error()),
+            }));
+        }
+        serde_json::json!({"ok": true, "sources": out}).to_string()
+    }
+
+    #[tool(
+        description = "Повторить подключение источника имён конфигурации, не перезапуская сервер. \
+                       Нужен, когда code-index подняли или перезапустили позже bsl-context: сам \
+                       сервер пробует переподключиться при обращении, но не чаще чем раз в 15 \
+                       секунд, а этот вызов делает попытку немедленно. Параметр repo — алиас \
+                       конфигурации ([[symbol_sources]] в config.toml), обязателен. Возвращает \
+                       JSON {ok, repo, connected, healthy, state, last_error} — состояние ПОСЛЕ \
+                       попытки; ok: false только если repo не настроен."
+    )]
+    pub async fn reconnect_symbol_source(
+        &self,
+        Parameters(p): Parameters<ReconnectSymbolSourceParams>,
+    ) -> String {
+        let repo = match p.repo.as_deref() {
+            Some(repo) => repo,
+            None => {
+                return err_json(&format!(
+                    "параметр repo обязателен; доступные конфигурации: {}",
+                    self.source_names()
+                ))
+            }
+        };
+        let slot = match self.resolve_slot(Some(repo)) {
+            Ok(slot) => slot,
+            Err(msg) => return err_json(&msg),
+        };
+        // force: попросили явно — отступ между автоматическими попытками здесь
+        // ни при чём, иначе вызов «подними сейчас» молча ничего бы не делал.
+        self.try_reconnect(repo, slot, true).await;
+
+        let guard = slot.source.read().await;
+        let (connected, healthy, describe) = match guard.as_ref() {
+            Some(source) => (true, source.is_healthy(), Some(source.describe())),
+            None => (false, false, None),
+        };
+        let state = match (connected, healthy) {
+            (true, true) => "ok",
+            (true, false) => "unhealthy",
+            _ => "not_connected",
+        };
+        serde_json::json!({
+            "ok": true,
+            "repo": repo,
+            "kind": slot.config.kind,
+            "connected": connected,
+            "healthy": healthy,
+            "state": state,
+            "last_error": describe
+                .filter(|_| !healthy)
+                .or_else(|| slot.last_error()),
+        })
+        .to_string()
     }
 
     #[tool(

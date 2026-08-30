@@ -68,8 +68,14 @@ async fn main() -> anyhow::Result<()> {
         .resolved_symbol_sources()?
         .into_iter()
         .map(|(name, sc)| {
-            let src = build_symbol_source(&sc);
-            (name, sc, src)
+            let built = build_symbol_source(&sc);
+            if let Err(msg) = &built {
+                // Причину надо и в журнал, и в слот: инструмент
+                // symbol_sources_status отдаёт её вызывающему, не заставляя
+                // читать логи сервера.
+                error!(source = %name, error = %msg, "источник имён конфигурации не подключён");
+            }
+            (name, sc, built)
         })
         .collect();
     info!(
