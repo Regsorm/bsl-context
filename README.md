@@ -40,6 +40,11 @@ file, language setup failure, parsing deadline) — tree-based checks did not ru
 so an empty finding list does NOT mean "no issues". Text-based checks
 (declarations, module structure, directives, query rules) always run.
 
+The second flag is `symbols_available`. `false` means configuration names were not
+available during the check (the name source never came up, or died mid-flight), so only
+platform-level rules were applied; the reason is in `degraded_reason`. An answer without
+these fields rests on the full set of names.
+
 Pass `module_path` whenever the module path is known. Without it the validator
 cannot tell an object module from an arbitrary fragment and assumes there is no
 implicit object context: calls on attributes and tabular sections
@@ -313,11 +318,20 @@ procedure call. Hence:
 - **On connect**, a `code_index_mcp` source asks `code-index` for the stats of its own
   repository. If `code-index` does not know it, the source is not created and the log gets
   an explicit error listing the available repositories.
-- **A configuration is declared but its source failed to come up** — `validate_module` for
-  that alias refuses and explains why (for `lite`: "index not built, call
-  `rebuild_symbol_index`") instead of emitting findings that are certainly false.
+- **A configuration is declared but its source failed to come up** — `validate_module`
+  still checks the module, against the platform reference alone. Refusing would throw away
+  the platform-level checks too (a call to a function that does not exist, a wrong argument
+  count, members of platform types), and those do not depend on configuration names at all.
+  The answer carries `symbols_available: false` and a `degraded_reason`, so a partial check
+  is never mistaken for a clean one. `undeclared_method` findings are **downgraded to
+  `low`**: dropping them would lose the invented call this check exists for, while keeping
+  them at `high` would flag every call to a global common module's procedure.
 - **A source dies mid-flight** (network, `code-index` down) — it is marked unhealthy, the
-  empty answer is not cached, and validation for that configuration refuses until recovery.
+  empty answer is not cached, and the module is re-checked against the platform alone, again
+  with `symbols_available: false`.
+- **The source comes up later than the server** (containers starting in parallel) — it is
+  reconnected on the next call, at most once per 15 seconds. `symbol_sources_status` shows
+  the state of every configured source, and `reconnect_symbol_source` retries immediately.
 
 ### Tool whitelist
 
@@ -329,7 +343,7 @@ If you only need part of the server's surface, list the tools you want in the
 enabled = ["validate_module", "get_constructors", "get_enum_values"]
 ```
 
-A missing section or an empty list means all eleven tools are available, as before.
+A missing section or an empty list means all thirteen tools are available, as before.
 Hidden tools are absent from `tools/list` and are rejected on a direct call.
 An unknown name does not break startup: it produces a warning in the log and the
 tool simply never appears.
@@ -358,6 +372,8 @@ Transport — Streamable HTTP at `http://127.0.0.1:8007/mcp` (stateless).
 | `validate_method_call` | Validate a global function's argument count |
 | `validate_module` | Validate BSL code (whole module or fragment) against the platform |
 | `rebuild_symbol_index` | Rebuild the own name index (`kind = "lite"`); paths come from the config |
+| `symbol_sources_status` | State of every configured name source: connected, healthy, last connection error |
+| `reconnect_symbol_source` | Retry the connection to one source without restarting the server |
 | `reserved_names` | Context-occupied names from the platform help: `global_readonly`/`form_readonly` (assignment fails at runtime), `global_writable`/`form_writable` (no variable is created — the session or the form is silently changed) |
 
 ## Connecting an MCP client
