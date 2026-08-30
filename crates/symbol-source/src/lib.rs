@@ -330,11 +330,17 @@ impl CodeIndexDbSource {
         })
     }
 
+    /// Второй шаблон — для выгрузки, лежащей В КОРНЕ репозитория: там путь
+    /// равен `CommonModules/<Имя>.xml`, ведущего слэша нет, и шаблон
+    /// `%/CommonModules/%` его не находит. Промах был тихим: запрос отдавал
+    /// ноль строк, и на каждый вызов процедуры глобального общего модуля
+    /// появлялась находка «метод не объявлен».
     fn try_collect_global_exports(conn: &Connection) -> Result<HashSet<String>> {
         let mut stmt = conn.prepare(
             "SELECT f.path, fc.content_blob FROM files f \
              JOIN file_contents fc ON fc.file_id = f.id \
-             WHERE f.path LIKE '%/CommonModules/%.xml' AND fc.oversize = 0",
+             WHERE (f.path LIKE '%/CommonModules/%.xml' \
+                    OR f.path LIKE 'CommonModules/%.xml') AND fc.oversize = 0",
         )?;
         let rows =
             stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)))?;
@@ -495,7 +501,7 @@ pub struct CodeIndexMcpSource {
 }
 
 /// Находка `search_function`: то, что нужно обоим вопросам источника.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct FoundFn {
     name_lower: String,
     args: String,
@@ -670,7 +676,7 @@ impl CodeIndexMcpSource {
         let text = resp.into_string().context("code-index mcp: тело ответа")?;
         let value = parse_sse_json(&text)
             .ok_or_else(|| anyhow::anyhow!("code-index mcp: пустой/неразбираемый SSE-ответ"))?;
-        Ok(found_fns_from_search(&value))
+        found_fns_from_search(&value)
     }
 
     /// Глобальный ли общий модуль. XML читается у самого code-index
@@ -711,7 +717,7 @@ impl CodeIndexMcpSource {
         let text = resp.into_string().context("code-index mcp: тело ответа")?;
         let value = parse_sse_json(&text)
             .ok_or_else(|| anyhow::anyhow!("code-index mcp: пустой/неразбираемый SSE-ответ"))?;
-        Ok(xml_says_global(&value))
+        xml_says_global(&value)
     }
 
     /// `get_file_summary(repo, path)` — карта файла без тел. Возвращает имена
@@ -739,7 +745,7 @@ impl CodeIndexMcpSource {
             .ok_or_else(|| anyhow::anyhow!("code-index mcp: get_file_summary без result.content[0].text"))?;
         let summary: Value =
             serde_json::from_str(text).context("code-index mcp: get_file_summary: не JSON")?;
-        Ok(export_names_from_summary(&summary))
+        export_names_from_summary(&summary)
     }
 
     /// Набор имён объектов конфигурации коллекции (нижний регистр), из кэша
@@ -895,7 +901,7 @@ impl CodeIndexMcpSource {
         let text = resp.into_string().context("code-index mcp: тело ответа")?;
         let value = parse_sse_json(&text)
             .ok_or_else(|| anyhow::anyhow!("code-index mcp: пустой/неразбираемый SSE-ответ"))?;
-        Ok(global_vars_from_grep(&value))
+        global_vars_from_grep(&value)
     }
 }
 
@@ -927,10 +933,13 @@ impl SymbolSource for CodeIndexMcpSource {
                 self.owner_cache.lock().unwrap().insert(owner, names.clone());
                 Some(names)
             }
+            // `None` — «не знаю», и валидатор промолчит. Пустой набор здесь
+            // означал бы «экспортов у владельца нет» и дал бы находку
+            // «метод не объявлен» на каждый его вызов.
             Err(e) => {
                 tracing::warn!(error = %e, owner = %owner, "code-index mcp: ошибка get_file_summary");
                 self.healthy.store(false, Ordering::Relaxed);
-                Some(HashSet::new())
+                None
             }
         }
     }
@@ -1224,20 +1233,26 @@ fn objects_from_bsl_sql(value: &Value) -> Option<ObjectPage> {
 /// Разбор ответа `grep_code`: `{"files": {"<path>": ["12: <строка>", ...]}}`.
 /// Номер строки отрезаем — дальше работает разбор объявления, общий с
 /// `lite-index`: правило чтения `Перем Имя Экспорт;` должно жить в одном месте.
-fn global_vars_from_grep(value: &Value) -> HashSet<String> {
-    let Some(text) = value
-        .pointer("/result/content/0/text")
-        .and_then(|t| t.as_str())
-    else {
-        return HashSet::new();
-    };
-    let Ok(parsed) = serde_json::from_str::<Value>(text) else {
-        return HashSet::new();
-    };
-    let body = payload(&parsed);
-    let Some(files) = body.get("files").and_then(|f| f.as_object()) else {
-        return HashSet::new();
-    };
+///
+/// Здесь, в отличие от `search_function`, важна ПОЛНОТА: набор целиком
+/// включает правило про общий модуль (`config_objects.rs`), и недостающее имя
+/// сразу становится находкой «общий модуль не существует» (замер на УТ — 123
+/// ложные находки на одном лишь `ПараметрыПриложения`). Поэтому обрезанный
+/// ответ отбраковывается наравне с отказом.
+fn global_vars_from_grep(value: &Value) -> Result<HashSet<String>> {
+    let body = tool_payload(value)?;
+    for marker in ["rows_truncated", "rows_elided_already_delivered"] {
+        if body.get(marker).is_some() {
+            anyhow::bail!("code-index mcp: grep_code вернул неполный ответ ({marker})");
+        }
+    }
+    if body.get("truncated").and_then(|t| t.as_bool()) == Some(true) {
+        anyhow::bail!("code-index mcp: grep_code упёрся в лимит — список переменных неполон");
+    }
+    let files = body
+        .get("files")
+        .and_then(|f| f.as_object())
+        .ok_or_else(|| anyhow::anyhow!("code-index mcp: grep_code без карты files"))?;
     let mut lines = String::new();
     for entries in files.values() {
         for entry in entries.as_array().into_iter().flatten() {
@@ -1250,10 +1265,10 @@ fn global_vars_from_grep(value: &Value) -> HashSet<String> {
             lines.push('\n');
         }
     }
-    lite_index::global_export_vars_from_text(&lines)
+    Ok(lite_index::global_export_vars_from_text(&lines)
         .into_iter()
         .map(|n| n.to_lowercase())
-        .collect()
+        .collect())
 }
 
 /// Полезная нагрузка ответа `code-index`. С версии 0.9 инструменты заворачивают
@@ -1262,6 +1277,40 @@ fn global_vars_from_grep(value: &Value) -> HashSet<String> {
 /// и источник молча отвечает «имени нет» на любое имя.
 fn payload(value: &Value) -> &Value {
     value.get("result").unwrap_or(value)
+}
+
+/// Отбраковка СЛУЖЕБНОГО ответа `code-index`. Отказ инструмента приходит с
+/// HTTP 200 и обычным телом — `{"status":"indexing"|"daemon_offline"|
+/// "unknown_repo","message":…}`, — то есть ошибкой транспорта не является и
+/// ветку `Err` вызывающего сам по себе не включает. Принять его за данные
+/// нельзя: «имени нет» на каждое имя даёт лавину находок «метод не объявлен»
+/// (замер на УТ — 1420 штук), и она уйдёт клиенту как успешный результат.
+fn reject_service_answer(parsed: &Value) -> Result<()> {
+    if parsed.get("response_truncated").is_some() {
+        anyhow::bail!("страж размера обрезал ответ");
+    }
+    let body = payload(parsed);
+    if let Some(status) = body.get("status").and_then(|s| s.as_str()) {
+        let message = body.get("message").and_then(|m| m.as_str()).unwrap_or("");
+        anyhow::bail!("служебный ответ status={status}: {message}");
+    }
+    Ok(())
+}
+
+/// Полезная нагрузка ответа инструмента `code-index` с проверкой достоверности.
+///
+/// `Err` здесь означает «источник не ответил по существу», а НЕ «данных нет»:
+/// вызывающий обязан уронить `healthy` и не класть результат в кэш. Именно
+/// смешение этих двух смыслов и есть главный источник ложных находок.
+fn tool_payload(value: &Value) -> Result<Value> {
+    let text = value
+        .pointer("/result/content/0/text")
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| anyhow::anyhow!("code-index mcp: ответ без result.content[0].text"))?;
+    let parsed: Value =
+        serde_json::from_str(text).context("code-index mcp: нагрузка не разбирается как JSON")?;
+    reject_service_answer(&parsed).context("code-index mcp")?;
+    Ok(payload(&parsed).clone())
 }
 
 /// Итог проверки репозитория по ответу `get_stats(repo)`.
@@ -1304,11 +1353,16 @@ fn repo_check_from_get_stats(value: &Value, repo: &str) -> RepoCheck {
 /// скобкой (`"() Экспорт"`). Тот же критерий, что у SQL-варианта
 /// (`args LIKE '%) Экспорт%'`) — проверка по `" Экспорт"` поймала бы и параметр
 /// с таким именем.
-fn export_names_from_summary(summary: &Value) -> HashSet<String> {
+/// Отсутствие ключа `functions` — отказ, а не файл без функций: у файла без
+/// функций code-index отдаёт пустой массив. Возвращаем `Err`, иначе «экспортов
+/// нет» погасит whitelist модуля-владельца.
+fn export_names_from_summary(summary: &Value) -> Result<HashSet<String>> {
+    reject_service_answer(summary).context("code-index mcp: get_file_summary")?;
     let mut out = HashSet::new();
-    let Some(functions) = payload(summary).get("functions").and_then(|f| f.as_array()) else {
-        return out;
-    };
+    let functions = payload(summary)
+        .get("functions")
+        .and_then(|f| f.as_array())
+        .ok_or_else(|| anyhow::anyhow!("code-index mcp: get_file_summary без списка functions"))?;
     for func in functions {
         let Some(args) = func.get("args").and_then(|a| a.as_str()) else {
             continue;
@@ -1319,21 +1373,20 @@ fn export_names_from_summary(summary: &Value) -> HashSet<String> {
             }
         }
     }
-    out
+    Ok(out)
 }
 
 /// Разбор ответа `search_function`: `result` — массив локаций.
-fn found_fns_from_search(value: &Value) -> Vec<FoundFn> {
-    let Some(text) = value.pointer("/result/content/0/text").and_then(|t| t.as_str()) else {
-        return Vec::new();
-    };
-    let Ok(parsed) = serde_json::from_str::<Value>(text) else {
-        return Vec::new();
-    };
-    let Some(items) = payload(&parsed).as_array() else {
-        return Vec::new();
-    };
-    items
+///
+/// Нагрузка не массив — это не «ничего не найдено», а отказ инструмента
+/// (`{"status":…}`) либо смена формата: возвращаем `Err`, иначе валидатор
+/// решит, что метода нигде нет.
+fn found_fns_from_search(value: &Value) -> Result<Vec<FoundFn>> {
+    let body = tool_payload(value)?;
+    let items = body
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("code-index mcp: search_function вернул не массив"))?;
+    Ok(items
         .iter()
         .map(|item| FoundFn {
             name_lower: item
@@ -1352,21 +1405,21 @@ fn found_fns_from_search(value: &Value) -> Vec<FoundFn> {
                 .unwrap_or_default()
                 .to_string(),
         })
-        .collect()
+        .collect())
 }
 
 /// В ответе `read_file` содержимое лежит в `content`. Ищем `<Global>true</Global>`.
-fn xml_says_global(value: &Value) -> bool {
-    let Some(text) = value.pointer("/result/content/0/text").and_then(|t| t.as_str()) else {
-        return false;
-    };
-    let Ok(parsed) = serde_json::from_str::<Value>(text) else {
-        return false;
-    };
-    payload(&parsed)
+///
+/// Нет поля `content` — файл не прочитан (отказ, иной формат): `Err`, а не
+/// «модуль не глобальный». Второе загасило бы whitelist глобального модуля и
+/// дало находку «метод не объявлен» на каждый его вызов.
+fn xml_says_global(value: &Value) -> Result<bool> {
+    let body = tool_payload(value)?;
+    let content = body
         .get("content")
         .and_then(|c| c.as_str())
-        .is_some_and(|c| c.contains("<Global>true</Global>"))
+        .ok_or_else(|| anyhow::anyhow!("code-index mcp: read_file без поля content"))?;
+    Ok(content.contains("<Global>true</Global>"))
 }
 
 #[cfg(test)]
@@ -1387,7 +1440,7 @@ mod tests {
     #[test]
     fn found_fns_parsed_from_search_response() {
         let v = tool_response(r#"{"result":[{"name":"Ф","args":"() Экспорт","file_path":"base/CommonModules/М/Ext/Module.bsl"}]}"#);
-        let fns = found_fns_from_search(&v);
+        let fns = found_fns_from_search(&v).expect("корректный ответ");
         assert_eq!(fns.len(), 1);
         assert_eq!(fns[0].name_lower, "ф");
         assert!(fns[0].args.contains("Экспорт"));
@@ -1400,9 +1453,80 @@ mod tests {
         let v = tool_response(
             r#"{"result":[{"name":"СведенияОВнешнейОбработкеДопустимой","args":"() Экспорт","file_path":"base/CommonModules/М/Ext/Module.bsl"}]}"#,
         );
-        let fns = found_fns_from_search(&v);
+        let fns = found_fns_from_search(&v).expect("корректный ответ");
         assert!(!fns.iter().any(|f| f.name_lower == "сведенияовнешнейобработке"));
         assert!(fns.iter().any(|f| f.name_lower == "сведенияовнешнейобработкедопустимой"));
+    }
+
+    // ── служебный ответ code-index ≠ «данных нет» ────────────────────────
+    //
+    // Отказ инструмента приходит с HTTP 200 и обычным телом, поэтому веткой
+    // `Err` транспорта не ловится. Принятый за пустой результат, он даёт
+    // «метода нигде нет» на каждое имя — лавину находок «метод не объявлен».
+
+    #[test]
+    fn search_rejects_service_answers() {
+        for body in [
+            r#"{"status":"unknown_repo","message":"Неизвестный repo 'нет-такого'. Доступные: [ut]"}"#,
+            r#"{"status":"indexing","message":"идёт переиндексация"}"#,
+            r#"{"status":"daemon_offline","message":"демон не запущен"}"#,
+        ] {
+            let err = found_fns_from_search(&tool_response(body))
+                .expect_err("служебный ответ обязан быть ошибкой, а не пустым списком");
+            assert!(
+                format!("{err:#}").contains("служебный ответ"),
+                "в тексте должна быть причина: {err:#}"
+            );
+        }
+        // Законный пустой результат ошибкой НЕ является.
+        let empty = found_fns_from_search(&tool_response(r#"{"result":[]}"#))
+            .expect("пустой список находок — нормальный ответ");
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn global_vars_reject_partial_answers() {
+        // Обрезка: список переменных обязан быть полным — он включает правило
+        // про общий модуль, и недостающее имя сразу становится находкой.
+        for body in [
+            r#"{"result":{"files":{},"truncated":true}}"#,
+            r#"{"result":{"files":{},"rows_truncated":10}}"#,
+            r#"{"status":"indexing","message":"идёт переиндексация"}"#,
+            r#"{"result":{"shown":0}}"#,
+        ] {
+            assert!(
+                global_vars_from_grep(&tool_response(body)).is_err(),
+                "неполный/служебный ответ обязан быть ошибкой: {body}"
+            );
+        }
+        // Конфигурация без экспортных переменных — законный пустой ответ.
+        let empty = global_vars_from_grep(&tool_response(
+            r#"{"result":{"files":{},"shown":0,"truncated":false}}"#,
+        ))
+        .expect("пустая карта files — нормальный ответ");
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn summary_without_functions_key_is_an_error() {
+        // У файла без функций code-index отдаёт ПУСТОЙ массив, а не пропуск
+        // ключа: отсутствие ключа — отказ.
+        assert!(export_names_from_summary(
+            &serde_json::from_str::<Value>(r#"{"status":"daemon_offline"}"#).unwrap()
+        )
+        .is_err());
+        assert!(export_names_from_summary(&serde_json::from_str::<Value>("{}").unwrap()).is_err());
+        let empty = export_names_from_summary(
+            &serde_json::from_str::<Value>(r#"{"result":{"functions":[]}}"#).unwrap(),
+        )
+        .expect("файл без функций — нормальный ответ");
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn xml_without_content_is_an_error() {
+        assert!(xml_says_global(&tool_response(r#"{"status":"unknown_repo"}"#)).is_err());
+        assert!(xml_says_global(&tool_response(r#"{"result":{}}"#)).is_err());
     }
 
     #[test]
@@ -1440,8 +1564,8 @@ mod tests {
 
     #[test]
     fn xml_says_global_reads_flag() {
-        assert!(xml_says_global(&tool_response(r#"{"result":{"content":"<Properties><Global>true</Global></Properties>"}}"#)));
-        assert!(!xml_says_global(&tool_response(r#"{"result":{"content":"<Properties><Global>false</Global></Properties>"}}"#)));
+        assert!(xml_says_global(&tool_response(r#"{"result":{"content":"<Properties><Global>true</Global></Properties>"}}"#)).unwrap());
+        assert!(!xml_says_global(&tool_response(r#"{"result":{"content":"<Properties><Global>false</Global></Properties>"}}"#)).unwrap());
     }
 
     #[test]
@@ -1472,7 +1596,7 @@ mod tests {
             ]}}"#,
         )
         .unwrap();
-        let names = export_names_from_summary(&v);
+        let names = export_names_from_summary(&v).expect("корректный ответ");
         assert!(names.contains("сведенияовнешнейобработке"));
         assert!(names.contains("выполнитьобмен"));
         assert!(!names.contains("внутренняя"));
