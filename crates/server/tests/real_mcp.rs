@@ -276,6 +276,59 @@ async fn rebuild_symbol_index_builds_database_and_creates_directory() {
     let _ = std::fs::remove_dir_all(dir.parent().unwrap());
 }
 
+/// Источник в слоте пуст, но база на диске есть: валидация обязана поднять его
+/// сама. До этой правки слот с `None` оставался пустым до перезапуска процесса —
+/// сетевой источник ронял свой `healthy` навсегда, а пересоздать его было нечем.
+#[tokio::test]
+async fn validate_module_reconnects_source_on_demand() {
+    let Some(srv) = make_server().await else { eprintln!("skip: hbk не найден"); return; };
+    let dir = std::env::temp_dir().join("bslctx_reconnect_test");
+    let _ = std::fs::remove_dir_all(&dir);
+    let root = dir.join("dump");
+    let module = root.join("base/CommonModules/Гло/Ext/Module.bsl");
+    std::fs::create_dir_all(module.parent().unwrap()).unwrap();
+    std::fs::write(&module, "Процедура ИмяИзГло() Экспорт\nКонецПроцедуры\n").unwrap();
+    std::fs::write(
+        root.join("base/CommonModules/Гло.xml"),
+        "<?xml version=\"1.0\"?>\n<MetaDataObject><CommonModule><Properties><Name>Гло</Name><Global>true</Global></Properties></CommonModule></MetaDataObject>\n",
+    )
+    .unwrap();
+    let db = dir.join("lite.db");
+    lite_index::build(&root, &db, 0).expect("сборка индекса");
+
+    // Слот настроен и база на месте, но источник в памяти НЕ поднят.
+    let mut cfg = bsl_context_server::config::SymbolSourceConfig::default();
+    cfg.kind = "lite".to_string();
+    cfg.root = Some(root.clone());
+    cfg.db_path = Some(db.clone());
+    let srv = srv.with_sources(vec![("ut".to_string(), cfg, None)]);
+    assert!(srv.sources["ut"].source.read().await.is_none());
+
+    let json = srv
+        .validate_module(Parameters(ValidateModuleParams {
+            source: "Процедура Тест()\n\tИмяИзГло();\nКонецПроцедуры".into(),
+            level: None,
+            profile: None,
+            module_path: None,
+            form_attributes: None,
+            repo: Some("ut".to_string()),
+        }))
+        .await;
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert!(
+        v.get("valid").is_some(),
+        "ожидалась валидация, а не отказ: {json}"
+    );
+    assert!(
+        srv.sources["ut"].source.read().await.is_some(),
+        "источник должен быть поднят на лету"
+    );
+    // Имя из глобального общего модуля источник знает — ложной находки нет.
+    assert_eq!(v["valid"], true, "неожиданные находки: {json}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test]
 async fn validate_module_rejects_unknown_repo() {
     let Some(srv) = make_server().await else { eprintln!("skip: hbk не найден"); return; };

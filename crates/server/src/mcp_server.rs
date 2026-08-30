@@ -34,7 +34,18 @@ pub struct SourceSlot {
     /// `tokio`-версия: блокировка переживает `await` вокруг сборки индекса.
     pub source: tokio::sync::RwLock<Option<Arc<dyn SymbolSource>>>,
     rebuilding: AtomicBool,
+    /// Идёт попытка переподключения — второй запрос ждать её не должен.
+    reconnecting: AtomicBool,
+    /// Когда пробовали переподключиться в последний раз. Без отступа каждый
+    /// `validate_module` при лежащем code-index ждал бы таймаут соединения.
+    last_reconnect: std::sync::Mutex<Option<std::time::Instant>>,
 }
+
+/// Отступ между попытками переподключения. Секунды, а не мгновенно: источник
+/// поднимается людьми (перезапуск code-index) или планировщиком, и долбить его
+/// на каждый вызов бессмысленно — зато после недолгого простоя валидация
+/// возвращается сама, без перезапуска bsl-context.
+const RECONNECT_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(15);
 
 impl SourceSlot {
     pub fn new(
@@ -45,6 +56,17 @@ impl SourceSlot {
             config,
             source: tokio::sync::RwLock::new(source),
             rebuilding: AtomicBool::new(false),
+            reconnecting: AtomicBool::new(false),
+            last_reconnect: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Пора ли пробовать снова (прошёл отступ и никто не пробует прямо сейчас).
+    fn reconnect_due(&self) -> bool {
+        let last = self.last_reconnect.lock().unwrap();
+        match *last {
+            Some(at) => at.elapsed() >= RECONNECT_COOLDOWN,
+            None => true,
         }
     }
 }
@@ -129,20 +151,37 @@ impl BslContextServer {
             .map(|t| t.name.to_string())
             .collect();
         let allowed: BTreeSet<String> = enabled.iter().cloned().collect();
-        let unknown: Vec<&str> = allowed
+        let unknown: Vec<String> = allowed
             .iter()
             .filter(|n| !known.contains(*n))
-            .map(|s| s.as_str())
+            .cloned()
             .collect();
         if !unknown.is_empty() {
             tracing::warn!(
                 ?unknown,
-                "[tools].enabled содержит неизвестные имена инструментов (опечатка?) — они ни на что не повлияют"
+                "[tools].enabled содержит неизвестные имена инструментов (опечатка?) — они не разрешают ничего"
             );
         }
+        // В список кладём ТОЛЬКО существующие имена: опечатка не должна
+        // занимать место в белом списке, ничего при этом не разрешая.
+        let allowed: BTreeSet<String> = allowed
+            .into_iter()
+            .filter(|name| known.contains(name))
+            .collect();
+        if allowed.is_empty() {
+            // Список из одних опечаток запретил бы ВСЕ инструменты: сервис
+            // стартует, /health отвечает «ok», tools/list пуст — работающим он
+            // только выглядит. Это заведомо не то, чего хотел автор конфига,
+            // поэтому фильтр не включаем, а ошибку делаем видимой.
+            tracing::error!(
+                "[tools].enabled не содержит ни одного существующего имени — белый список \
+                 НЕ включён, доступны все инструменты. Проверьте имена в config.toml."
+            );
+            return self;
+        }
         tracing::info!(
-            known = allowed.len() - unknown.len(),
-            listed = allowed.len(),
+            known = allowed.len(),
+            listed = allowed.len() + unknown.len(),
             "[tools].enabled — белый список активен"
         );
         self.allowed_tools = Some(Arc::new(allowed));
@@ -184,6 +223,44 @@ impl BslContextServer {
                 self.source_names()
             )),
         }
+    }
+
+    /// Пересоздать источник имён для слота. Нужно потому, что сетевой источник
+    /// (`code_index_mcp`) роняет свой `healthy` навсегда — по замыслу его
+    /// автора, «источник пересоздаётся заново». Пересоздавать было нечем:
+    /// `rebuild_symbol_index` работает только с `lite`, а `build_symbol_source`
+    /// вызывался единственный раз на старте. Итог: секундный простой
+    /// code-index (штатный перезапуск) выключал валидацию по конфигурации до
+    /// перезапуска самого bsl-context, а сообщение отправляло искать
+    /// несуществующую поломку в уже исправном code-index.
+    ///
+    /// Возвращает `true`, если после попытки в слоте лежит здоровый источник.
+    async fn try_reconnect(&self, repo: &str, slot: &SourceSlot) -> bool {
+        if !slot.reconnect_due() || slot.reconnecting.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+        *slot.last_reconnect.lock().unwrap() = Some(std::time::Instant::now());
+
+        let cfg = slot.config.clone();
+        // Создание синхронное (рукопожатие MCP через `ureq`) — worker-поток
+        // tokio им занимать нельзя.
+        let built = tokio::task::spawn_blocking(move || crate::sources::build_symbol_source(&cfg))
+            .await
+            .unwrap_or(None);
+
+        let ok = match built {
+            Some(source) => {
+                tracing::info!(repo, "источник имён конфигурации переподключён");
+                *slot.source.write().await = Some(source);
+                true
+            }
+            None => {
+                tracing::warn!(repo, "переподключить источник имён не удалось");
+                false
+            }
+        };
+        slot.reconnecting.store(false, Ordering::SeqCst);
+        ok
     }
 
     /// Собрать индекс во временный файл, снять старый источник, подменить файл,
@@ -358,6 +435,12 @@ pub struct ValidateModuleParams {
     /// что это модуль формы (`.../Forms/<Имя>/Ext/Form/Module.bsl` или
     /// `.../Form/<Имя>/Form.obj.bsl`), и включить проверку имён, занятых
     /// членами `ФормаКлиентскогоПриложения`.
+    ///
+    /// Передавайте его ВСЕГДА, когда путь известен, особенно для модуля
+    /// объекта. Без пути валидатор не отличает модуль объекта от произвольного
+    /// фрагмента и считает, что неявного контекста объекта нет: обращения к
+    /// реквизитам и табличным частям (`Товары.Очистить()`) тогда дают находку
+    /// `unknown_common_module`.
     #[serde(alias = "modulePath")]
     pub module_path: Option<String>,
     /// Имена реквизитов формы (`Объект`, `Список`, свои реквизиты). Реквизит
@@ -581,6 +664,18 @@ impl BslContextServer {
         };
         // Слот найден по точному совпадению repo — значит параметр был Some.
         let repo = p.repo.as_deref().unwrap_or_default();
+        // Источника нет или он уже свалился — пробуем поднять заново, не
+        // дожидаясь перезапуска процесса. Отступ между попытками внутри.
+        let stale = {
+            let guard = slot.source.read().await;
+            match guard.as_ref() {
+                None => true,
+                Some(source) => !source.is_healthy(),
+            }
+        };
+        if stale {
+            self.try_reconnect(repo, slot).await;
+        }
         let guard = slot.source.read().await;
         let source = match guard.as_ref() {
             Some(source) => source,
@@ -596,16 +691,21 @@ impl BslContextServer {
                     ))
                 } else {
                     err_json(&format!(
-                        "источник имён конфигурации \"{repo}\" не подключён — смотрите ошибку \
-                         в журнале сервера"
+                        "источник имён конфигурации \"{repo}\" не подключён; переподключение \
+                         пробовали, оно не удалось — смотрите ошибку в журнале сервера. \
+                         Следующая попытка — при вызове не раньше чем через {} с.",
+                        RECONNECT_COOLDOWN.as_secs()
                     ))
                 };
             }
         };
         if !source.is_healthy() {
             return err_json(&format!(
-                "источник имён конфигурации \"{repo}\" недоступен: {}. Проверьте code-index.",
-                source.describe()
+                "источник имён конфигурации \"{repo}\" недоступен: {}. Переподключение \
+                 пробовали, оно не удалось — проверьте code-index; следующая попытка \
+                 будет при вызове не раньше чем через {} с.",
+                source.describe(),
+                RECONNECT_COOLDOWN.as_secs()
             ));
         }
         let result = validate_module_with_symbols(

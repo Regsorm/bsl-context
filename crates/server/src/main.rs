@@ -5,13 +5,11 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
-
 use clap::Parser;
 use tracing::{error, info};
 
+use bsl_context_server::sources::build_symbol_source;
 use bsl_context_server::{config, http, mcp_server, pid_lock};
-use bsl_validator::SymbolSource;
 
 #[derive(Parser, Debug)]
 #[command(name = "bsl-context-rs", version, about = "MCP-сервер контекста платформы 1С")]
@@ -19,58 +17,6 @@ struct Cli {
     /// Путь к config.toml. Если не указан — используются дефолты.
     #[arg(short = 'c', long = "config", value_name = "PATH")]
     config: Option<PathBuf>,
-}
-
-/// Создать внешний источник имён по конфигу (`symbol_source.kind`). Ошибка
-/// создания НЕ валит сервер — предупреждение в лог, `validate_module`
-/// работает без источника (как раньше).
-fn build_symbol_source(cfg: &config::SymbolSourceConfig) -> Option<Arc<dyn SymbolSource>> {
-    match cfg.kind.as_str() {
-        "none" => None,
-        "lite" => {
-            let path = cfg.db_path.as_deref()?;
-            if !path.exists() {
-                tracing::warn!(
-                    path = %path.display(),
-                    "lite-индекса ещё нет — источник не подключён; вызовите инструмент rebuild_symbol_index"
-                );
-                return None;
-            }
-            match symbol_source::LiteSource::open(path) {
-                Ok(src) => Some(Arc::new(src) as Arc<dyn SymbolSource>),
-                Err(e) => {
-                    error!(error = %e, path = %path.display(), "не удалось открыть lite-index источник имён");
-                    None
-                }
-            }
-        }
-        "code_index_db" => {
-            let path = cfg.db_path.as_deref()?;
-            match symbol_source::CodeIndexDbSource::open(path) {
-                Ok(src) => Some(Arc::new(src) as Arc<dyn SymbolSource>),
-                Err(e) => {
-                    error!(error = %e, path = %path.display(), "не удалось открыть code-index источник имён");
-                    None
-                }
-            }
-        }
-        "code_index_mcp" => {
-            let url = cfg.url.clone()?;
-            let repo = cfg.code_index_repo_effective()?.to_string();
-            match symbol_source::CodeIndexMcpSource::new(url.clone(), repo.clone(), cfg.timeout_ms)
-            {
-                Ok(src) => Some(Arc::new(src) as Arc<dyn SymbolSource>),
-                Err(e) => {
-                    error!(error = %e, %url, %repo, "не удалось подключить MCP-источник имён code-index");
-                    None
-                }
-            }
-        }
-        other => {
-            error!(kind = other, "неизвестный symbol_source.kind — источник имён не создан");
-            None
-        }
-    }
 }
 
 #[tokio::main]
