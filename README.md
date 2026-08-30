@@ -33,7 +33,17 @@ module or an arbitrary fragment; via `tree-sitter-bsl` the server
 extracts `Процедура`/`Функция` declarations from the submitted text and does
 not treat their calls as typos of platform methods (for a fragment this set is
 simply empty); it also validates compiler/extension directive names. Returns
-findings with line, column, kind, and confidence:
+findings with line, column, kind, and confidence, plus a `tree_parsed` flag.
+
+`tree_parsed: false` means the text could not be parsed into a tree (binary
+file, language setup failure, parsing deadline) — tree-based checks did not run,
+so an empty finding list does NOT mean "no issues". Text-based checks
+(declarations, module structure, directives, query rules) always run.
+
+Pass `module_path` whenever the module path is known. Without it the validator
+cannot tell an object module from an arbitrary fragment and assumes there is no
+implicit object context: calls on attributes and tabular sections
+(`Товары.Очистить()`) then produce an `unknown_common_module` finding.
 
 | Finding kind | confidence | Meaning |
 |--------------|-----------|---------|
