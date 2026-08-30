@@ -259,6 +259,127 @@ pub(crate) fn check_config_objects(
     }
 }
 
+/// Проверка головы обращения `Имя.Член`, когда `Имя` не объявлено в модуле и не
+/// найдено в платформенном контексте, но написано похоже на настоящее свойство.
+///
+/// Типовой случай — имя коллекции в форме языка ЗАПРОСОВ: в запросе таблица
+/// называется `Справочник.Номенклатура`, а в коде менеджер зовётся
+/// `Справочники.Номенклатура`. Модель, только что писавшая текст запроса,
+/// переносит запросную форму в код; платформа такой модуль не компилирует, а
+/// валидатор молчал. Хуже того, неверная голова отключала и проверку имени
+/// объекта внутри цепочки: после `Справочник.` можно было подставить что угодно.
+///
+/// **Находка эмиттится только при сходстве с реальным свойством.** Голова, ни на
+/// что не похожая, пропускается молча — иначе находку получило бы каждое
+/// обращение к общему модулю конфигурации (`ОбщегоНазначения.Метод()`), чьи
+/// имена платформе неизвестны в принципе. Пороги — общие с
+/// `UnknownGlobalMethod` (`fuzzy_confidence_for`).
+///
+/// В отличие от [`check_config_objects`], правило НЕ требует внешнего источника
+/// имён: имена коллекций платформенные, а не конфигурационные, поэтому оно
+/// работает и при неподнятом источнике. Источник, если он есть, используется
+/// только чтобы не трогать законную голову — имя общего модуля конфигурации.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn check_global_property_heads(
+    index: &PlatformIndex,
+    src: &str,
+    facts: &AstFacts,
+    form_module: bool,
+    form_attributes: Option<&HashSet<String>>,
+    symbols: Option<&dyn SymbolSource>,
+    errors: &mut Vec<ExprError>,
+) {
+    // Состав реквизитов формы неизвестен — молчим совсем: реквизит с именем
+    // `Справочник` законен, а отличить его от опечатки нечем. Тот же приём, что
+    // в `check_config_objects`.
+    if form_module && form_attributes.is_none() {
+        return;
+    }
+
+    let bound = locally_bound_names(facts);
+    let managed_form = form_module && facts.has_directives;
+
+    for dot in &facts.dots {
+        let head_lower = dot.head.to_lowercase();
+
+        if bound.contains(&head_lower) {
+            continue;
+        }
+        if form_attributes.is_some_and(|a| a.contains(&head_lower)) {
+            continue;
+        }
+        // Мусор восстановления дерева после ошибки разбора — головой может
+        // оказаться число.
+        if !is_identifier_like(&dot.head) {
+            continue;
+        }
+        // Верная форма имени менеджера — своё правило (проверка имени объекта).
+        if collection_for_manager(&dot.head).is_some() {
+            continue;
+        }
+        if index.find_global_property(&dot.head).is_some() || index.find_type(&dot.head).is_some() {
+            continue;
+        }
+        if CONTEXT_HEADS.iter().any(|n| n.to_lowercase() == head_lower) {
+            continue;
+        }
+        if managed_form && form_type_has_member(index, &dot.head) {
+            continue;
+        }
+        // Имя общего модуля конфигурации — законная голова. Источник знает их
+        // поимённо; без источника защитой служит сама проверка на сходство.
+        if symbols.is_some_and(|s| s.object_exists("CommonModules", &head_lower) == Some(true)) {
+            continue;
+        }
+
+        let Some((suggestion, confidence)) = closest_global_property(index, &dot.head) else {
+            continue;
+        };
+        let (line, col) = pos_at(src, dot.head_byte);
+        errors.push(ExprError::new_with_confidence(
+            line,
+            col,
+            ExprErrorKind::UnknownGlobalProperty,
+            format!(
+                "'{}' не найдено в глобальном контексте платформы. \
+                 Возможно, вы имели в виду '{}'.",
+                dot.head, suggestion
+            ),
+            confidence,
+            Some(suggestion),
+            Vec::new(),
+        ));
+    }
+}
+
+/// Ближайшее по написанию свойство глобального контекста — но только когда это
+/// правдоподобная опечатка (двухпороговая эвристика `fuzzy_confidence_for`, та
+/// же, что у `UnknownGlobalMethod`).
+///
+/// Имена менеджеров объектов добавлены к списку явно: в справке платформы они
+/// есть как свойства глобального контекста, но таблица `MANAGER_COLLECTIONS` —
+/// источник истины именно для них, и зависеть здесь от полноты `hbk` не стоит.
+fn closest_global_property(index: &PlatformIndex, head: &str) -> Option<(String, Confidence)> {
+    let head_lc = head.to_lowercase();
+    let candidates = index
+        .global_properties
+        .iter()
+        .map(|p| p.name_ru.as_str())
+        .chain(MANAGER_COLLECTIONS.iter().map(|(name, _, _)| *name));
+
+    let mut best: Option<(String, usize)> = None;
+    for name in candidates {
+        let d = lev(&head_lc, &name.to_lowercase());
+        match &best {
+            Some((_, best_d)) if d >= *best_d => {}
+            _ => best = Some((name.to_string(), d)),
+        }
+    }
+    let (suggestion, distance) = best?;
+    let confidence = fuzzy_confidence_for(head, &suggestion, distance)?;
+    Some((suggestion, confidence))
+}
+
 /// Имена, связанные локально ГДЕ-ЛИБО в модуле: любое присваивание простому
 /// идентификатору (`Перем Х` — `declaration=true`, и обычное `Х = ...` —
 /// `declaration=false`, оно тоже связывает имя, даже без предшествующего
@@ -519,6 +640,106 @@ mod tests {
         .into_iter()
         .find(|p| p.exists())?;
         platform_index::load_from_hbk(&hbk).ok()
+    }
+
+    /// Находки правила про голову обращения на настоящей справке платформы.
+    /// Источник имён конфигурации НЕ подключён — правило обязано работать и так.
+    fn heads_findings(source: &str) -> Vec<crate::expression::ExprError> {
+        let Some(index) = real_index() else {
+            return Vec::new();
+        };
+        let result = crate::module::validate_module_at_level(&index, source, 1);
+        result
+            .errors
+            .into_iter()
+            .filter(|e| e.kind == ExprErrorKind::UnknownGlobalProperty)
+            .collect()
+    }
+
+    /// Имя коллекции в форме языка запросов: в коде менеджер называется во
+    /// множественном числе. Пять видов из ТЗ — на каждом находка с подсказкой.
+    /// `#[ignore]`: нужен `BSL_CONTEXT_PLATFORM_PATH`.
+    #[test]
+    #[ignore]
+    fn singular_manager_head_is_caught_with_suggestion() {
+        if real_index().is_none() {
+            eprintln!("skip: BSL_CONTEXT_PLATFORM_PATH не задан");
+            return;
+        }
+        let cases = [
+            ("Справочник.Номенклатура", "Справочники"),
+            ("Документ.РеализацияТоваровУслуг", "Документы"),
+            ("РегистрСведений.КурсыВалют", "РегистрыСведений"),
+            ("Перечисление.СтатусыДокументов", "Перечисления"),
+            ("РегистрНакопления.ТоварыОрганизаций", "РегистрыНакопления"),
+        ];
+        for (chain, expected) in cases {
+            let src = format!("Процедура Тест()\n\tП = {chain};\nКонецПроцедуры\n");
+            let found = heads_findings(&src);
+            assert_eq!(found.len(), 1, "ожидалась одна находка на '{chain}': {found:?}");
+            assert_eq!(found[0].suggestion.as_deref(), Some(expected), "подсказка на '{chain}'");
+            assert_eq!(found[0].confidence, Confidence::High, "уверенность на '{chain}'");
+        }
+    }
+
+    /// Верная форма находки не даёт — иначе правило ломает законный код.
+    #[test]
+    #[ignore]
+    fn plural_manager_head_is_silent() {
+        if real_index().is_none() {
+            eprintln!("skip: BSL_CONTEXT_PLATFORM_PATH не задан");
+            return;
+        }
+        for chain in ["Справочники.Номенклатура", "Документы.РеализацияТоваровУслуг"] {
+            let src = format!("Процедура Тест()\n\tП = {chain};\nКонецПроцедуры\n");
+            assert!(heads_findings(&src).is_empty(), "ложная находка на '{chain}'");
+        }
+    }
+
+    /// Голова, объявленная в самом модуле, законна: это обычная переменная.
+    #[test]
+    #[ignore]
+    fn declared_variable_head_is_silent() {
+        if real_index().is_none() {
+            eprintln!("skip: BSL_CONTEXT_PLATFORM_PATH не задан");
+            return;
+        }
+        let src = "Процедура Тест()\n\tСправочник = Справочники.Номенклатура;\n\t\
+                   П = Справочник.ПустаяСсылка();\nКонецПроцедуры\n";
+        assert!(heads_findings(src).is_empty(), "переменная не должна давать находку");
+    }
+
+    /// Обращение к общему модулю конфигурации не похоже ни на одно свойство
+    /// платформы — правило обязано молчать даже без источника имён. Это защита
+    /// от лавины: таких вызовов в типовом модуле десятки.
+    #[test]
+    #[ignore]
+    fn common_module_head_is_silent() {
+        if real_index().is_none() {
+            eprintln!("skip: BSL_CONTEXT_PLATFORM_PATH не задан");
+            return;
+        }
+        let src = "Процедура Тест()\n\t\
+                   ОбщегоНазначения.СообщитьПользователю(\"текст\");\n\t\
+                   ОбщегоНазначенияКлиентСервер.ПроверитьПараметр(1, 2);\n\
+                   КонецПроцедуры\n";
+        assert!(heads_findings(src).is_empty(), "вызов общего модуля не должен давать находку");
+    }
+
+    /// Внутри текста запроса `Справочник.Номенклатура` — ПРАВИЛЬНАЯ форма.
+    /// Разбор не должен заглядывать в строковый литерал, в том числе
+    /// многострочный с продолжением через `|`.
+    #[test]
+    #[ignore]
+    fn query_text_inside_string_is_silent() {
+        if real_index().is_none() {
+            eprintln!("skip: BSL_CONTEXT_PLATFORM_PATH не задан");
+            return;
+        }
+        let src = "Процедура Тест()\n\tЗапрос = Новый Запрос;\n\tЗапрос.Текст = \"\n\t\
+                   |ВЫБРАТЬ\n\t|\tТ.Ссылка\n\t|ИЗ\n\t|\tСправочник.Номенклатура КАК Т\";\n\
+                   КонецПроцедуры\n";
+        assert!(heads_findings(src).is_empty(), "текст запроса не должен давать находку");
     }
 
     /// КАЖДЫЙ префикс типа-менеджера из `MANAGER_COLLECTIONS` разрешается в тип
