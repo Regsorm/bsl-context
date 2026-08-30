@@ -15,15 +15,27 @@ pub struct HashIndex<T: Clone> {
 }
 
 impl<T: Clone> HashIndex<T> {
-    pub fn from_iter_with<I, K>(items: I, key: K) -> Self
+    /// `keys` отдаёт ОБА имени элемента — русское и английское. Индексируются
+    /// оба: платформа принимает `Сообщить` и `Message` наравне, и справочные
+    /// инструменты (`info`, `get_member`) обязаны отвечать одинаково на любое
+    /// из них. Русское имя приоритетно: английский омоним его не перетирает.
+    pub fn from_iter_with<I, K>(items: I, keys: K) -> Self
     where
         I: IntoIterator<Item = T>,
-        K: Fn(&T) -> &str,
+        K: Fn(&T) -> (&str, &str),
     {
         let mut inner = HashMap::new();
+        let mut aliases: Vec<(String, T)> = Vec::new();
         for it in items {
-            let k = key(&it).to_lowercase();
-            inner.insert(k, it);
+            let (ru, en) = keys(&it);
+            let (ru, en) = (ru.to_lowercase(), en.to_lowercase());
+            if !en.is_empty() && en != ru {
+                aliases.push((en, it.clone()));
+            }
+            inner.insert(ru, it);
+        }
+        for (en, it) in aliases {
+            inner.entry(en).or_insert(it);
         }
         Self { inner }
     }
@@ -48,15 +60,25 @@ pub struct StartWithIndex<T: Clone> {
 }
 
 impl<T: Clone> StartWithIndex<T> {
-    pub fn from_iter_with<I, K>(items: I, key: K) -> Self
+    /// Оба имени, как и в [`HashIndex::from_iter_with`]: набор `Мас` и `Arr`
+    /// должны одинаково приводить к типу `Массив`.
+    pub fn from_iter_with<I, K>(items: I, keys: K) -> Self
     where
         I: IntoIterator<Item = T>,
-        K: Fn(&T) -> &str,
+        K: Fn(&T) -> (&str, &str),
     {
         let mut inner = BTreeMap::new();
+        let mut aliases: Vec<(String, T)> = Vec::new();
         for it in items {
-            let k = key(&it).to_lowercase();
-            inner.insert(k, it);
+            let (ru, en) = keys(&it);
+            let (ru, en) = (ru.to_lowercase(), en.to_lowercase());
+            if !en.is_empty() && en != ru {
+                aliases.push((en, it.clone()));
+            }
+            inner.insert(ru, it);
+        }
+        for (en, it) in aliases {
+            inner.entry(en).or_insert(it);
         }
         Self { inner }
     }
@@ -93,25 +115,25 @@ pub struct SearchEngine {
 impl SearchEngine {
     pub fn from_index(index: &PlatformIndex) -> Self {
         let methods_hash = HashIndex::from_iter_with(index.global_methods.iter().cloned(), |m| {
-            m.name_ru.as_str()
+            (m.name_ru.as_str(), m.name_en.as_str())
         });
         let properties_hash =
             HashIndex::from_iter_with(index.global_properties.iter().cloned(), |p| {
-                p.name_ru.as_str()
+                (p.name_ru.as_str(), p.name_en.as_str())
             });
         let types_hash = HashIndex::from_iter_with(index.types.values().cloned(), |t| {
-            t.name_ru.as_str()
+            (t.name_ru.as_str(), t.name_en.as_str())
         });
         let methods_prefix =
             StartWithIndex::from_iter_with(index.global_methods.iter().cloned(), |m| {
-                m.name_ru.as_str()
+                (m.name_ru.as_str(), m.name_en.as_str())
             });
         let properties_prefix =
             StartWithIndex::from_iter_with(index.global_properties.iter().cloned(), |p| {
-                p.name_ru.as_str()
+                (p.name_ru.as_str(), p.name_en.as_str())
             });
         let types_prefix = StartWithIndex::from_iter_with(index.types.values().cloned(), |t| {
-            t.name_ru.as_str()
+            (t.name_ru.as_str(), t.name_en.as_str())
         });
         Self {
             methods_hash,
@@ -136,16 +158,20 @@ impl SearchEngine {
         self.types_hash.get(name)
     }
 
-    /// Найти член (метод/свойство) у типа по точному имени.
+    /// Найти член (метод/свойство) у типа по точному имени — русскому либо
+    /// английскому.
     pub fn find_type_member(&self, ty: &Type, name: &str) -> Option<Definition> {
         let key = name.to_lowercase();
-        if let Some(m) = ty.methods.iter().find(|m| m.name_ru.to_lowercase() == key) {
+        let matches = |ru: &str, en: &str| {
+            ru.to_lowercase() == key || (!en.is_empty() && en.to_lowercase() == key)
+        };
+        if let Some(m) = ty.methods.iter().find(|m| matches(&m.name_ru, &m.name_en)) {
             return Some(Definition::Method(m.clone()));
         }
         if let Some(p) = ty
             .properties
             .iter()
-            .find(|p| p.name_ru.to_lowercase() == key)
+            .find(|p| matches(&p.name_ru, &p.name_en))
         {
             return Some(Definition::Property(p.clone()));
         }

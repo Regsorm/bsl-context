@@ -16,6 +16,12 @@ pub struct PlatformIndex {
     pub global_properties: Vec<Property>,
     /// Ключ — `name_ru` в нижнем регистре. Тип-перечисление и обычный тип лежат вместе.
     pub types: HashMap<String, Type>,
+    /// `name_en` в нижнем регистре → ключ в `types`. Платформа принимает оба
+    /// написания (`Новый Массив` и `Новый Array`), и без этой карты английское
+    /// имя давало находку «тип не найден» на законном коде. Отдельная карта, а
+    /// не обход при промахе: `find_type` зовётся на каждое обращение, а типов
+    /// больше двух тысяч.
+    types_en: HashMap<String, String>,
     /// Ленивый кэш имён методов всех типов (см. `all_type_method_names`).
     /// Обход 2414 типов стоит десятки миллисекунд — на каждый вызов
     /// `validate_module` это заметно, а индекс после загрузки неизменен.
@@ -32,9 +38,15 @@ impl PlatformIndex {
         self.types.values().filter(|t| t.is_enum()).count()
     }
 
-    /// Точный поиск типа по русскому имени (регистронезависимо).
-    pub fn find_type(&self, name_ru: &str) -> Option<&Type> {
-        self.types.get(&name_ru.to_lowercase())
+    /// Точный поиск типа по имени (регистронезависимо).
+    ///
+    /// Сверяются ОБА имени — русское и английское, как в `find_global_method`:
+    /// платформа принимает и `Массив`, и `Array`.
+    pub fn find_type(&self, name: &str) -> Option<&Type> {
+        let key = name.to_lowercase();
+        self.types
+            .get(&key)
+            .or_else(|| self.types_en.get(&key).and_then(|ru| self.types.get(ru)))
     }
 
     /// Точный поиск глобального метода по имени (регистронезависимо).
@@ -51,12 +63,16 @@ impl PlatformIndex {
         })
     }
 
-    /// Точный поиск глобального свойства по русскому имени (регистронезависимо).
-    pub fn find_global_property(&self, name_ru: &str) -> Option<&Property> {
-        let key = name_ru.to_lowercase();
-        self.global_properties
-            .iter()
-            .find(|p| p.name_ru.to_lowercase() == key)
+    /// Точный поиск глобального свойства по имени (регистронезависимо).
+    ///
+    /// Оба имени, как и у метода: `Справочники` и `Catalogs` — одно и то же
+    /// свойство глобального контекста.
+    pub fn find_global_property(&self, name: &str) -> Option<&Property> {
+        let key = name.to_lowercase();
+        self.global_properties.iter().find(|p| {
+            p.name_ru.to_lowercase() == key
+                || (!p.name_en.is_empty() && p.name_en.to_lowercase() == key)
+        })
     }
 
     /// Имена (lowercase, русские и английские) ВСЕХ методов ВСЕХ типов платформы.
@@ -89,6 +105,9 @@ impl PlatformIndex {
     /// Вставка типа в storage. Перезаписывает по ключу `name_ru.lowercase()`.
     pub fn insert_type(&mut self, ty: Type) {
         let key = ty.name_ru.to_lowercase();
+        if !ty.name_en.is_empty() {
+            self.types_en.insert(ty.name_en.to_lowercase(), key.clone());
+        }
         self.types.insert(key, ty);
     }
 }

@@ -40,24 +40,76 @@ fn loads_real_platform_index() {
         index.enum_types_count(),
     );
 
+    // Границы — по реальным числам версии 8.3.27 (2414 типов, 500 методов,
+    // 100 свойств) с запасом вниз. Проверка «не пусто» пропускала бы потерю
+    // почти всего индекса: страницы справки выбрасываются молча, а у
+    // пользователя это оборачивается находкой «метод не найден» на законном
+    // вызове. Границы держат именно этот случай, а не точное число.
     assert!(
-        index.types.len() > 1000,
-        "ожидается > 1000 типов, получено {}",
+        index.types.len() >= 2000,
+        "ожидается ≥2000 типов, получено {}",
         index.types.len()
     );
     assert!(
-        index.enum_types_count() >= 30,
-        "ожидается ≥30 типов-перечислений, получено {}",
+        index.enum_types_count() >= 500,
+        "ожидается ≥500 типов-перечислений, получено {}",
         index.enum_types_count()
     );
     assert!(
-        !index.global_methods.is_empty(),
-        "global_methods не должен быть пуст"
+        index.global_methods.len() >= 400,
+        "ожидается ≥400 глобальных методов, получено {}",
+        index.global_methods.len()
     );
     assert!(
-        !index.global_properties.is_empty(),
-        "global_properties не должен быть пуст"
+        index.global_properties.len() >= 80,
+        "ожидается ≥80 глобальных свойств, получено {}",
+        index.global_properties.len()
     );
+
+    // Поимённо: опорные элементы, потеря которых означает разъехавшийся разбор.
+    for name in ["Сообщить", "СтрНайти", "ЗначениеЗаполнено"] {
+        assert!(
+            index.find_global_method(name).is_some(),
+            "глобальный метод '{name}' пропал из индекса"
+        );
+    }
+    for name in ["ТаблицаЗначений", "Массив", "Структура", "Запрос"] {
+        assert!(
+            index.find_type(name).is_some(),
+            "тип '{name}' пропал из индекса"
+        );
+    }
+    assert!(
+        index.find_global_property("Справочники").is_some(),
+        "свойство глобального контекста 'Справочники' пропало из индекса"
+    );
+}
+
+/// Платформа принимает и русское, и английское написание. Оба пути поиска —
+/// прямой по индексу и через `SearchEngine` (на нём стоят справочные
+/// инструменты `info`/`get_member`) — обязаны отвечать одинаково.
+#[test]
+fn english_names_resolve_in_both_lookup_paths() {
+    let Some(path) = hbk_path() else {
+        eprintln!("skip: hbk не найден");
+        return;
+    };
+    let index = load_from_hbk(&path).expect("PlatformIndex");
+    let engine = platform_index::SearchEngine::from_index(&index);
+
+    assert!(index.find_global_method("Message").is_some());
+    assert!(index.find_type("Array").is_some());
+    assert!(index.find_global_property("Catalogs").is_some());
+
+    assert!(
+        engine.find_method("Message").is_some(),
+        "info('Message') обязан находить тот же метод, что validate_method_call"
+    );
+    assert!(engine.find_type("Array").is_some());
+    assert!(engine.find_property("Catalogs").is_some());
+    // Русское имя не потеряно английским омонимом.
+    assert!(engine.find_type("Массив").is_some());
+    assert!(engine.find_method("Сообщить").is_some());
 }
 
 #[test]

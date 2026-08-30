@@ -148,7 +148,11 @@ impl TokenStream {
         let got = self
             .next()
             .ok_or_else(|| HbkError::TocParse(format!("{ctx}: не найден токен (конец данных)")))?;
-        if !got.starts_with('"') || !got.ends_with('"') {
+        // Длина проверяется первой: у токена ровно из одного символа `"` (его
+    // оставляет `tokenize`, когда данные оборвались на открывающей кавычке)
+    // обе проверки на кавычки истинны, и срез `[1..len-1]` паникует. Битый
+    // блок должен давать TocParse, как все прочие искажения формата здесь.
+    if got.len() < 2 || !got.starts_with('"') || !got.ends_with('"') {
             return Err(HbkError::TocParse(format!(
                 "{ctx}: ожидалась строка в кавычках, получено '{got}'"
             )));

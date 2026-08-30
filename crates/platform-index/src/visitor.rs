@@ -97,13 +97,30 @@ pub fn collect_root_pages(pages: &[Page]) -> RootPages<'_> {
     }
 }
 
-/// Прочитать html-страницу через `HbkContent`. Возвращает пустую строку при
-/// ошибке (страница может отсутствовать или быть «каталогом» без html).
+/// Прочитать html-страницу через `HbkContent`. `None` — страницы нет (узел
+/// TOC бывает «каталогом» без html), это штатный случай и он молчит.
+///
+/// А вот НАСТОЯЩИЙ отказ чтения (текст не в UTF-8, битый deflate, ошибка
+/// ввода-вывода) раньше тоже сворачивался в `None` тем же `.ok()`. Такой
+/// пропуск незаметен: индекс собирается, `load_from_hbk` возвращает `Ok`, а у
+/// пользователя недостающий метод оборачивается находкой «метод не найден в
+/// платформенном контексте» на законном вызове. Теперь он попадает в журнал.
 fn try_read_html(content: &mut HbkContent, html_path: &str) -> Option<String> {
     if html_path.is_empty() {
         return None;
     }
-    content.get_entry_text(html_path).ok()
+    match content.get_entry_text(html_path) {
+        Ok(text) => Some(text),
+        Err(hbk_reader::HbkError::HtmlEntryNotFound(_)) => None,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                page = html_path,
+                "страница справки не прочитана — её содержимое в индекс не попадёт"
+            );
+            None
+        }
+    }
 }
 
 /// Распарсить страницу системного перечисления + значения из её детей `/properties/`.
