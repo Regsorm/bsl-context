@@ -134,6 +134,99 @@ fn directive_typo_flagged() {
     assert_eq!(err.confidence, Confidence::High);
 }
 
+/// Аннотация `// @type` относится к ПЕРВОМУ присваиванию после неё и не
+/// перебивает честный вывод по `Новый ТипX` у следующих. До правки она
+/// цеплялась ко всем присваиваниям в окне 200 байт, и `МойЗапрос` получал тип
+/// «Массив» → ложная находка «у типа Массив нет члена Выполнить».
+#[test]
+fn type_annotation_binds_only_to_next_assignment() {
+    let Some(path) = hbk_path() else { return };
+    let index = load_from_hbk(&path).expect("PlatformIndex");
+
+    let src = "\
+Функция ПолучитьДанные() Экспорт
+\t// @type Массив
+\tСписок = ПолучитьСписок();
+\tМойЗапрос = Новый Запрос;
+\tВозврат МойЗапрос.Выполнить();
+КонецФункции
+";
+    let result = bsl_validator::validate_module_at_level(&index, src, 3);
+    println!("{result:#?}");
+    assert!(
+        !result
+            .errors
+            .iter()
+            .any(|e| e.message.contains("Массив") && e.message.contains("Выполнить")),
+        "аннотация не должна распространяться на следующее присваивание: {:#?}",
+        result.errors
+    );
+}
+
+/// Выбор аннотации детерминирован: из двух подходящих берётся ближайшая, а не
+/// произвольная по обходу `HashMap`. Один и тот же текст обязан давать один и
+/// тот же результат от прогона к прогону.
+#[test]
+fn nearest_type_annotation_wins_deterministically() {
+    let Some(path) = hbk_path() else { return };
+    let index = load_from_hbk(&path).expect("PlatformIndex");
+
+    // Второй тип — с фиксированным составом членов: у `Структура` свойства
+    // произвольные, и проверка членов по ней намеренно молчит.
+    let src = "\
+Процедура Тест()
+\t// @type Структура
+\tА = Получить();
+\t// @type Массив
+\tБ = Получить();
+\tБ.НетТакогоЧлена();
+КонецПроцедуры
+";
+    let first = validate_module_at_level_messages(&index, src);
+    for _ in 0..5 {
+        assert_eq!(
+            first,
+            validate_module_at_level_messages(&index, src),
+            "набор находок обязан быть воспроизводимым"
+        );
+    }
+    assert!(
+        first.iter().any(|m| m.contains("Массив")),
+        "для Б должна выбираться ближайшая аннотация (Массив): {first:?}"
+    );
+}
+
+fn validate_module_at_level_messages(
+    index: &platform_index::PlatformIndex,
+    src: &str,
+) -> Vec<String> {
+    bsl_validator::validate_module_at_level(index, src, 3)
+        .errors
+        .into_iter()
+        .map(|e| e.message)
+        .collect()
+}
+
+/// Ключевое слово отделяется от имени любым пробельным символом: `Функция\t\tИмя()`
+/// — законное объявление, и проверки по объявлениям обязаны его видеть.
+#[test]
+fn declaration_with_tab_after_keyword_is_seen() {
+    let Some(path) = hbk_path() else { return };
+    let index = load_from_hbk(&path).expect("PlatformIndex");
+
+    let src = "Функция\t\tДубль()\nКонецФункции\nФункция\tДубль()\nКонецФункции\n";
+    let result = validate_module(&index, src);
+    println!("{result:#?}");
+    assert!(
+        result
+            .errors
+            .iter()
+            .any(|e| e.kind == ExprErrorKind::DuplicateDeclaration),
+        "дубль объявления с табуляцией обязан находиться: {:#?}",
+        result.errors
+    );
+}
+
 #[test]
 fn override_directive_ok() {
     let Some(path) = hbk_path() else { return };

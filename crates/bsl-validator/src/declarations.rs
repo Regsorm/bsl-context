@@ -329,9 +329,20 @@ pub(crate) fn scan_declarations_with_pos(cleaned: &str) -> Vec<DeclFact> {
         let trimmed = &full[async_len..];
         let lower = &full_lower[async_len..];
 
-        let kw_len = ["процедура ", "функция ", "procedure ", "function "]
+        // Ключевое слово отделяется от имени ЛЮБЫМ пробельным символом, а не
+        // обязательно пробелом: `Функция\t\tИмя()` — законное объявление, оно
+        // встречается во внешних обработках. Требование литерального пробела
+        // делало такие заголовки невидимыми для проверок целиком (ни дубль
+        // имени, ни зарезервированное имя не находились).
+        let kw_len = ["процедура", "функция", "procedure", "function"]
             .iter()
-            .find(|kw| lower.starts_with(**kw))
+            .find(|kw| {
+                lower.starts_with(**kw)
+                    && lower[kw.len()..]
+                        .chars()
+                        .next()
+                        .is_some_and(char::is_whitespace)
+            })
             .map(|kw| kw.len());
 
         if let Some(kw_len) = kw_len {

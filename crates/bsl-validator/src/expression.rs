@@ -36,6 +36,15 @@ use crate::symbols::SymbolSource;
 #[derive(Debug, Clone, Serialize)]
 pub struct ExpressionValidation {
     pub valid: bool,
+    /// Удалось ли разобрать текст в дерево. `false` — все проверки поверх
+    /// дерева (типы, вызовы, обращения к объектам конфигурации) не выполнялись:
+    /// двоичный файл, сбой языка, истёкший дедлайн разбора. Текстовые проверки
+    /// (объявления, структура модуля, директивы, правила запросов) при этом
+    /// отрабатывают, поэтому находки быть могут.
+    ///
+    /// Поле обязано быть в ответе: без него `valid: true` на неразобранном
+    /// модуле читается как «замечаний нет», хотя проверка не проводилась.
+    pub tree_parsed: bool,
     pub errors: Vec<ExprError>,
 }
 
@@ -341,6 +350,7 @@ pub fn validate_expression_at_level(
 
     ExpressionValidation {
         valid: errors.is_empty(),
+        tree_parsed: facts.parsed,
         errors,
     }
 }
@@ -589,6 +599,18 @@ pub(crate) fn check_global_calls(
             if type_methods.contains(&call.name.to_lowercase()) {
                 continue;
             }
+            // Внешний источник имён проверяем ДО fuzzy. Имя, законно видимое
+            // отсюда (экспорт глобального общего модуля, метод модуля
+            // объекта-владельца), иначе превращается в «опечатку платформенного
+            // метода»: `ОткрытьЗначения()` владельца отстоит на одну правку от
+            // платформенного `ОткрытьЗначение` и даёт High на законном вызове.
+            // Собственный whitelist модуля так и проверяется — выше по циклу.
+            let lc = call.name.to_lowercase();
+            let visible_via_symbols = owner_exports.map(|s| s.contains(&lc)).unwrap_or(false)
+                || symbols.map(|s| s.is_global_export(&lc)).unwrap_or(false);
+            if visible_via_symbols {
+                continue;
+            }
             // Неизвестный глобальный вызов: пробуем fuzzy к платформенным.
             // Строгого совпадения нет — либо это опечатка платформенного метода,
             // либо процедура общего модуля/БСП (валидатор её не видит). Различаем
@@ -620,13 +642,8 @@ pub(crate) fn check_global_calls(
                 // процедуры зовутся без префикса, валидатор их не видит и даст
                 // здесь false-positive. Внешний источник имён (`symbols`) закрывает
                 // этот случай и ещё один — метод модуля объекта-владельца
-                // (`owner_exports`) для модуля обычной формы внешней обработки.
-                let lc = call.name.to_lowercase();
-                let is_owner_export = owner_exports.map(|s| s.contains(&lc)).unwrap_or(false);
-                let is_global_export = symbols.map(|s| s.is_global_export(&lc)).unwrap_or(false);
-                if is_owner_export || is_global_export {
-                    // Не описка: метод виден отсюда через внешний источник.
-                } else if symbols.map(|s| s.method_exists(&lc)).unwrap_or(false) {
+                // (`owner_exports`); оба уже отсеяны выше, до fuzzy.
+                if symbols.map(|s| s.method_exists(&lc)).unwrap_or(false) {
                     // Имя объявлено где-то в конфигурации, но отсюда может быть
                     // не видно по правилам видимости — находка остаётся, но
                     // с пониженной уверенностью.

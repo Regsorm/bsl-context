@@ -178,6 +178,7 @@ fn validate_module_at_level_inner(
 
     ExpressionValidation {
         valid: errors.is_empty(),
+        tree_parsed: facts.parsed,
         errors,
     }
 }

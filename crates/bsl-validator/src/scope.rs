@@ -171,6 +171,14 @@ fn build_scope(
 ) -> Scope {
     let mut vars: HashMap<String, String> = HashMap::new();
 
+    // Абсолютные смещения ВСЕХ присваиваний тела: по ним видно, израсходована
+    // ли аннотация. Без этого `// @type` цеплялась к каждому присваиванию в
+    // окне 200 байт и перебивала честный вывод по `Новый ТипX`.
+    let assign_starts: Vec<usize> = assign_re()
+        .captures_iter(body)
+        .map(|cap| byte_start + cap.name("lhs").unwrap().start())
+        .collect();
+
     for cap in assign_re().captures_iter(body) {
         let lhs_match = cap.name("lhs").unwrap();
         let rhs_match = cap.name("rhs").unwrap();
@@ -179,17 +187,27 @@ fn build_scope(
 
         let abs_start = byte_start + lhs_match.start();
 
-        // 1. Проверить аннотацию: ищем последнюю аннотацию, чей end_of_line <= abs_start
-        // и абсолютная разница не больше ~200 байт (примерно 4 строки).
-        let mut typ: Option<String> = None;
-        for (&annot_end, annot_ty) in annotations {
-            if annot_end <= abs_start && abs_start.saturating_sub(annot_end) <= 200 {
-                // Используем последнюю
-                if typ.is_none() {
-                    typ = Some(annot_ty.clone());
-                }
-            }
-        }
+        // 1. Проверить аннотацию: берём БЛИЖАЙШУЮ к присваиванию (наибольший
+        // end_of_line) в пределах ~200 байт (примерно 4 строки) — и только ту,
+        // между которой и этим присваиванием нет другого присваивания.
+        //
+        // Оба условия существенны. Без выбора по максимуму порядок обхода
+        // `HashMap` произволен, и из двух подходящих аннотаций бралась
+        // случайная — набор находок менялся от запуска к запуску. Без проверки
+        // «первое присваивание после аннотации» она цеплялась ко всем
+        // последующим в окне и перебивала вывод по `Новый ТипX`.
+        let mut typ: Option<String> = annotations
+            .iter()
+            .filter(|(&annot_end, _)| {
+                annot_end <= abs_start && abs_start.saturating_sub(annot_end) <= 200
+            })
+            .filter(|(&annot_end, _)| {
+                !assign_starts
+                    .iter()
+                    .any(|&other| other >= annot_end && other < abs_start)
+            })
+            .max_by_key(|(&annot_end, _)| annot_end)
+            .map(|(_, annot_ty)| annot_ty.clone());
 
         // 2. Если аннотации нет — пробуем извлечь из RHS.
         if typ.is_none() {
