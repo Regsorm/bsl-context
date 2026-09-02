@@ -52,7 +52,7 @@ implicit object context: calls on attributes and tabular sections
 
 | Finding kind | confidence | Meaning |
 |--------------|-----------|---------|
-| `unknown_enum_value` | high | System enumeration value does not exist |
+| `unknown_enum_value` | high | System enumeration value does not exist. Open collections (`ЦветаСтиля`, `БиблиотекаКартинок` — the configuration adds its own values) are not checked |
 | `wrong_argument_count` | high | Global function argument count outside its overloads |
 | `unknown_type_member` | low | Platform type has no such method/property |
 | `unknown_new_type` | low | `Новый TypeX` constructor unknown to the platform |
@@ -369,7 +369,7 @@ Transport — Streamable HTTP at `http://127.0.0.1:8007/mcp` (stateless).
 | `get_members` | All members of a type (methods + properties + enum values) |
 | `get_constructors` | A type's constructors with signatures |
 | `get_enum_values` | Values of a system enumeration |
-| `validate_enum` | Validate an enumeration value |
+| `validate_enum` | Validate an enumeration value. For an open collection (`open_collection: true`) a value missing from the help is not rejected |
 | `validate_method_call` | Validate a global function's argument count |
 | `validate_module` | Validate BSL code (whole module or fragment) against the platform |
 | `rebuild_symbol_index` | Rebuild the own name index (`kind = "lite"`); paths come from the config |
