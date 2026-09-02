@@ -170,6 +170,51 @@ async fn validate_enum_accepts_valid_value() {
 }
 
 #[tokio::test]
+async fn validate_enum_accepts_value_with_english_synonym() {
+    // Issue #2: `Windows_x86 (Windows_x86)` в справке — синоним с `_` не
+    // отрезался, и значение объявлялось несуществующим.
+    let Some(srv) = make_server().await else { return };
+    for (ty, val) in [
+        ("ТипПлатформы", "Windows_x86"),
+        ("ВариантИнтерфейсаКлиентскогоПриложения", "Версия8_2"),
+    ] {
+        let json = srv
+            .validate_enum(Parameters(ValidateEnumParams {
+                type_name: ty.into(),
+                value_name: val.into(),
+            }))
+            .await;
+        println!("--- validate_enum({ty}.{val}) ---\n{json}");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["valid"], true, "{ty}.{val}");
+        let all: Vec<&str> = v["all_valid_values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_str().unwrap())
+            .collect();
+        assert!(all.contains(&val), "имя без синонима в списке: {all:?}");
+    }
+}
+
+#[tokio::test]
+async fn validate_enum_open_collection_is_not_rejected() {
+    // Issue #2: `ЦветаСтиля` / `БиблиотекаКартинок` пополняет конфигурация.
+    let Some(srv) = make_server().await else { return };
+    for ty in ["ЦветаСтиля", "БиблиотекаКартинок"] {
+        let json = srv
+            .validate_enum(Parameters(ValidateEnumParams {
+                type_name: ty.into(),
+                value_name: "ПрикладноеЗначениеТест".into(),
+            }))
+            .await;
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["open_collection"], true, "{ty}");
+        assert_eq!(v["valid"], true, "{ty}");
+    }
+}
+
+#[tokio::test]
 async fn validate_method_call_rejects_extra_argument() {
     let Some(srv) = make_server().await else { return };
     // У 'СтрНайти' максимум 5 аргументов (Строка, Подстрока, НаправлениеПоиска,

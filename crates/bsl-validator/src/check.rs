@@ -44,6 +44,10 @@ pub struct EnumValidation {
     pub all_valid_values: Vec<String>,
     /// Топ-5 ближайших по Левенштейну значений (только при `valid=false`).
     pub similar: Vec<SimilarValue>,
+    /// `true` — тип является открытой коллекцией (`ЦветаСтиля`,
+    /// `БиблиотекаКартинок`): значения добавляет конфигурация, и отсутствие
+    /// в списке справки не означает ошибку.
+    pub open_collection: bool,
     /// Удобочитаемый текст. Включается всегда (и при ok, и при ошибке).
     pub message: String,
 }
@@ -67,6 +71,7 @@ pub fn validate_enum(index: &PlatformIndex, type_name: &str, value_name: &str) -
             value_name: value_name.to_string(),
             all_valid_values: Vec::new(),
             similar: Vec::new(),
+            open_collection: false,
             message: format!("❌ Тип '{type_name}' не найден в платформенном контексте."),
         };
     };
@@ -77,6 +82,7 @@ pub fn validate_enum(index: &PlatformIndex, type_name: &str, value_name: &str) -
             value_name: value_name.to_string(),
             all_valid_values: Vec::new(),
             similar: Vec::new(),
+            open_collection: false,
             message: format!("❌ Тип '{}' не является системным перечислением.", ty.name_ru),
         };
     }
@@ -88,6 +94,7 @@ pub fn validate_enum(index: &PlatformIndex, type_name: &str, value_name: &str) -
         .any(|v| v.name_ru.to_lowercase() == value_lower || v.name_en.to_lowercase() == value_lower);
 
     let all_valid_values: Vec<String> = ty.enum_values.iter().map(|v| v.name_ru.clone()).collect();
+    let open_collection = ty.is_open_enum();
 
     if valid {
         EnumValidation {
@@ -96,8 +103,24 @@ pub fn validate_enum(index: &PlatformIndex, type_name: &str, value_name: &str) -
             value_name: value_name.to_string(),
             all_valid_values,
             similar: Vec::new(),
+            open_collection,
             message: format!(
                 "✅ Значение '{}' допустимо для типа '{}'.",
+                value_name, ty.name_ru
+            ),
+        }
+    } else if open_collection {
+        // Значение не из справки, но тип открытый: его могла добавить
+        // конфигурация. Отвергнуть по справке платформы нельзя.
+        EnumValidation {
+            valid: true,
+            type_name: ty.name_ru.clone(),
+            value_name: value_name.to_string(),
+            all_valid_values,
+            similar: Vec::new(),
+            open_collection,
+            message: format!(
+                "ℹ️ Значение '{}' в справке платформы не найдено, но тип '{}' — открытая коллекция: значения добавляет конфигурация. Проверьте имя по конфигурации.",
                 value_name, ty.name_ru
             ),
         }
@@ -113,6 +136,7 @@ pub fn validate_enum(index: &PlatformIndex, type_name: &str, value_name: &str) -
             value_name: value_name.to_string(),
             all_valid_values,
             similar,
+            open_collection,
             message: format!(
                 "❌ Значение '{}' не существует у типа '{}'.{}",
                 value_name, ty.name_ru, suggestion
@@ -353,6 +377,25 @@ mod tests {
         ];
         let top = top_similar("перенос", &values, 3);
         assert_eq!(top[0].name, "Переносить");
+    }
+
+    #[test]
+    fn open_collection_unknown_value_is_not_rejected() {
+        use platform_index::{PlatformIndex, Type};
+        let mut idx = PlatformIndex::new();
+        idx.insert_type(Type {
+            name_ru: "КартинкиТест".into(),
+            name_en: String::new(),
+            description: String::new(),
+            methods: Vec::new(),
+            properties: Vec::new(),
+            constructors: Vec::new(),
+            enum_values: vec![enum_v("<Имя картинки>"), enum_v("Лупа")],
+        });
+        let r = validate_enum(&idx, "КартинкиТест", "МояКартинка");
+        assert!(r.valid, "открытую коллекцию по справке не отвергаем");
+        assert!(r.open_collection);
+        assert!(validate_enum(&idx, "КартинкиТест", "Лупа").valid);
     }
 
     #[test]

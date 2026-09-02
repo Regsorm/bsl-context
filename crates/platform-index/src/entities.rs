@@ -80,6 +80,14 @@ impl Type {
         !self.enum_values.is_empty()
     }
 
+    /// Открытая коллекция: значения добавляет конфигурация (`ЦветаСтиля`,
+    /// `БиблиотекаКартинок`). Признак — псевдо-значение вида `<Имя картинки>`
+    /// в списке значений справки. Проверка по фиксированному списку для
+    /// такого типа неполна.
+    pub fn is_open_enum(&self) -> bool {
+        self.enum_values.iter().any(|v| v.name_ru.starts_with('<'))
+    }
+
     pub fn has_methods(&self) -> bool {
         !self.methods.is_empty()
     }

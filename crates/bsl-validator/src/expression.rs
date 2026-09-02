@@ -453,6 +453,13 @@ pub(crate) fn check_type_dot_members(
         };
 
         if ty.is_enum() {
+            if ty.is_open_enum() {
+                // Открытая коллекция (`ЦветаСтиля`, `БиблиотекаКартинок`):
+                // значения добавляет конфигурация, справка платформы их не
+                // знает. Проверка дала бы high-находку на каждый прикладной
+                // цвет или картинку (issue #2) — пропускаем.
+                continue;
+            }
             // Проверяем что member — одно из enum_values (ru/en).
             let m_lower = member.to_lowercase();
             let exists = ty
@@ -1098,7 +1105,38 @@ mod tests {
             enum_values: Vec::new(),
         });
 
+        // Открытая коллекция: первым значением — псевдо-элемент `<...>`.
+        index.insert_type(Type {
+            name_ru: "КартинкиТест".into(),
+            name_en: "PicturesTest".into(),
+            description: String::new(),
+            methods: Vec::new(),
+            properties: Vec::new(),
+            constructors: Vec::new(),
+            enum_values: vec![
+                EnumValue {
+                    name_ru: "<Имя картинки>".into(),
+                    name_en: String::new(),
+                    description: String::new(),
+                },
+                EnumValue {
+                    name_ru: "Лупа".into(),
+                    name_en: "Magnifier".into(),
+                    description: String::new(),
+                },
+            ],
+        });
+
         index
+    }
+
+    #[test]
+    fn open_collection_value_is_not_reported() {
+        let index = test_index();
+        // Значение из конфигурации: в справке его нет, но тип открытый.
+        let src = "А = КартинкиТест.МояКартинка;";
+        let result = validate_expression_with_profile(&index, src, 1, Profile::Full);
+        assert!(result.valid, "открытая коллекция не даёт находок: {:?}", result.errors);
     }
 
     #[test]

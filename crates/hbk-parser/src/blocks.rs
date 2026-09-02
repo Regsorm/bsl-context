@@ -19,10 +19,15 @@ fn split_dual_name(text: &str) -> (String, String) {
                 if !en.is_empty() && !en.contains(' ') || (en.contains(' ') && en.is_ascii()) {
                     // Если содержимое скобок похоже на английское имя (только латиница/пробелы) —
                     // считаем парой ru/en. Иначе — оставляем всё имя как ru.
-                    if en
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c.is_ascii_whitespace() || c == '.')
-                    {
+                    // Подчёркивание — законная часть английского имени
+                    // (`Windows_x86`, `Version8_2`); без него такие значения
+                    // оставались с синонимом в скобках прямо в `name_ru`.
+                    if en.chars().all(|c| {
+                        c.is_ascii_alphanumeric()
+                            || c.is_ascii_whitespace()
+                            || c == '.'
+                            || c == '_'
+                    }) {
                         return (ru, en);
                     }
                 }
@@ -222,4 +227,30 @@ fn parse_parameter_header(text: &str) -> (String, bool) {
 /// Синтаксис метода/конструктора (`Синтаксис:`) — текст без html.
 pub fn parse_syntax(body_html: &str) -> String {
     extract_text(body_html)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_dual_name;
+
+    #[test]
+    fn dual_name_with_underscore_is_split() {
+        assert_eq!(
+            split_dual_name("Windows_x86 (Windows_x86)"),
+            ("Windows_x86".to_string(), "Windows_x86".to_string())
+        );
+        assert_eq!(
+            split_dual_name("Версия8_2 (Version8_2)"),
+            ("Версия8_2".to_string(), "Version8_2".to_string())
+        );
+    }
+
+    #[test]
+    fn pseudo_value_in_angle_brackets_stays_whole() {
+        // `<Имя картинки> (<Icon name>)` — не пара имён, а описание открытой
+        // коллекции; оставляем целиком, чтобы признак `<` сохранился.
+        let (ru, en) = split_dual_name("<Имя картинки> (<Icon name>)");
+        assert!(ru.starts_with('<'));
+        assert!(en.is_empty());
+    }
 }

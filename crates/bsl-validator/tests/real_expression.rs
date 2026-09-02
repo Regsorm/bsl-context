@@ -40,6 +40,25 @@ fn canonical_638_enum_typo() {
 }
 
 #[test]
+fn issue2_no_false_unknown_enum_value() {
+    // Синоним с `_` в справке и открытые коллекции не дают находок.
+    let Some(path) = hbk_path() else { return };
+    let index = load_from_hbk(&path).expect("PlatformIndex");
+
+    let src = "Если ТипПлатформы.Windows_x86 = Х Тогда\n\
+               Цвет = ЦветаСтиля.ЦветМоегоОтчета;\n\
+               Картинка = БиблиотекаКартинок.МояПрикладнаяКартинка;\n\
+               КонецЕсли;";
+    let result = validate_expression(&index, src);
+    println!("{result:#?}");
+    assert!(
+        !result.errors.iter().any(|e| e.kind == ExprErrorKind::UnknownEnumValue),
+        "ложных unknown_enum_value быть не должно: {:?}",
+        result.errors
+    );
+}
+
+#[test]
 fn extra_argument_to_global_method() {
     let Some(path) = hbk_path() else { return };
     let index = load_from_hbk(&path).expect("PlatformIndex");
