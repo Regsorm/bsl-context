@@ -159,7 +159,12 @@ fn init_tracing(cfg: &config::Config) {
         );
     }
 
-    let file_appender = tracing_appender::rolling::daily(&cfg.log_dir, "service.log");
+    let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("service")
+        .filename_suffix("log")
+        .build(&cfg.log_dir)
+        .expect("failed to initialize rolling file appender");
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(&cfg.log_level));
 
