@@ -36,6 +36,9 @@ clap = { workspace = true }
 chrono = { workspace = true }
 sysinfo = "0.32"
 
+[build-dependencies]
+winresource = { version = "0.1.31", default-features = false }
+
 [dev-dependencies]
 # Обход корпуса в регресс-тесте `corpus_config_objects` (только тесты).
 walkdir = { workspace = true }
