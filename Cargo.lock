@@ -213,7 +213,7 @@ dependencies = [
 
 [[package]]
 name = "bsl-context-server"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -243,7 +243,7 @@ dependencies = [
 
 [[package]]
 name = "bsl-parse"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "tree-sitter",
  "tree-sitter-bsl",
@@ -251,7 +251,7 @@ dependencies = [
 
 [[package]]
 name = "bsl-validator"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "anyhow",
  "bsl-parse",
@@ -922,7 +922,7 @@ dependencies = [
 
 [[package]]
 name = "hbk-parser"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "anyhow",
  "ego-tree",
@@ -937,7 +937,7 @@ dependencies = [
 
 [[package]]
 name = "hbk-reader"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -1287,7 +1287,7 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "lite-index"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "anyhow",
  "bsl-parse",
@@ -1581,7 +1581,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
 name = "platform-index"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "anyhow",
  "hbk-parser",
@@ -1963,7 +1963,7 @@ dependencies = [
 
 [[package]]
 name = "sdbl-parse"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "bsl-parse",
 ]
@@ -2223,7 +2223,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "symbol-source"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "anyhow",
  "bsl-validator",
