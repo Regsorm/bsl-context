@@ -5,6 +5,13 @@ name: release
 #   - push тега vX.Y.Z — автоматическая сборка для будущих релизов;
 #   - ручной запуск (workflow_dispatch) с указанием тега — чтобы добрать
 #     артефакты к уже существующему релизу.
+#
+# Имена архивов — человекочитаемые, по образцу code-index: `<продукт>-<ос>-<арх>`
+# (`bsl-context-windows-x64.zip`, `bsl-context-linux-x64-musl.tar.gz`). Версии в
+# имени нет — она видна в теге и заголовке релиза; тройки цели Rust в имя не
+# попадают намеренно (`x86_64-unknown-linux-musl` читается только сборщиком).
+# Внутри архива — каталог с тем же именем: бинарник плюс README, CHANGELOG,
+# LICENSE и пример конфига.
 on:
   push:
     tags:
@@ -46,29 +53,31 @@ jobs:
           fi
 
   build:
-    name: ${{ matrix.target }}
+    name: ${{ matrix.archive }}
     needs: create-release   # релиз уже существует — сборкам остаётся только долить архивы
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false   # одна упавшая цель не отменяет остальные
       matrix:
         include:
+          # `archive` — готовое имя файла в релизе; каталог внутри архива — то же
+          # имя без расширения. `target` — цель сборки Rust, в имя не попадает.
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             ext: .exe
-            archive: zip
+            archive: bsl-context-windows-x64.zip
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             ext: ''
-            archive: tar.gz
+            archive: bsl-context-linux-x64.tar.gz
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             ext: ''
-            archive: tar.gz
+            archive: bsl-context-linux-x64-musl.tar.gz
           - os: macos-14          # Apple Silicon (покрывает Mac 2020+)
             target: aarch64-apple-darwin
             ext: ''
-            archive: tar.gz
+            archive: bsl-context-macos-arm64.tar.gz
 
     steps:
       - name: Определить тег
@@ -98,24 +107,26 @@ jobs:
         shell: bash
         run: |
           BIN="bsl-context-rs${{ matrix.ext }}"
-          DIST="bsl-context-${{ steps.tag.outputs.tag }}-${{ matrix.target }}"
+          ARCHIVE="${{ matrix.archive }}"
+          DIST="${ARCHIVE%.tar.gz}"
           mkdir "$DIST"
           cp "target/${{ matrix.target }}/release/$BIN" "$DIST/"
           cp README.md README_RU.md LICENSE CHANGELOG.md configs/config.toml.example "$DIST/"
-          tar czf "$DIST.tar.gz" "$DIST"
-          echo "ASSET=$DIST.tar.gz" >> "$GITHUB_ENV"
+          tar czf "$ARCHIVE" "$DIST"
+          echo "ASSET=$ARCHIVE" >> "$GITHUB_ENV"
 
       - name: Упаковка (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $bin = "bsl-context-rs${{ matrix.ext }}"
-          $dist = "bsl-context-${{ steps.tag.outputs.tag }}-${{ matrix.target }}"
+          $archive = "${{ matrix.archive }}"
+          $dist = $archive -replace '\.zip$', ''
           New-Item -ItemType Directory -Path $dist | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/$bin" $dist
           Copy-Item README.md,README_RU.md,LICENSE,CHANGELOG.md,configs/config.toml.example $dist
-          Compress-Archive -Path $dist -DestinationPath "$dist.zip"
-          "ASSET=$dist.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Compress-Archive -Path $dist -DestinationPath $archive
+          "ASSET=$archive" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       # Только заливка: релиз создан отдельной работой выше. Никакая сборка больше не
       # создаёт релиз сама, поэтому гонки за тег не возникает. --clobber делает шаг
