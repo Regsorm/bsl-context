@@ -1285,6 +1285,7 @@ mod tests {
                     },
                 ],
             }],
+            note: None,
         });
         let src = "Текст = НСтр(\"ru = 'Неверный тип запроса.'\");";
         let res = validate_expression_at_level(&index, src, 1);
@@ -1409,7 +1410,9 @@ mod tests {
                 name_ru: "Красный".into(),
                 name_en: "Red".into(),
                 description: String::new(),
+                note: None,
             }],
+            note: None,
         });
 
         index.insert_type(Type {
@@ -1422,10 +1425,12 @@ mod tests {
                 description: String::new(),
                 return_type: String::new(),
                 signatures: Vec::new(),
+                note: None,
             }],
             properties: Vec::new(),
             constructors: Vec::new(),
             enum_values: Vec::new(),
+            note: None,
         });
 
         // Открытая коллекция: первым значением — псевдо-элемент `<...>`.
@@ -1441,13 +1446,16 @@ mod tests {
                     name_ru: "<Имя картинки>".into(),
                     name_en: String::new(),
                     description: String::new(),
+                    note: None,
                 },
                 EnumValue {
                     name_ru: "Лупа".into(),
                     name_en: "Magnifier".into(),
                     description: String::new(),
+                    note: None,
                 },
             ],
+            note: None,
         });
 
         // Issue #31: `XBase` — свойства это поля конкретного DBF-файла (динамические),
@@ -1462,10 +1470,12 @@ mod tests {
                 description: String::new(),
                 return_type: String::new(),
                 signatures: Vec::new(),
+                note: None,
             }],
             properties: Vec::new(),
             constructors: Vec::new(),
             enum_values: Vec::new(),
+            note: None,
         });
 
         index

@@ -48,7 +48,10 @@ pub const DEFAULT_CACHE_FILE_NAME: &str = "platform-index.cache";
 /// полей `Snapshot`, `Fingerprint` или `PlatformIndex`, — иначе старый файл был
 /// бы прочитан как новый и молча дал другой индекс. Отдельно от версии крейта:
 /// та меняется и на правках, к кэшу отношения не имеющих.
-const FORMAT_VERSION: u32 = 2;
+///
+/// 3 — `note` у типов, методов, свойств и значений перечислений плюс `name_en`
+/// у конструкторов: без подъёма версии старый кэш отдал бы пустые примечания.
+const FORMAT_VERSION: u32 = 3;
 
 /// Предел на строку заголовка кэша: файл без переводов строк иначе вычитал бы
 /// в память гигабайты (путь кэша приходит из конфига).
@@ -494,6 +497,7 @@ mod tests {
                     description: "Что выводить".to_string(),
                 }],
             }],
+            note: Some("Примечание метода".to_string()),
         });
         index.global_properties.push(Property {
             name_ru: "Справочники".to_string(),
@@ -501,6 +505,7 @@ mod tests {
             description: "Менеджеры справочников".to_string(),
             type_name: "СправочникиМенеджер".to_string(),
             readonly: true,
+            note: Some("Примечание свойства".to_string()),
         });
         index.insert_type(Type {
             name_ru: "Массив".to_string(),
@@ -522,6 +527,7 @@ mod tests {
                         description: String::new(),
                     }],
                 }],
+                note: None,
             }],
             properties: vec![Property {
                 name_ru: "Количество".to_string(),
@@ -529,6 +535,7 @@ mod tests {
                 description: String::new(),
                 type_name: "Число".to_string(),
                 readonly: true,
+                note: None,
             }],
             constructors: vec![Constructor {
                 name: "Массив".to_string(),
@@ -540,8 +547,11 @@ mod tests {
                     required: false,
                     description: String::new(),
                 }],
+                name_en: "Array".to_string(),
+                note: Some("Примечание конструктора".to_string()),
             }],
             enum_values: Vec::new(),
+            note: Some("Примечание типа".to_string()),
         });
         index.insert_type(Type {
             name_ru: "Цвет".to_string(),
@@ -554,7 +564,9 @@ mod tests {
                 name_ru: "Красный".to_string(),
                 name_en: "Red".to_string(),
                 description: "Цвет".to_string(),
+                note: Some("Примечание значения".to_string()),
             }],
+            note: None,
         });
         index
     }

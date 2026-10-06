@@ -624,6 +624,7 @@ mod tests {
             description: String::new(),
             return_type: return_type.to_string(),
             signatures: Vec::new(),
+            note: None,
         }
     }
 
@@ -634,6 +635,7 @@ mod tests {
             description: String::new(),
             type_name: type_name.to_string(),
             readonly: false,
+            note: None,
         }
     }
 
@@ -646,6 +648,7 @@ mod tests {
             properties,
             constructors: Vec::new(),
             enum_values: Vec::new(),
+            note: None,
         }
     }
 

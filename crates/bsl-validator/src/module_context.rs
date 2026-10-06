@@ -329,10 +329,12 @@ mod tests {
                 description: String::new(),
                 return_type: String::new(),
                 signatures: Vec::new(),
+                note: None,
             }],
             properties: Vec::new(),
             constructors: Vec::new(),
             enum_values: Vec::new(),
+            note: None,
         });
 
         let path = "Documents/Заказ/Forms/ФормаДокумента/Ext/Form/Module.bsl";

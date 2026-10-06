@@ -1,0 +1,21 @@
+{
+  "valid": false,
+  "tree_parsed": true,
+  "symbols_available": true,
+  "errors": [
+    {
+      "line": 2,
+      "col": 15,
+      "kind": "unknown_new_type",
+      "message": "Тип 'НетТакогоТипа' не найден в платформенном контексте.",
+      "confidence": "low"
+    },
+    {
+      "line": 3,
+      "col": 5,
+      "kind": "wrong_argument_count",
+      "message": "❌ Метод 'Сообщить' не принимает 0 аргументов. Допустимо: 1..2.",
+      "confidence": "high"
+    }
+  ]
+}

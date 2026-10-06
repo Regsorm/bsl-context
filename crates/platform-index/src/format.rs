@@ -25,6 +25,24 @@ fn inline_line(s: &str) -> String {
     s.replace(['\r', '\n'], " ")
 }
 
+/// ` (`En`)` для заголовков и элементов списка, если английское имя есть.
+fn english_name(name_en: &str) -> String {
+    if name_en.is_empty() {
+        String::new()
+    } else {
+        format!(" (`{name_en}`)")
+    }
+}
+
+/// Абзац «**Примечание:** …» для подробного вывода; пустого примечания нет —
+/// пустая строка.
+fn note_block(note: Option<&str>) -> String {
+    match note.map(str::trim).filter(|n| !n.is_empty()) {
+        Some(note) => format!("**Примечание:** {}\n\n", inline_line(note)),
+        None => String::new(),
+    }
+}
+
 pub fn format_query_header(query: &str) -> String {
     format!("# Результаты поиска: '{}'\n\n", inline_line(query))
 }
@@ -45,7 +63,7 @@ pub fn format_search_results(results: &[Definition]) -> String {
         } else {
             d.description()
         };
-        let _ = writeln!(out, "### {}", d.name_ru());
+        let _ = writeln!(out, "### {}{}", d.name_ru(), english_name(d.name_en()));
         let _ = writeln!(out, "**Тип элемента:** {}", d.kind_label());
         let _ = writeln!(out, "**Описание:** {desc}\n");
     }
@@ -62,11 +80,12 @@ pub fn format_member(def: &Definition) -> String {
 
 pub fn format_type(t: &Type) -> String {
     let mut out = String::new();
-    let _ = writeln!(out, "# {}\n", t.name_ru);
+    let _ = writeln!(out, "# {}{}\n", t.name_ru, english_name(&t.name_en));
 
     if !t.description.is_empty() {
         let _ = writeln!(out, "{}\n", t.description);
     }
+    out.push_str(&note_block(t.note.as_deref()));
 
     if t.has_methods() {
         out.push_str("## Методы\n\n");
@@ -101,10 +120,11 @@ pub fn format_type(t: &Type) -> String {
 
 pub fn format_method(m: &Method) -> String {
     let mut out = String::new();
-    let _ = writeln!(out, "### {}\n", m.name_ru);
+    let _ = writeln!(out, "### {}{}\n", m.name_ru, english_name(&m.name_en));
     if !m.description.is_empty() {
         let _ = writeln!(out, "{}\n", m.description);
     }
+    out.push_str(&note_block(m.note.as_deref()));
     out.push_str(&format_signatures(&m.signatures, &m.name_ru));
     if !m.return_type.is_empty() {
         let _ = writeln!(
@@ -118,10 +138,11 @@ pub fn format_method(m: &Method) -> String {
 
 pub fn format_property(p: &Property) -> String {
     let mut out = String::new();
-    let _ = writeln!(out, "### {}\n", p.name_ru);
+    let _ = writeln!(out, "### {}{}\n", p.name_ru, english_name(&p.name_en));
     if !p.description.is_empty() {
         let _ = writeln!(out, "{}\n", p.description);
     }
+    out.push_str(&note_block(p.note.as_deref()));
     let _ = writeln!(out, "**Тип:** {}", render_type(&p.type_name));
     let _ = writeln!(
         out,
@@ -140,12 +161,19 @@ pub fn format_constructors(constructors: &[Constructor], type_name: &str) -> Str
     }
     for c in constructors {
         let desc = inline_line(&c.description);
-        let _ = writeln!(out, "## Конструктор: {} ({})", c.name, desc);
+        let _ = writeln!(
+            out,
+            "## Конструктор: {}{} ({})",
+            c.name,
+            english_name(&c.name_en),
+            desc
+        );
         out.push_str(&format_signature_block(
             &c.parameters,
             &c.syntax,
             &format!("Новый {type_name}"),
         ));
+        out.push_str(&note_block(c.note.as_deref()));
     }
     out
 }
@@ -239,9 +267,10 @@ fn format_method_summary(m: &Method) -> String {
         t if t.is_empty() => String::new(),
         t => format!(": {t}"),
     };
+    let en = english_name(&m.name_en);
     if m.signatures.is_empty() {
         format!(
-            "- {}(){} - {}\n",
+            "- {}{en}(){} - {}\n",
             m.name_ru,
             return_type,
             inline_line(&m.description)
@@ -264,7 +293,7 @@ fn format_method_summary(m: &Method) -> String {
                 .join(", ");
             let _ = writeln!(
                 out,
-                "- {}({}){} - {}",
+                "- {}{en}({}){} - {}",
                 m.name_ru,
                 inline,
                 return_type,
@@ -277,11 +306,12 @@ fn format_method_summary(m: &Method) -> String {
 
 fn format_property_summary(p: &Property) -> String {
     let type_name = render_type(&p.type_name);
+    let en = english_name(&p.name_en);
     if type_name.is_empty() {
-        format!("- {} - {}\n", p.name_ru, inline_line(&p.description))
+        format!("- {}{en} - {}\n", p.name_ru, inline_line(&p.description))
     } else {
         format!(
-            "- {}: {} - {}\n",
+            "- {}{en}: {} - {}\n",
             p.name_ru,
             type_name,
             inline_line(&p.description)
@@ -290,18 +320,182 @@ fn format_property_summary(p: &Property) -> String {
 }
 
 fn format_constructor_summary(c: &Constructor) -> String {
-    format!("- {} - {}\n", c.name, c.description)
+    format!(
+        "- {}{} - {}\n",
+        c.name,
+        english_name(&c.name_en),
+        c.description
+    )
 }
 
 fn format_enum_value_summary(v: &EnumValue) -> String {
-    let en = if v.name_en.is_empty() {
-        String::new()
+    let en = english_name(&v.name_en);
+    let base = if v.description.is_empty() {
+        format!("- {}{}", v.name_ru, en)
     } else {
-        format!(" (`{}`)", v.name_en)
+        format!("- {}{} - {}", v.name_ru, en, inline_line(&v.description))
     };
-    if v.description.is_empty() {
-        format!("- {}{}\n", v.name_ru, en)
-    } else {
-        format!("- {}{} - {}\n", v.name_ru, en, inline_line(&v.description))
+    // «Примечание:» значения (на 8.3.27 таких страниц 52) — в той же строке
+    // списка: отдельным абзацем оно разрывало бы перечень значений.
+    match v.note.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+        Some(note) => format!("{base} — **Примечание:** {}\n", inline_line(note)),
+        None => format!("{base}\n"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::entities::Parameter;
+
+    fn parameter() -> Parameter {
+        Parameter {
+            name: "Значение".to_string(),
+            type_name: "Произвольный".to_string(),
+            required: false,
+            description: String::new(),
+        }
+    }
+
+    fn method(note: Option<&str>) -> Method {
+        Method {
+            name_ru: "Добавить".to_string(),
+            name_en: "Add".to_string(),
+            description: "Добавляет элемент".to_string(),
+            note: note.map(str::to_string),
+            return_type: String::new(),
+            signatures: vec![Signature {
+                name: "Основная".to_string(),
+                syntax: String::new(),
+                description: String::new(),
+                parameters: vec![parameter()],
+            }],
+        }
+    }
+
+    fn property(note: Option<&str>) -> Property {
+        Property {
+            name_ru: "Количество".to_string(),
+            name_en: "Count".to_string(),
+            description: String::new(),
+            note: note.map(str::to_string),
+            type_name: "Число".to_string(),
+            readonly: true,
+        }
+    }
+
+    fn constructor(note: Option<&str>) -> Constructor {
+        Constructor {
+            name: "Массив".to_string(),
+            name_en: "Array".to_string(),
+            syntax: "Новый Массив()".to_string(),
+            description: "Пустой массив".to_string(),
+            note: note.map(str::to_string),
+            parameters: vec![parameter()],
+        }
+    }
+
+    fn enum_value(note: Option<&str>) -> EnumValue {
+        EnumValue {
+            name_ru: "Красный".to_string(),
+            name_en: "Red".to_string(),
+            description: "Цвет".to_string(),
+            note: note.map(str::to_string),
+        }
+    }
+
+    fn ty(note: Option<&str>) -> Type {
+        Type {
+            name_ru: "Массив".to_string(),
+            name_en: "Array".to_string(),
+            description: String::new(),
+            note: note.map(str::to_string),
+            methods: vec![method(note)],
+            properties: vec![property(note)],
+            constructors: vec![constructor(note)],
+            enum_values: vec![enum_value(note)],
+        }
+    }
+
+    #[test]
+    fn english_names_appear_in_headers_and_lists() {
+        let text = format_type(&ty(None));
+        assert!(text.contains("# Массив (`Array`)"), "{text}");
+        assert!(
+            text.contains("- Добавить (`Add`)(Значение?: Произвольный)"),
+            "{text}"
+        );
+        assert!(text.contains("- Количество (`Count`): `Число`"), "{text}");
+        assert!(
+            text.contains("- Массив (`Array`) - Пустой массив"),
+            "{text}"
+        );
+        assert!(text.contains("- Красный (`Red`) - Цвет"), "{text}");
+
+        let method_text = format_member(&Definition::Method(method(None)));
+        assert!(
+            method_text.contains("### Добавить (`Add`)"),
+            "{method_text}"
+        );
+        let property_text = format_member(&Definition::Property(property(None)));
+        assert!(
+            property_text.contains("### Количество (`Count`)"),
+            "{property_text}"
+        );
+        let ctor_text = format_constructors(&[constructor(None)], "Массив");
+        assert!(
+            ctor_text.contains("## Конструктор: Массив (`Array`)"),
+            "{ctor_text}"
+        );
+    }
+
+    #[test]
+    fn search_list_shows_english_names() {
+        let results = vec![Definition::Method(method(None)), Definition::Type(ty(None))];
+        let text = format_search_results(&results);
+        assert!(text.contains("### Добавить (`Add`)"), "{text}");
+        assert!(text.contains("### Массив (`Array`)"), "{text}");
+    }
+
+    #[test]
+    fn notes_appear_for_every_entity_kind() {
+        // Обзор типа показывает примечание самого типа и значения перечисления;
+        // методы/свойства/конструкторы раскрывают своё в подробном выводе.
+        let overview = format_type(&ty(Some("Нюанс работы")));
+        assert_eq!(
+            overview.matches("**Примечание:** Нюанс работы").count(),
+            2,
+            "{overview}"
+        );
+
+        let method_text = format_member(&Definition::Method(method(Some("Нюанс метода"))));
+        assert!(
+            method_text.contains("**Примечание:** Нюанс метода"),
+            "{method_text}"
+        );
+        let property_text = format_member(&Definition::Property(property(Some("Нюанс свойства"))));
+        assert!(
+            property_text.contains("**Примечание:** Нюанс свойства"),
+            "{property_text}"
+        );
+        let ctor_text = format_constructors(&[constructor(Some("Нюанс конструктора"))], "Массив");
+        assert!(
+            ctor_text.contains("**Примечание:** Нюанс конструктора"),
+            "{ctor_text}"
+        );
+        let enum_text = format_enum_values(&[enum_value(Some("Нюанс значения"))], "Массив");
+        assert!(
+            enum_text.contains("**Примечание:** Нюанс значения"),
+            "{enum_text}"
+        );
+    }
+
+    #[test]
+    fn empty_note_and_english_name_add_nothing() {
+        let mut t = ty(None);
+        t.name_en = String::new();
+        let text = format_type(&t);
+        assert!(!text.contains("**Примечание:**"), "{text}");
+        assert!(text.contains("# Массив\n"), "{text}");
     }
 }

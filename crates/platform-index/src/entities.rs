@@ -1,9 +1,9 @@
 //! Доменные сущности business-слоя.
 //!
-//! Это УЗКАЯ проекция `hbk_parser::*Info`: переносятся имена, описания, типы,
-//! параметры и синтаксис. `note`/`example`/`related_objects` и описание
-//! возвращаемого значения пока остаются в промежуточных Info и в домен не
-//! попадают — при расширении домена обязателен подъём `cache::FORMAT_VERSION`.
+//! Это УЗКАЯ проекция `hbk_parser::*Info`: переносятся имена, описания, `note`,
+//! типы, параметры и синтаксис. `example`/`related_objects` и описание
+//! возвращаемого значения пока остаются в промежуточных Info — при расширении
+//! домена обязателен подъём `cache::FORMAT_VERSION`.
 
 use serde::{Deserialize, Serialize};
 
@@ -13,6 +13,8 @@ pub struct Method {
     pub name_ru: String,
     pub name_en: String,
     pub description: String,
+    /// «Примечание:» страницы справки, если оно есть.
+    pub note: Option<String>,
     pub return_type: String,
     /// Список перегрузок. У апстрима всегда `emptyList()` — это исправляется здесь.
     pub signatures: Vec<Signature>,
@@ -43,6 +45,8 @@ pub struct Property {
     pub name_ru: String,
     pub name_en: String,
     pub description: String,
+    /// «Примечание:» страницы справки, если оно есть.
+    pub note: Option<String>,
     pub type_name: String,
     pub readonly: bool,
 }
@@ -51,9 +55,13 @@ pub struct Property {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Constructor {
     pub name: String,
+    /// Английская форма имени конструктора, если она есть на странице.
+    pub name_en: String,
     /// Текст синтаксиса со страницы (`Новый Тип(<Параметр>)`), если он есть.
     pub syntax: String,
     pub description: String,
+    /// «Примечание:» страницы справки, если оно есть.
+    pub note: Option<String>,
     pub parameters: Vec<Parameter>,
 }
 
@@ -63,6 +71,9 @@ pub struct EnumValue {
     pub name_ru: String,
     pub name_en: String,
     pub description: String,
+    /// «Примечание:» страницы значения (на 8.3.27 таких страниц 52 — раньше
+    /// терялось на пути парсер → домен).
+    pub note: Option<String>,
 }
 
 /// Тип платформы. Системное перечисление — это разновидность `Type` с непустым
@@ -73,6 +84,8 @@ pub struct Type {
     pub name_ru: String,
     pub name_en: String,
     pub description: String,
+    /// «Примечание:» страницы справки, если оно есть.
+    pub note: Option<String>,
     pub methods: Vec<Method>,
     pub properties: Vec<Property>,
     pub constructors: Vec<Constructor>,

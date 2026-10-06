@@ -486,6 +486,7 @@ mod tests {
             name_ru: ru.to_string(),
             name_en: String::new(),
             description: String::new(),
+            note: None,
         }
     }
 
@@ -520,6 +521,7 @@ mod tests {
             properties: Vec::new(),
             constructors: Vec::new(),
             enum_values: vec![enum_v("<Имя картинки>"), enum_v("Лупа")],
+            note: None,
         });
         let r = validate_enum(&idx, "КартинкиТест", "МояКартинка");
         assert!(r.valid, "открытую коллекцию по справке не отвергаем");
@@ -547,6 +549,7 @@ mod tests {
                 enum_v("F1...F12"),
                 enum_v("Num0...Num9"),
             ],
+            note: None,
         });
         idx.insert_type(Type {
             name_ru: "ОтображениеОбычнойГруппы".into(),
@@ -556,6 +559,7 @@ mod tests {
             properties: Vec::new(),
             constructors: Vec::new(),
             enum_values: vec![enum_v("Нет"), enum_v("СлабоеВыделение")],
+            note: None,
         });
 
         for value in ["A", "F5", "F12", "Num0", "Num9", "_1", "BackSpace"] {
@@ -604,6 +608,7 @@ mod tests {
                 enum_v("БлокироватьВеcьИнтерфейс"), // латинская `c` — как в справке
                 enum_v("Независимый"),
             ],
+            note: None,
         });
 
         let r = validate_enum(&idx, "РежимОткрытияОкнаФормы", "БлокироватьВесьИнтерфейс");
@@ -640,6 +645,7 @@ mod tests {
                     description: String::new(),
                 }],
             }],
+            note: None,
         }
     }
 
@@ -685,6 +691,7 @@ mod tests {
                     },
                 ],
             }],
+            note: None,
         });
         assert!(
             validate_method_call(&idx, "СтрШаблон", 3).valid,

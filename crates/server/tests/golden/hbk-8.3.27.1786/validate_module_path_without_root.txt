@@ -1,0 +1,1 @@
+{"message":"параметр path требует источника имён с полем root — корнем выгрузки конфигурации: добавьте root в секцию [symbol_source] или [[symbol_sources]] для нужного repo.","ok":false}

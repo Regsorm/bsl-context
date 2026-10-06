@@ -179,6 +179,7 @@ mod tests {
             description: String::new(),
             return_type: String::new(),
             signatures: Vec::new(),
+            note: None,
         }
     }
 

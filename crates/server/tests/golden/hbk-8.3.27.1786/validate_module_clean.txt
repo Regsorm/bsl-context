@@ -1,0 +1,6 @@
+{
+  "valid": true,
+  "tree_parsed": true,
+  "symbols_available": true,
+  "errors": []
+}

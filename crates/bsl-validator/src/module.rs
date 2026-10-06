@@ -947,6 +947,7 @@ EndFunction
                         })
                         .collect(),
                 }],
+                note: None,
             }
         }
 
@@ -960,6 +961,7 @@ EndFunction
             properties: Vec::new(),
             constructors: Vec::new(),
             enum_values: Vec::new(),
+            note: None,
         });
         // Глобальная функция того же имени — с ДВУМЯ параметрами.
         index
@@ -1023,6 +1025,7 @@ EndFunction
                         })
                         .collect(),
                 }],
+                note: None,
             }
         }
 
@@ -1036,6 +1039,7 @@ EndFunction
             properties: Vec::new(),
             constructors: Vec::new(),
             enum_values: Vec::new(),
+            note: None,
         });
         // Глобальная функция того же имени — с ШЕСТЬЮ параметрами.
         index
