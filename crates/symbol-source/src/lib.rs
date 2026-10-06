@@ -438,9 +438,12 @@ impl CodeIndexDbSource {
             if !lite_index::is_application_module_file(file_name) {
                 continue;
             }
-            let Ok(bytes) = zstd::stream::decode_all(&blob[..]) else {
-                continue;
-            };
+            // Повреждённый блоб хотя бы одного модуля делает недостоверным
+            // ВЕСЬ набор: потребитель должен молчать (`None`), а не считать,
+            // что объявленных переменных нет, — иначе на реальную экспортную
+            // переменную появится ложный `UnknownCommonModule`.
+            let bytes = zstd::stream::decode_all(&blob[..])
+                .with_context(|| format!("не удалось распаковать модуль {path}"))?;
             let content = String::from_utf8_lossy(&bytes);
             for name in lite_index::global_export_vars_from_text(&content) {
                 out.insert(name.to_lowercase());
@@ -516,7 +519,15 @@ impl CodeIndexDbSource {
         let mut out = HashSet::new();
         for row in rows {
             let (xml_path, blob) = row?;
+            // Повреждённый XML пропускаем с предупреждением: в отличие от
+            // переменных модулей приложения, «не знаю» здесь выразить нечем
+            // (`is_global_export` — bool), а неполный набор лишь теряет
+            // подавление, не создавая находок на пустом месте.
             let Ok(bytes) = zstd::stream::decode_all(&blob[..]) else {
+                tracing::warn!(
+                    path = %xml_path,
+                    "code-index база: XML общего модуля не распаковался — экспорты могут быть неполными"
+                );
                 continue;
             };
             let content = String::from_utf8_lossy(&bytes);
@@ -562,6 +573,19 @@ impl SymbolSource for CodeIndexDbSource {
         self.refresh_if_stale();
         let owner = lite_index::owner_module_path(module_path)?;
         let conn = self.conn.lock().unwrap();
+        // Модуль-владелец есть в базе? Нет — «не знаю» (`None`), как в
+        // LiteSource: иначе пустой набор выглядел бы как «у владельца нет
+        // экспортов» и давал ложную находку на каждый его вызов (аудит PR).
+        let owner_present = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM files WHERE path = ?1)",
+                params![owner],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap_or(false);
+        if !owner_present {
+            return None;
+        }
         let mut stmt = conn
             .prepare(
                 "SELECT fn.name FROM functions fn JOIN files fl ON fl.id = fn.file_id \
@@ -1192,10 +1216,7 @@ impl SymbolSource for CodeIndexMcpSource {
         self.search(name_lower).into_iter().any(|f| {
             f.name_lower == name_lower
                 && f.args.contains(") Экспорт")
-                // Путь может быть как с ведущим сегментом (`base/CommonModules/…`),
-                // так и от корня репозитория (`CommonModules/…`).
-                && (f.file_path.contains("/CommonModules/")
-                    || f.file_path.starts_with("CommonModules/"))
+                && is_common_module_file_path(&f.file_path)
                 && common_module_xml_path(&f.file_path)
                     .is_some_and(|xml_path| self.module_is_global(&xml_path))
         })
@@ -1331,17 +1352,30 @@ impl SymbolSource for CodeIndexMcpSource {
 /// URL для журнала и сообщений об ошибках — без учётных данных и query:
 /// `http://user:pass@host/mcp?token=…` → `http://host/mcp`. Секреты из
 /// конфигурации не должны попадать в логи и ответы MCP-клиентам.
+///
+/// URL без схемы (`127.0.0.1:8011/mcp?token=…`) тоже маскируется: строка из
+/// конфига уходит в `last_error`, и оставлять в ней токен нельзя (аудит PR).
+/// Учётные данные отделены от хоста ПОСЛЕДНИМ `@` в authority-части — до
+/// первого `/`, а не по всему пути: `http://host/path@x` — это хост `host`.
 pub fn redact_url(url: &str) -> String {
-    let Some(scheme_end) = url.find("://") else {
-        return url.to_string();
+    let url = url.split(['?', '#']).next().unwrap_or(url);
+    let (scheme, rest) = match url.find("://") {
+        Some(pos) => url.split_at(pos + 3),
+        None => ("", url),
     };
-    let (scheme, rest) = url.split_at(scheme_end + 3);
-    let rest = rest.split(['?', '#']).next().unwrap_or(rest);
-    let host_and_path = match rest.find('@') {
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let redacted = match authority.rfind('@') {
         Some(at) => &rest[at + 1..],
         None => rest,
     };
-    format!("{scheme}{host_and_path}")
+    format!("{scheme}{redacted}")
+}
+
+/// Путь файла — модуль общего модуля? Выгрузка встречается в двух видах:
+/// с ведущим сегментом (`base/CommonModules/…`) и от корня репозитория
+/// (`CommonModules/…`). Сегмент проверяется целиком: `MyCommonModules/…` — не он.
+fn is_common_module_file_path(file_path: &str) -> bool {
+    file_path.contains("/CommonModules/") || file_path.starts_with("CommonModules/")
 }
 
 /// Разобрать SSE-ответ MCP-сервера: строки `data: {...}`, первая бывает
@@ -2277,6 +2311,36 @@ data: {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabili
         assert!(parse_sse_json("не json и не SSE").is_none());
     }
 
+    #[test]
+    fn redact_url_strips_credentials_and_query() {
+        assert_eq!(
+            redact_url("http://user:pass@host:8011/mcp?token=SECRET#frag"),
+            "http://host:8011/mcp"
+        );
+        // Без схемы: query и userinfo тоже не должны утечь в last_error,
+        // который сервер отдаёт MCP-клиенту (аудит PR).
+        assert_eq!(
+            redact_url("127.0.0.1:8011/mcp?token=SECRET"),
+            "127.0.0.1:8011/mcp"
+        );
+        assert_eq!(redact_url("user:pass@host/mcp"), "host/mcp");
+        // `@` в пути — не userinfo: хост не подменяется.
+        assert_eq!(redact_url("http://host/path@x"), "http://host/path@x");
+        assert_eq!(redact_url("not-a-url"), "not-a-url");
+    }
+
+    #[test]
+    fn common_module_path_accepts_both_layouts() {
+        assert!(is_common_module_file_path(
+            "base/CommonModules/М/Ext/Module.bsl"
+        ));
+        assert!(is_common_module_file_path("CommonModules/М/Ext/Module.bsl"));
+        assert!(!is_common_module_file_path("MyCommonModules/М.xml"));
+        assert!(!is_common_module_file_path(
+            "base/Documents/Х/Ext/Module.bsl"
+        ));
+    }
+
     // ── CodeIndexDbSource ─────────────────────────────────────────────────
 
     #[test]
@@ -2298,6 +2362,133 @@ data: {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabili
         assert!(!source.method_exists("несуществующийметод"));
         assert!(!source.is_global_export("датасообщенияedi"));
         assert!(source.describe().contains("index.db"));
+    }
+
+    #[test]
+    fn code_index_db_source_reads_external_connection_module_vars() {
+        // Модуль внешнего соединения объявляет экспортные переменные наравне с
+        // модулями приложения (issue #35-соседнее: без него на реальную
+        // переменную появлялся ложный UnknownCommonModule).
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute("CREATE TABLE functions (name TEXT NOT NULL)", [])
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE files (id INTEGER PRIMARY KEY, path TEXT NOT NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE file_contents (file_id INTEGER NOT NULL, content_blob BLOB NOT NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO files (id, path) VALUES (1, 'base/Ext/ExternalConnectionModule.bsl')",
+            [],
+        )
+        .unwrap();
+        let text = "Перем ИзВнешнегоСоединения Экспорт;\n";
+        let blob = zstd::stream::encode_all(text.as_bytes(), 0).unwrap();
+        conn.execute(
+            "INSERT INTO file_contents (file_id, content_blob) VALUES (1, ?1)",
+            params![blob],
+        )
+        .unwrap();
+        drop(conn);
+
+        let source = CodeIndexDbSource::open(&db_path).unwrap();
+        let vars = source.global_variables().expect("набор должен собраться");
+        assert!(
+            vars.contains("извнешнегосоединения"),
+            "нет экспортной переменной модуля внешнего соединения: {vars:?}"
+        );
+    }
+
+    #[test]
+    fn code_index_db_source_global_vars_none_when_blob_corrupt() {
+        // Один повреждённый блоб делает недостоверным весь набор: «не знаю»
+        // (`None`) выключает правило целиком, вместо ложных срабатываний на
+        // реальные экспортные переменные.
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute("CREATE TABLE functions (name TEXT NOT NULL)", [])
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE files (id INTEGER PRIMARY KEY, path TEXT NOT NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE file_contents (file_id INTEGER NOT NULL, content_blob BLOB NOT NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO files (id, path) VALUES (1, 'base/Ext/ManagedApplicationModule.bsl')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO file_contents (file_id, content_blob) VALUES (1, ?1)",
+            params![vec![0u8, 1, 2, 3]],
+        )
+        .unwrap();
+        drop(conn);
+
+        let source = CodeIndexDbSource::open(&db_path).unwrap();
+        assert!(
+            source.global_variables().is_none(),
+            "повреждённый блоб — «не знаю», а не пустой набор"
+        );
+    }
+
+    #[test]
+    fn code_index_db_source_owner_missing_is_none_not_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "CREATE TABLE functions (name TEXT NOT NULL, file_id INTEGER, args TEXT)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE files (id INTEGER PRIMARY KEY, path TEXT NOT NULL)",
+            [],
+        )
+        .unwrap();
+        // Форма есть, модуля-владельца в базе нет — «не знаю», не пустой набор.
+        conn.execute(
+            "INSERT INTO files (id, path) VALUES (1, 'external/Обр/Form/Ф/Form.obj.bsl')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let source = CodeIndexDbSource::open(&db_path).unwrap();
+        assert!(
+            source
+                .owner_exports("external/Обр/Form/Ф/Form.obj.bsl")
+                .is_none(),
+            "владельца нет в базе — «не знаю»"
+        );
+
+        // Владелец появился, но экспортных методов у него нет: пустой набор —
+        // законный ответ «экспортов нет» (вызов владельца здесь невозможен).
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO files (id, path) VALUES (2, 'external/Обр/ExternalDataProcessor.obj.bsl')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let source = CodeIndexDbSource::open(&db_path).unwrap();
+        assert_eq!(
+            source.owner_exports("external/Обр/Form/Ф/Form.obj.bsl"),
+            Some(HashSet::new())
+        );
     }
 
     // ── LiteSource ────────────────────────────────────────────────────────
@@ -2528,6 +2719,23 @@ data: {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabili
         let db = db.as_path();
         if !db.exists() {
             eprintln!("skip: базы code-index нет");
+            return;
+        }
+        // Выгрузка может не содержать внешних обработок (`external/`): тогда
+        // форм с владельцем в ней нет, и проверять нечего (аудит PR: на таком
+        // корпусе тест падал «получено: 0 имён»).
+        let has_external = Connection::open(db)
+            .and_then(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM files WHERE path LIKE 'external/%'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .unwrap_or(0)
+            > 0;
+        if !has_external {
+            eprintln!("skip: в выгрузке нет external/ — фикстура другой конфигурации");
             return;
         }
         let src = CodeIndexDbSource::open(db).unwrap();

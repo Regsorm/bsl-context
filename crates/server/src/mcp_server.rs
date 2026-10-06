@@ -653,8 +653,14 @@ impl BslContextServer {
                 // Старую базу не удаляем, а откладываем в `.bak`: если подмена
                 // не удастся, вернём её на место (на Windows rename поверх файла
                 // запрещён, поэтому просто «переименовать поверх» нельзя).
-                let backup = db_c.with_extension("db.bak");
-                let _ = std::fs::remove_file(&backup);
+                // Имя отката уникально вместе с tmp: две пересборки одного
+                // db_path (reload_config × rebuild) не должны затирать откат
+                // друг друга (аудит PR, M7).
+                let backup = {
+                    let mut name = tmp_c.as_os_str().to_owned();
+                    name.push(".bak");
+                    PathBuf::from(name)
+                };
                 if db_c.exists() {
                     if let Err(e) = std::fs::rename(&db_c, &backup) {
                         // Windows не переименовывает файл, открытый другим
@@ -1193,7 +1199,9 @@ impl BslContextServer {
     )]
     pub async fn validate_module(&self, Parameters(p): Parameters<ValidateModuleParams>) -> String {
         // Лимит размера ДО любой работы: stdio-кадр не ограничен, а разбор
-        // многомегабайтного текста блокирует воркер на секунды.
+        // многомегабайтного текста блокирует воркер на секунды. Файловый вход
+        // (`path`) сюда не попадает — у него собственный потолок
+        // `module_source::MAX_MODULE_BYTES` (16 МиБ).
         if p.source.len() > MAX_SOURCE_BYTES {
             return err_json(&format!(
                 "исходник слишком большой: {} байт (предел {} байт)",

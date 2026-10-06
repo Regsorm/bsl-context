@@ -71,7 +71,7 @@ pub fn validate_module_at_level(
     source: &str,
     level: u8,
 ) -> ExpressionValidation {
-    validate_module_at_level_inner(index, source, level, None, None, None, None, false)
+    validate_module_at_level_inner(index, source, level, None, None, None, None, false, false)
 }
 
 /// Общее тело `validate_module_at_level`/`validate_module_with_symbols`.
@@ -93,6 +93,11 @@ pub fn validate_module_at_level(
 /// модуля объекта-владельца; оба `None` при вызове без источника — поведение
 /// не отличается от прежнего `validate_module_at_level`.
 ///
+/// `owner_unknown` — модуль формы есть, источник имён настроен, но модуль
+/// владельца в нём не нашёлся: вызовы без префикса могут быть его методами,
+/// поэтому проверки глобальных вызовов молчат (контракт `owner_exports = None`
+/// — «не знаю»).
+///
 /// `symbols_degraded` — источник имён настроен, но недоступен (см.
 /// [`validate_module_degraded`]). Влияет только на уверенность находок
 /// `UndeclaredMethod`; при `symbols: Some(_)` не имеет смысла и передаётся
@@ -106,6 +111,7 @@ fn validate_module_at_level_inner(
     form_attributes: Option<&HashSet<String>>,
     symbols: Option<&dyn SymbolSource>,
     owner_exports: Option<&HashSet<String>>,
+    owner_unknown: bool,
     symbols_degraded: bool,
 ) -> ExpressionValidation {
     validate_module_at_level_inner_ext(
@@ -116,6 +122,7 @@ fn validate_module_at_level_inner(
         form_attributes,
         symbols,
         owner_exports,
+        owner_unknown,
         symbols_degraded,
         None,
     )
@@ -137,6 +144,7 @@ fn validate_module_at_level_inner_ext(
     form_attributes: Option<&HashSet<String>>,
     symbols: Option<&dyn SymbolSource>,
     owner_exports: Option<&HashSet<String>>,
+    owner_unknown: bool,
     symbols_degraded: bool,
     form_kind: Option<crate::module_context::FormKind>,
 ) -> ExpressionValidation {
@@ -229,6 +237,7 @@ fn validate_module_at_level_inner_ext(
         strict_unknown,
         symbols,
         owner_exports,
+        owner_unknown,
         symbols_degraded,
         module_context,
         &mut errors,
@@ -310,6 +319,7 @@ pub fn validate_module_with_profile(
         None,
         None,
         false,
+        false,
     );
 
     if profile == Profile::Strict {
@@ -337,9 +347,16 @@ pub fn validate_module_with_symbols(
     symbols: Option<&dyn SymbolSource>,
 ) -> ExpressionValidation {
     let effective_level = if profile == Profile::Strict { 1 } else { level };
-    let owner_exports = module_path
+    // Владелец формы есть, но его модуль не попал в источник имён: вызовы без
+    // префикса могут быть его методами, поэтому проверки глобальных вызовов
+    // молчат (контракт `owner_exports = None` — «не знаю», аудит PR).
+    let owner_lookup = module_path
         .zip(symbols)
-        .and_then(|(path, src)| src.owner_exports(path));
+        .map(|(path, src)| (path, src.owner_exports(path)));
+    let owner_unknown = owner_lookup
+        .as_ref()
+        .is_some_and(|(path, names)| names.is_none() && crate::context_names::is_form_module(path));
+    let owner_exports = owner_lookup.and_then(|(_, names)| names);
     let mut result = validate_module_at_level_inner(
         index,
         source,
@@ -348,6 +365,7 @@ pub fn validate_module_with_symbols(
         form_attributes,
         symbols,
         owner_exports.as_ref(),
+        owner_unknown,
         false,
     );
 
@@ -379,9 +397,15 @@ pub fn validate_module_with_symbols_and_form_kind(
     form_kind: Option<crate::module_context::FormKind>,
 ) -> ExpressionValidation {
     let effective_level = if profile == Profile::Strict { 1 } else { level };
-    let owner_exports = module_path
+    // Владелец формы есть, но его модуль не попал в источник имён — см.
+    // `validate_module_with_symbols`.
+    let owner_lookup = module_path
         .zip(symbols)
-        .and_then(|(path, src)| src.owner_exports(path));
+        .map(|(path, src)| (path, src.owner_exports(path)));
+    let owner_unknown = owner_lookup
+        .as_ref()
+        .is_some_and(|(path, names)| names.is_none() && crate::context_names::is_form_module(path));
+    let owner_exports = owner_lookup.and_then(|(_, names)| names);
     let mut result = validate_module_at_level_inner_ext(
         index,
         source,
@@ -390,6 +414,7 @@ pub fn validate_module_with_symbols_and_form_kind(
         form_attributes,
         symbols,
         owner_exports.as_ref(),
+        owner_unknown,
         false,
         form_kind,
     );
@@ -444,6 +469,7 @@ pub fn validate_module_degraded(
         form_attributes,
         None,
         None,
+        false,
         true,
     );
 
@@ -718,6 +744,34 @@ EndFunction
         assert!(
             result.errors.is_empty(),
             "метод модуля объекта-владельца не должен давать находку: {:?}",
+            result.errors
+        );
+    }
+
+    /// Владелец формы есть, но его модуль не попал в источник имён (`None` =
+    /// «не знаю»): вызов без префикса может быть его методом, поэтому находки
+    /// молчат — иначе законный `ОткрытьЗначения()` владельца превращался бы в
+    /// «опечатку» платформенного `ОткрытьЗначение` (аудит PR, M1).
+    #[test]
+    fn symbols_owner_unknown_is_silent() {
+        let index = PlatformIndex::new();
+        let source = StubSource {
+            global_export: false,
+            exists: false,
+            owner: None,
+        };
+        let result = validate_module_with_symbols(
+            &index,
+            module_with_unknown_call(),
+            1,
+            Profile::Full,
+            Some("external/Обр/Form/Ф/Form.obj.bsl"),
+            None,
+            Some(&source),
+        );
+        assert!(
+            result.errors.is_empty(),
+            "«не знаю» о владельце не должно давать находку: {:?}",
             result.errors
         );
     }

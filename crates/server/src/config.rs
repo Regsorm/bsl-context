@@ -383,17 +383,30 @@ impl Config {
             }
             return Ok(result);
         }
-        if self.symbol_source.kind != "none" {
-            self.symbol_source.validate()?;
-            let name = self
-                .symbol_source
-                .repo
-                .clone()
-                .filter(|n| !n.is_empty())
-                .unwrap_or_else(|| DEFAULT_SOURCE_NAME.to_string());
-            return Ok(vec![(name, self.symbol_source.clone())]);
+        if self.symbol_source.kind == "none" {
+            // Одиночная секция с полями источника — тот же недописанный
+            // конфиг, что и в списке `[[symbol_sources]]`: молча игнорировать
+            // нельзя (аудит PR: предупреждение `validate()` сюда не доходило).
+            if self.symbol_source.db_path.is_some()
+                || self.symbol_source.root.is_some()
+                || self.symbol_source.url.is_some()
+                || self.symbol_source.code_index_repo.is_some()
+            {
+                anyhow::bail!(
+                    "[symbol_source]: kind = \"none\", но заданы поля источника — \
+                     укажите kind или уберите поля"
+                );
+            }
+            return Ok(Vec::new());
         }
-        Ok(Vec::new())
+        self.symbol_source.validate()?;
+        let name = self
+            .symbol_source
+            .repo
+            .clone()
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| DEFAULT_SOURCE_NAME.to_string());
+        Ok(vec![(name, self.symbol_source.clone())])
     }
 }
 
@@ -591,6 +604,22 @@ mod tests {
         )
         .unwrap();
         assert!(cfg.resolved_symbol_sources().is_err());
+    }
+
+    #[test]
+    fn single_section_kind_none_with_fields_is_error() {
+        // Та же недописанная секция, но одиночная: раньше поля молча
+        // игнорировались, а источник считался отключённым (аудит PR).
+        let cfg: Config =
+            toml::from_str("[symbol_source]\nkind = \"none\"\ndb_path = \"ut.db\"\n").unwrap();
+        let err = cfg.resolved_symbol_sources().unwrap_err().to_string();
+        assert!(err.contains("kind = \"none\""), "{err}");
+    }
+
+    #[test]
+    fn single_section_kind_none_without_fields_is_disabled() {
+        let cfg: Config = toml::from_str("[symbol_source]\nkind = \"none\"\n").unwrap();
+        assert!(cfg.resolved_symbol_sources().unwrap().is_empty());
     }
 
     #[test]

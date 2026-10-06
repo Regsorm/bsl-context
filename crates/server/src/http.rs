@@ -121,15 +121,24 @@ pub fn router(config: Config, server: BslContextServer) -> Router {
 /// Отсутствующий Host пропускаем (HTTP/1.0 и не-браузерные клиенты); браузерный
 /// DNS-rebinding всегда шлёт Host, и именно его мы отклоняем.
 async fn host_guard(State(allowed): State<Arc<Vec<String>>>, req: Request, next: Next) -> Response {
-    let allowed_ok = req
-        .headers()
-        .get(axum::http::header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .is_none_or(|host| host_is_allowed(host, &allowed));
-    if !allowed_ok {
+    if !host_header_allowed(req.headers(), &allowed) {
         return (StatusCode::FORBIDDEN, "Host header is not allowed").into_response();
     }
     next.run(req).await
+}
+
+/// Пропускать ли запрос по заголовку `Host`.
+///
+/// Отсутствующий заголовок пропускаем (HTTP/1.0 и не-браузерные клиенты).
+/// Присутствующий, но нечитаемый (не-ASCII) — отклоняем: иначе allowlist
+/// обходится одним битым заголовком (аудит PR, fail-open).
+fn host_header_allowed(headers: &axum::http::HeaderMap, allowed: &[String]) -> bool {
+    match headers.get(axum::http::header::HOST) {
+        None => true,
+        Some(value) => value
+            .to_str()
+            .is_ok_and(|host| host_is_allowed(host, allowed)),
+    }
 }
 
 /// Разрешён ли `Host`-заголовок. Запись без порта разрешает любой порт хоста;
@@ -180,4 +189,57 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         default_validation_level: state.config.default_validation_level,
         symbol_sources,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::{header::HOST, HeaderMap, HeaderValue};
+
+    fn headers_with_host(value: &[u8]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(HOST, HeaderValue::from_bytes(value).unwrap());
+        headers
+    }
+
+    #[test]
+    fn host_guard_absent_host_is_allowed() {
+        assert!(host_header_allowed(
+            &HeaderMap::new(),
+            &["localhost".into()]
+        ));
+    }
+
+    #[test]
+    fn host_guard_allowed_host_passes() {
+        let allowed = vec!["127.0.0.1:8007".to_string(), "localhost".to_string()];
+        assert!(host_header_allowed(
+            &headers_with_host(b"localhost"),
+            &allowed
+        ));
+        assert!(host_header_allowed(
+            &headers_with_host(b"127.0.0.1:8007"),
+            &allowed
+        ));
+    }
+
+    #[test]
+    fn host_guard_foreign_host_is_rejected() {
+        let allowed = vec!["localhost".to_string()];
+        assert!(!host_header_allowed(
+            &headers_with_host(b"evil.example"),
+            &allowed
+        ));
+    }
+
+    #[test]
+    fn host_guard_non_ascii_host_is_rejected() {
+        let allowed = vec!["localhost".to_string()];
+        // 0x80 — допустимый байт HeaderValue, но не видимый ASCII: `to_str`
+        // вернёт Err, и запрос обязан быть отклонён, а не пропущен.
+        assert!(!host_header_allowed(
+            &headers_with_host(b"\x80host"),
+            &allowed
+        ));
+    }
 }

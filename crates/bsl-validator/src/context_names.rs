@@ -262,9 +262,16 @@ fn is_bound_locally(
         return true;
     }
     // Переменная цикла (`Для Каждого X Из …`, `Для X = …`) тоже связывает
-    // имя; в facts у неё нет позиции, поэтому проверяем по имени (как в
-    // config_objects::locally_bound_names).
-    if facts.loop_vars.contains(name_lower) {
+    // имя, но ТОЛЬКО в своей области видимости: модуль-широкий набор
+    // `facts.loop_vars` глушил находки и в чужих процедурах (аудит PR, M4;
+    // на корпусном замере такое правило стоило тысячи пропущенных теней).
+    if facts.loop_var_sites.iter().any(|site| {
+        site.name == name_lower
+            && match scope {
+                Some(proc) => proc.contains(site.byte),
+                None => scope_of(facts, site.byte).is_none(),
+            }
+    }) {
         return true;
     }
     let Some(scope) = scope else {

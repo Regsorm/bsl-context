@@ -420,6 +420,7 @@ pub fn validate_expression_at_level(
         None,
         None,
         false,
+        false,
         None,
         &mut errors,
     );
@@ -860,6 +861,7 @@ pub(crate) fn check_global_calls(
     strict_unknown: bool,
     symbols: Option<&dyn SymbolSource>,
     owner_exports: Option<&HashSet<String>>,
+    owner_unknown: bool,
     symbols_degraded: bool,
     module_context: Option<&Type>,
     errors: &mut Vec<ExprError>,
@@ -896,6 +898,15 @@ pub(crate) fn check_global_calls(
             let visible_via_symbols = owner_exports.map(|s| s.contains(&lc)).unwrap_or(false)
                 || symbols.map(|s| s.is_global_export(&lc)).unwrap_or(false);
             if visible_via_symbols {
+                continue;
+            }
+            // Модуль формы есть, но модуль-владелец не попал в источник имён
+            // («не знаю»): вызов может быть его методом, и любая находка здесь
+            // недостоверна — молчим, как и обещает контракт `owner_exports =
+            // None` (аудит PR, M1). Проверка стоит ДО fuzzy: иначе законный
+            // `ОткрытьЗначения()` владельца превращался бы в «опечатку»
+            // платформенного `ОткрытьЗначение`.
+            if owner_unknown {
                 continue;
             }
             // Неизвестный глобальный вызов: пробуем fuzzy к платформенным.
