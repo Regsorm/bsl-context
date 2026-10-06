@@ -420,6 +420,7 @@ pub fn validate_expression_at_level(
         None,
         None,
         false,
+        false,
         None,
         &mut errors,
     );
@@ -802,15 +803,18 @@ pub(crate) fn check_new_expressions(
     for n in news {
         if index.find_type(&n.type_name).is_none() {
             let (line, col) = pos_at(src, n.byte);
-            let all_types: Vec<String> = index.types.values().map(|t| t.name_ru.clone()).collect();
+            // Сортировка — детерминированный порядок кандидатов при равном
+            // сходстве (обход HashMap случаен; подсказка плавала между запусками).
+            let mut all_types: Vec<String> =
+                index.types.values().map(|t| t.name_ru.clone()).collect();
+            all_types.sort();
             let suggestion = closest_str(&n.type_name, &all_types);
             errors.push(ExprError::new(
                 line,
                 col,
                 ExprErrorKind::UnknownNewType,
                 format!(
-                    "Тип '{}' не найден в платформенном контексте (Новый '{}').{}",
-                    n.type_name,
+                    "Тип '{}' не найден в платформенном контексте.{}",
                     n.type_name,
                     suggestion
                         .as_ref()
@@ -857,6 +861,7 @@ pub(crate) fn check_global_calls(
     strict_unknown: bool,
     symbols: Option<&dyn SymbolSource>,
     owner_exports: Option<&HashSet<String>>,
+    owner_unknown: bool,
     symbols_degraded: bool,
     module_context: Option<&Type>,
     errors: &mut Vec<ExprError>,
@@ -893,6 +898,15 @@ pub(crate) fn check_global_calls(
             let visible_via_symbols = owner_exports.map(|s| s.contains(&lc)).unwrap_or(false)
                 || symbols.map(|s| s.is_global_export(&lc)).unwrap_or(false);
             if visible_via_symbols {
+                continue;
+            }
+            // Модуль формы есть, но модуль-владелец не попал в источник имён
+            // («не знаю»): вызов может быть его методом, и любая находка здесь
+            // недостоверна — молчим, как и обещает контракт `owner_exports =
+            // None` (аудит PR, M1). Проверка стоит ДО fuzzy: иначе законный
+            // `ОткрытьЗначения()` владельца превращался бы в «опечатку»
+            // платформенного `ОткрытьЗначение`.
+            if owner_unknown {
                 continue;
             }
             // Неизвестный глобальный вызов: пробуем fuzzy к платформенным.
@@ -1072,7 +1086,13 @@ fn closest_str(target: &str, candidates: &[String]) -> Option<String> {
         // имя отвергнет — подсказка сломала бы рабочий код (issue #18).
         .filter(|c| !crate::homoglyphs::is_mixed_alphabet(c))
         .map(|c| (similarity(&target_l, &c.to_lowercase()), c.clone()))
-        .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+        // Тай-брейк по имени: при равном сходстве порядок кандидатов не должен
+        // влиять на подсказку (недетерминизм ловился запуском).
+        .max_by(|a, b| {
+            a.0.partial_cmp(&b.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.1.cmp(&a.1))
+        })
         .filter(|(s, _)| *s > 0.5)
         .map(|(_, c)| c)
 }
@@ -1248,6 +1268,7 @@ mod tests {
             return_type: "Строка".into(),
             signatures: vec![Signature {
                 name: "Основная".into(),
+                syntax: String::new(),
                 description: String::new(),
                 parameters: vec![
                     Parameter {
@@ -1264,6 +1285,7 @@ mod tests {
                     },
                 ],
             }],
+            note: None,
         });
         let src = "Текст = НСтр(\"ru = 'Неверный тип запроса.'\");";
         let res = validate_expression_at_level(&index, src, 1);
@@ -1388,7 +1410,9 @@ mod tests {
                 name_ru: "Красный".into(),
                 name_en: "Red".into(),
                 description: String::new(),
+                note: None,
             }],
+            note: None,
         });
 
         index.insert_type(Type {
@@ -1401,10 +1425,12 @@ mod tests {
                 description: String::new(),
                 return_type: String::new(),
                 signatures: Vec::new(),
+                note: None,
             }],
             properties: Vec::new(),
             constructors: Vec::new(),
             enum_values: Vec::new(),
+            note: None,
         });
 
         // Открытая коллекция: первым значением — псевдо-элемент `<...>`.
@@ -1420,13 +1446,16 @@ mod tests {
                     name_ru: "<Имя картинки>".into(),
                     name_en: String::new(),
                     description: String::new(),
+                    note: None,
                 },
                 EnumValue {
                     name_ru: "Лупа".into(),
                     name_en: "Magnifier".into(),
                     description: String::new(),
+                    note: None,
                 },
             ],
+            note: None,
         });
 
         // Issue #31: `XBase` — свойства это поля конкретного DBF-файла (динамические),
@@ -1441,10 +1470,12 @@ mod tests {
                 description: String::new(),
                 return_type: String::new(),
                 signatures: Vec::new(),
+                note: None,
             }],
             properties: Vec::new(),
             constructors: Vec::new(),
             enum_values: Vec::new(),
+            note: None,
         });
 
         index

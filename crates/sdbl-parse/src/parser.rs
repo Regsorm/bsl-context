@@ -11,6 +11,7 @@ use crate::lexer::{tokenize, Kind, Kw, Token};
 /// Причина отказа. Текст нужен только для отладки и тестов: наружу, в находки,
 /// ошибки разбора не выходят.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ParseError {
     pub message: String,
     pub offset: usize,
@@ -122,7 +123,10 @@ pub struct Parser {
 /// `Err` означает «я это не понял» и обязан приводить к молчанию правил, а не к
 /// диагностике: непонятый запрос — вина парсера, а не автора кода.
 pub fn parse(src: &str) -> Result<Package> {
-    let tokens = tokenize(src);
+    let tokens = tokenize(src).map_err(|e| ParseError {
+        message: e.message,
+        offset: e.offset,
+    })?;
     let mut parser = Parser {
         tokens,
         pos: 0,
@@ -137,7 +141,14 @@ impl Parser {
     }
 
     fn offset(&self) -> usize {
-        self.peek().map(|t| t.offset).unwrap_or(0)
+        self.peek().map(|t| t.offset).unwrap_or_else(|| {
+            // Конец текста: смещение за последней лексемой, а не 0 — иначе
+            // ошибка на EOF указывала бы на начало запроса.
+            self.tokens
+                .last()
+                .map(|t| t.offset + t.text.len())
+                .unwrap_or(0)
+        })
     }
 
     fn bump(&mut self) -> Option<Token> {
@@ -189,6 +200,7 @@ impl Parser {
         if queries.is_empty() {
             return self.err("пакет не содержит запросов");
         }
+        attach_union_indexes(&mut queries);
         Ok(Package { queries })
     }
 
@@ -217,13 +229,23 @@ impl Parser {
         self.eat_kw(Kw::Allowed);
         self.eat_kw(Kw::Distinct);
         if self.eat_kw(Kw::Top) {
-            // Число после ПЕРВЫЕ.
-            self.bump();
+            // Число после ПЕРВЫЕ обязательно: `ВЫБРАТЬ ПЕРВЫЕ ИЗ Т` — битый
+            // запрос, и принять `ИЗ` за число значит молча потерять источник.
+            if self.peek().is_some_and(|t| t.kind == Kind::Number) {
+                self.bump();
+            } else {
+                return self.err("после ПЕРВЫЕ ожидалось число");
+            }
         }
 
         // Список полей выборки глотается, но имена полей сохраняются: по ним
-        // правила понимают, какие поля источника запросу нужны.
-        query.select = Some(self.parse_condition());
+        // правила понимают, какие поля источника запросу нужны. Пустой список
+        // (`ВЫБРАТЬ` и сразу секция) — не запрос.
+        let select = self.parse_condition()?;
+        if select.is_empty {
+            return self.err("пустой список выборки");
+        }
+        query.select = Some(select);
 
         if self.eat_kw(Kw::Into) {
             query.into = Some(self.parse_name()?);
@@ -238,10 +260,16 @@ impl Parser {
         }
 
         if self.eat_kw(Kw::Where) {
-            query.filter = Some(self.parse_condition());
+            let filter = self.parse_condition()?;
+            if filter.is_empty {
+                return self.err("пустое условие ГДЕ");
+            }
+            query.filter = Some(filter);
         }
 
-        // Секции, которые правилам безразличны.
+        // Секции, которые правилам безразличны, — но их поля сохраняем:
+        // проверке «физическая таблица регистра» важно, не используются ли
+        // там поля, существующие только в таблице движений.
         loop {
             if self.eat_kw(Kw::GroupBy)
                 || self.eat_kw(Kw::Having)
@@ -250,7 +278,8 @@ impl Parser {
                 || self.eat_kw(Kw::ForUpdate)
                 || self.eat_kw(Kw::AutoOrder)
             {
-                self.skip_expression();
+                let section = self.parse_condition()?;
+                query.extra_fields.extend(section.fields);
                 continue;
             }
             break;
@@ -264,7 +293,7 @@ impl Parser {
                 .is_some_and(|t| matches!(t.text.to_uppercase().as_str(), "НАБОРАМ" | "SETS"));
             if by_sets {
                 self.pos += 1;
-                for param in self.parse_call_params() {
+                for param in self.parse_call_params()? {
                     for field in param.fields {
                         query.index_fields.push(Named {
                             name: field.path.join("."),
@@ -284,6 +313,12 @@ impl Parser {
         // запрос пакета — правила смотрят на источники, а не на объединение.
         if self.eat_kw(Kw::Union) {
             self.eat_kw(Kw::All);
+            // `ОБЪЕДИНИТЬ` без следующей выборки — оборванный запрос; саму
+            // следующую выборку разбирает внешний контекст (пакет/подзапрос).
+            if !self.at_kw(Kw::Select) {
+                return self.err("после ОБЪЕДИНИТЬ ожидалось ВЫБРАТЬ");
+            }
+            query.has_union_continuation = true;
         }
 
         Ok(query)
@@ -317,7 +352,7 @@ impl Parser {
 
             let source = self.parse_source()?;
             let on = if self.eat_kw(Kw::On) {
-                Some(self.parse_condition())
+                Some(self.parse_condition()?)
             } else {
                 None
             };
@@ -342,19 +377,18 @@ impl Parser {
                 return self.err("в источнике ожидался подзапрос");
             }
             self.depth += 1;
-            let mut queries = vec![self.parse_query()?];
-            // `ОБЪЕДИНИТЬ` внутри скобок: `parse_query` уже снял само слово,
-            // осталось разобрать следующую выборку.
-            while self.at_kw(Kw::Select) {
-                queries.push(self.parse_query()?);
-            }
+            let parsed = self.parse_subquery_queries();
+            // Счётчик глубины обязан вернуться даже при ошибке: иначе
+            // восстановление после `Err` упрётся в исчерпанный лимит.
             self.depth -= 1;
+            let queries = parsed?;
             if !self.eat_punct(')') {
                 return self.err("не закрыта скобка подзапроса");
             }
+            let alias = self.parse_alias()?;
             return Ok(Source {
                 table: Table::Subquery(Box::new(Package { queries })),
-                alias: self.parse_alias(),
+                alias,
             });
         }
 
@@ -366,9 +400,10 @@ impl Parser {
                     offset: token.offset,
                 };
                 self.pos += 1;
+                let alias = self.parse_alias()?;
                 return Ok(Source {
                     table: Table::Parameter(named),
-                    alias: self.parse_alias(),
+                    alias,
                 });
             }
         }
@@ -381,19 +416,36 @@ impl Parser {
         }
 
         let table = if is_meta_kind(&parts[0]) && parts.len() >= 2 {
-            let mut meta = MetaTable {
-                kind: parts[0].clone(),
-                name: parts[1].clone(),
-                sub_table: parts.get(2).cloned(),
-                params: Vec::new(),
-                has_parens: false,
-                offset,
-            };
-            if self.at_punct('(') {
-                meta.has_parens = true;
-                meta.params = self.parse_call_params();
+            // Составной путь (`ВнешнийИсточникДанных.<Ист>.Таблица.<Табл>` или
+            // куб с измерениями) в подмножество не входит — но `Err` здесь
+            // стоил бы молчания ВСЕХ правил по этому тексту, а не только по
+            // этому источнику. Отдаём `Unknown`: потребитель обязан такой
+            // источник пропускать (см. `Table::Unknown`).
+            if parts.len() > 3 {
+                if self.at_punct('(') {
+                    // Скобки съедаем, чтобы не сбить разбор остального запроса.
+                    self.parse_call_params()?;
+                }
+                Table::Unknown(Named {
+                    name: parts.last().cloned().unwrap_or_default(),
+                    offset,
+                })
+            } else {
+                // `MetaTable` хранит ровно три сегмента.
+                let mut meta = MetaTable {
+                    kind: parts[0].clone(),
+                    name: parts[1].clone(),
+                    sub_table: parts.get(2).cloned(),
+                    params: Vec::new(),
+                    has_parens: false,
+                    offset,
+                };
+                if self.at_punct('(') {
+                    meta.has_parens = true;
+                    meta.params = self.parse_call_params()?;
+                }
+                Table::Meta(meta)
             }
-            Table::Meta(meta)
         } else {
             // Скобки после имени, не являющегося метаданными, — это уже не
             // таблица, а что-то, чего подмножество не знает.
@@ -406,14 +458,28 @@ impl Parser {
             })
         };
 
-        Ok(Source {
-            table,
-            alias: self.parse_alias(),
-        })
+        let alias = self.parse_alias()?;
+        Ok(Source { table, alias })
+    }
+
+    /// Выборки внутри скобок подзапроса: первая плюс присоединённые через
+    /// `ОБЪЕДИНИТЬ`. Вызывается при уже увеличенном `depth`.
+    fn parse_subquery_queries(&mut self) -> Result<Vec<Query>> {
+        let mut queries = vec![self.parse_query()?];
+        // `ОБЪЕДИНИТЬ` внутри скобок: `parse_query` уже снял само слово,
+        // осталось разобрать следующую выборку.
+        while self.at_kw(Kw::Select) {
+            queries.push(self.parse_query()?);
+        }
+        attach_union_indexes(&mut queries);
+        Ok(queries)
     }
 
     /// Алиас источника: `КАК Имя` либо просто имя следом.
-    fn parse_alias(&mut self) -> Option<Named> {
+    ///
+    /// `КАК` без имени — ошибка: молча оставить алиас пустым значит потерять
+    /// часть синтаксиса и дать правилам неверную картину запроса.
+    fn parse_alias(&mut self) -> Result<Option<Named>> {
         if self.eat_kw(Kw::As) {
             // После `КАК` стоит имя, даже если оно совпало с ключевым словом.
             if let Some(token) = self.peek() {
@@ -423,10 +489,10 @@ impl Parser {
                         offset: token.offset,
                     };
                     self.pos += 1;
-                    return Some(named);
+                    return Ok(Some(named));
                 }
             }
-            return None;
+            return self.err("после КАК ожидалось имя");
         }
         if let Some(token) = self.peek() {
             if token.kind == Kind::Ident {
@@ -435,10 +501,10 @@ impl Parser {
                     offset: token.offset,
                 };
                 self.pos += 1;
-                return Some(named);
+                return Ok(Some(named));
             }
         }
-        None
+        Ok(None)
     }
 
     fn parse_ident(&mut self) -> Result<String> {
@@ -449,6 +515,18 @@ impl Parser {
             if let Some(next) = self.tokens.get(self.pos + 1) {
                 if next.kind == Kind::Number {
                     let text = format!("%{}", next.text);
+                    self.pos += 2;
+                    return Ok(text);
+                }
+            }
+        }
+        // Имя-шаблон из конструктора запроса: `ПОМЕСТИТЬ #ИмяТаблицы`.
+        // Правила такие имена пропускают (`is_template_name`), но разбор
+        // остального запроса ломать нельзя.
+        if self.at_punct('#') {
+            if let Some(next) = self.tokens.get(self.pos + 1) {
+                if next.kind == Kind::Ident {
+                    let text = format!("#{}", next.text);
                     self.pos += 2;
                     return Ok(text);
                 }
@@ -490,16 +568,18 @@ impl Parser {
     }
 
     /// Разобрать скобки вызова, разделив содержимое по запятым верхнего уровня.
-    fn parse_call_params(&mut self) -> Vec<Condition> {
+    ///
+    /// `Err` — скобки не закрыты: иначе остаток текста (в том числе следующий
+    /// оператор пакета) был бы проглочен как содержимое вызова.
+    fn parse_call_params(&mut self) -> Result<Vec<Condition>> {
         let mut params = Vec::new();
         if !self.eat_punct('(') {
-            return params;
+            return Ok(params);
         }
 
         let mut depth = 1usize;
         let mut current = Condition {
             offset: self.offset(),
-            is_empty: true,
             ..Default::default()
         };
         let mut path: Vec<String> = Vec::new();
@@ -521,7 +601,6 @@ impl Parser {
                 flush_path(&mut path, path_offset, &mut current);
                 params.push(std::mem::take(&mut current));
                 current.offset = token.offset;
-                current.is_empty = true;
                 after_dot = false;
                 self.pos += 1;
                 continue;
@@ -542,6 +621,7 @@ impl Parser {
             collect_field(
                 &token,
                 next_is_dot,
+                false,
                 &mut path,
                 &mut path_offset,
                 &mut after_dot,
@@ -550,47 +630,30 @@ impl Parser {
             self.pos += 1;
         }
 
+        if depth > 0 {
+            return self.err("не закрыта скобка в параметрах");
+        }
+
         flush_path(&mut path, path_offset, &mut current);
         if !current.is_empty || !params.is_empty() {
             params.push(current);
         }
-        params
-    }
-
-    /// Проглотить выражение до ближайшего ключевого слова секции верхнего уровня.
-    fn skip_expression(&mut self) {
-        let mut depth = 0usize;
-        while let Some(token) = self.peek() {
-            if token.is_punct('(') {
-                depth += 1;
-            } else if token.is_punct(')') {
-                if depth == 0 {
-                    return; // скобка чужая — мы внутри подзапроса
-                }
-                depth -= 1;
-            } else if token.is_punct(';') && depth == 0 {
-                return;
-            } else if depth == 0 {
-                if let Kind::Keyword(kw) = token.kind {
-                    if SECTION_KEYWORDS.contains(&kw) {
-                        return;
-                    }
-                }
-            }
-            self.pos += 1;
-        }
+        Ok(params)
     }
 
     /// Проглотить условие, сохранив упомянутые поля и наличие `ИЛИ`.
-    fn parse_condition(&mut self) -> Condition {
+    ///
+    /// `Err` — условие оборвалось на незакрытой скобке: продолжение текста
+    /// (например, следующий оператор пакета) иначе было бы проглочено.
+    fn parse_condition(&mut self) -> Result<Condition> {
         let mut condition = Condition {
             offset: self.offset(),
-            is_empty: true,
             ..Default::default()
         };
         let mut path: Vec<String> = Vec::new();
         let mut path_offset = 0usize;
         let mut after_dot = false;
+        let mut prev_was_as = false;
         let mut depth = 0usize;
 
         while let Some(token) = self.peek().cloned() {
@@ -609,6 +672,29 @@ impl Parser {
                         break;
                     }
                 }
+            } else if token.is(Kw::Select) {
+                // Подзапрос внутри скобок: его поля принадлежат другому
+                // источнику и в fields внешнего условия попадать не должны.
+                // Флаг has_subquery сигналит потребителю «поля неполны».
+                condition.has_subquery = true;
+                let outer = depth;
+                self.pos += 1;
+                while let Some(t) = self.peek() {
+                    if t.is_punct('(') {
+                        depth += 1;
+                    } else if t.is_punct(')') {
+                        if depth == outer {
+                            // Закрылась скобка, внутри которой был подзапрос.
+                            depth -= 1;
+                            self.pos += 1;
+                            break;
+                        }
+                        depth -= 1;
+                    }
+                    self.pos += 1;
+                }
+                prev_was_as = false;
+                continue;
             }
 
             condition.is_empty = false;
@@ -618,13 +704,35 @@ impl Parser {
                     condition.has_top_level_or = true;
                 }
             }
+            if token.is_punct('*') && depth == 0 {
+                // Джокер состава полей (`ВЫБРАТЬ *`, `ВЫБРАТЬ Т.*`,
+                // `ВЫБРАТЬ ПЕРВЫЕ 10 *`), а не умножение и не аргумент
+                // `КОЛИЧЕСТВО(*)`. Признак — справа нет операнда: у умножения он
+                // есть всегда (`Т.А * 2`, `Т.А * -1`), у вызова — скобка, у
+                // джокера — запятая, ключевое слово или конец условия. Иначе
+                // `ВЫБРАТЬ КОЛИЧЕСТВО(*)` глушило правило о физической таблице
+                // регистра — состав полей «неизвестен», хотя он известен.
+                let next_is_operand = self.tokens.get(self.pos + 1).is_some_and(|t| {
+                    matches!(t.kind, Kind::Ident | Kind::Number | Kind::Str | Kind::Param)
+                        || t.is_punct('.')
+                        || t.is_punct('(')
+                        || t.is_punct('+')
+                        || t.is_punct('-')
+                });
+                if !next_is_operand {
+                    condition.has_star = true;
+                }
+            }
             let next_is_dot = self
                 .tokens
                 .get(self.pos + 1)
                 .is_some_and(|t| t.is_punct('.'));
+            let is_alias = prev_was_as;
+            prev_was_as = token.is(Kw::As);
             collect_field(
                 &token,
                 next_is_dot,
+                is_alias,
                 &mut path,
                 &mut path_offset,
                 &mut after_dot,
@@ -633,8 +741,12 @@ impl Parser {
             self.pos += 1;
         }
 
+        if depth > 0 {
+            return self.err("не закрыта скобка в условии");
+        }
+
         flush_path(&mut path, path_offset, &mut condition);
-        condition
+        Ok(condition)
     }
 }
 
@@ -642,14 +754,24 @@ impl Parser {
 ///
 /// `after_dot` обязателен: без него два имени подряд (`Товары Т` — источник и
 /// его алиас) слиплись бы в один путь `Товары.Т`, которого в запросе нет.
+///
+/// `is_alias` — предыдущая лексема была `КАК`: имя после неё это алиас
+/// выражения (`СУММА(Т.Кол) КАК Регистратор`), а не поле источника. Попадание
+/// алиаса в `fields` даёт ложные срабатывания правил.
 fn collect_field(
     token: &Token,
     next_is_dot: bool,
+    is_alias: bool,
     path: &mut Vec<String>,
     path_offset: &mut usize,
     after_dot: &mut bool,
     condition: &mut Condition,
 ) {
+    if is_alias {
+        flush_path(path, *path_offset, condition);
+        *after_dot = false;
+        return;
+    }
     // Ключевое слово рядом с точкой — это имя: `В.Ссылка`, `Т.В`. Само по себе
     // (`И`, `ИЛИ` между условиями) — оператор, и полем считаться не должно.
     let is_name = token.kind == Kind::Ident || (is_name_like(token) && (*after_dot || next_is_dot));
@@ -670,6 +792,30 @@ fn collect_field(
     }
     flush_path(path, *path_offset, condition);
     *after_dot = false;
+}
+
+/// `ИНДЕКСИРОВАТЬ ПО` при `ОБЪЕДИНИТЬ` стоит в тексте после ПОСЛЕДНЕЙ выборки
+/// цепочки, а `ПОМЕСТИТЬ` — на первой: без переноса правило о неиндексированной
+/// временной таблице срабатывало бы на корректном запросе.
+fn attach_union_indexes(queries: &mut [Query]) {
+    let mut i = 0;
+    while i < queries.len() {
+        if queries[i].into.is_some()
+            && queries[i].has_union_continuation
+            && queries[i].index_fields.is_empty()
+        {
+            let mut last = i;
+            while last + 1 < queries.len() && queries[last].has_union_continuation {
+                last += 1;
+            }
+            if last > i && !queries[last].index_fields.is_empty() {
+                queries[i].index_fields = std::mem::take(&mut queries[last].index_fields);
+            }
+            i = last + 1;
+            continue;
+        }
+        i += 1;
+    }
 }
 
 fn flush_path(path: &mut Vec<String>, offset: usize, condition: &mut Condition) {

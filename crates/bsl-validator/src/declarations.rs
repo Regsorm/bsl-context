@@ -33,7 +33,7 @@
 
 use std::collections::HashMap;
 
-use crate::expression::{pos_at, Confidence, ExprError, ExprErrorKind};
+use crate::expression::{Confidence, ExprError, ExprErrorKind};
 
 /// Ключевые слова языка. Имя из этого списка платформа не примет как имя
 /// процедуры ни при каких условиях — это не эвристика, а грамматика языка.
@@ -169,8 +169,10 @@ fn scan_structure_tokens(cleaned: &str) -> Vec<(usize, Token)> {
         ("function", Token::Header),
     ];
 
-    let lower = cleaned.to_lowercase();
-    debug_assert_eq!(lower.len(), cleaned.len(), "смена регистра изменила длину");
+    // Регистр не должен менять длину: `to_lowercase()` удлиняет U+0130 (İ)
+    // и укорачивает U+1E9E (ẞ), после чего байтовые смещения слов разъезжаются
+    // с исходником (паника в debug, неверные line/col в release).
+    let lower = lower_len_preserving(cleaned);
 
     let mut out = Vec::new();
     let mut i = 0usize;
@@ -251,6 +253,49 @@ fn starts_statement(lower: &str, at: usize, prev_end: usize) -> bool {
 /// блока не распознавался.
 fn is_indent_char(c: char) -> bool {
     (c.is_whitespace() && c != '\n' && c != '\r') || c == '\u{FEFF}'
+}
+
+/// Регистронезависимая копия ТОЙ ЖЕ длины: символы, чей `to_lowercase()`
+/// меняет число байт (U+0130 `İ`, U+1E9E `ẞ`), остаются как есть. Для ключевых
+/// слов BSL этого достаточно, а смещения обязаны совпадать с исходником.
+fn lower_len_preserving(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        let mut lower = ch.to_lowercase();
+        let first = lower.next().unwrap_or(ch);
+        if first.len_utf8() == ch.len_utf8() && lower.next().is_none() {
+            out.push(first);
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Начала строк: перевод байта в (line, col) за O(log n) вместо скана с начала
+/// файла — иначе k находок давали O(n·k), и большой модуль вешал валидатор.
+struct LineIndex {
+    starts: Vec<usize>,
+}
+
+impl LineIndex {
+    fn new(src: &str) -> Self {
+        let mut starts = vec![0usize];
+        for (i, ch) in src.char_indices() {
+            if ch == '\n' {
+                starts.push(i + 1);
+            }
+        }
+        Self { starts }
+    }
+
+    fn pos(&self, src: &str, byte: usize) -> (u32, u32) {
+        let byte = byte.min(src.len());
+        let line = self.starts.partition_point(|&s| s <= byte).max(1);
+        let line_start = self.starts[line - 1];
+        let col = src[line_start..byte].chars().count() + 1;
+        (line as u32, col as u32)
+    }
 }
 
 /// Обрезать ведущие пробелы вместе с меткой порядка байт.
@@ -374,9 +419,10 @@ pub(crate) fn scan_declarations_with_pos(cleaned: &str) -> Vec<DeclFact> {
 pub(crate) fn check_declarations(source: &str, cleaned: &str, errors: &mut Vec<ExprError>) {
     let decls = scan_declarations_with_pos(cleaned);
     let mut seen: HashMap<&str, usize> = HashMap::new();
+    let lines = LineIndex::new(source);
 
     for decl in &decls {
-        let (line, col) = pos_at(source, decl.byte);
+        let (line, col) = lines.pos(source, decl.byte);
 
         if KEYWORDS.contains(&decl.name_lower.as_str()) {
             errors.push(ExprError::new_with_confidence(
@@ -439,13 +485,14 @@ pub(crate) fn check_declarations(source: &str, cleaned: &str, errors: &mut Vec<E
 pub(crate) fn check_module_structure(source: &str, cleaned: &str, errors: &mut Vec<ExprError>) {
     let mut depth: i32 = 0;
     let mut open_byte: Option<usize> = None;
+    let lines = LineIndex::new(source);
 
     for (byte, token) in scan_structure_tokens(cleaned) {
         match token {
             Token::Header => {
                 if depth > 0 {
                     // Заголовок внутри незакрытого блока — предыдущий не закрыт.
-                    let (l, c) = pos_at(source, open_byte.unwrap_or(byte));
+                    let (l, c) = lines.pos(source, open_byte.unwrap_or(byte));
                     errors.push(ExprError::new_with_confidence(
                         l,
                         c,
@@ -465,7 +512,7 @@ pub(crate) fn check_module_structure(source: &str, cleaned: &str, errors: &mut V
             Token::End => {
                 depth -= 1;
                 if depth < 0 {
-                    let (l, c) = pos_at(source, byte);
+                    let (l, c) = lines.pos(source, byte);
                     errors.push(ExprError::new_with_confidence(
                         l,
                         c,
@@ -486,7 +533,7 @@ pub(crate) fn check_module_structure(source: &str, cleaned: &str, errors: &mut V
     }
 
     if depth > 0 {
-        let (l, c) = pos_at(source, open_byte.unwrap_or(0));
+        let (l, c) = lines.pos(source, open_byte.unwrap_or(0));
         errors.push(ExprError::new_with_confidence(
             l,
             c,

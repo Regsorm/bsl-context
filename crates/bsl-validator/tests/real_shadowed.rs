@@ -84,15 +84,15 @@ fn external_processing_form_layout_is_high() {
 }
 
 #[test]
-fn form_var_declaration_is_high() {
+fn form_var_declaration_is_silent() {
+    // `Перем Элементы;` сам создаёт локальное имя и перекрывает контекст —
+    // находки нет (согласовано с bsl-analyzer: declared binding законен).
     let Some(path) = hbk_path() else { return };
     let index = load_from_hbk(&path).expect("PlatformIndex");
     let src = "&НаСервере\nПроцедура Т()\nПерем Элементы;\nКонецПроцедуры\n";
     let result =
         validate_module_with_profile(&index, src, Some(FORM_MODULE), None, 1, Profile::Full);
-    let found = shadowed(&result.errors);
-    assert_eq!(found.len(), 1, "{:#?}", result.errors);
-    assert_eq!(found[0].confidence, Confidence::High);
+    assert!(shadowed(&result.errors).is_empty(), "{:#?}", result.errors);
 }
 
 #[test]

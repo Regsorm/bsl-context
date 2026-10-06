@@ -208,6 +208,15 @@ pub struct BuildStats {
 pub fn build(root: &Path, db_path: &Path, jobs: usize) -> Result<BuildStats> {
     let start = Instant::now();
 
+    // Опечатка в --root иначе неотличима от пустой выгрузки: WalkDir молча
+    // отдаёт ноль файлов, и валидный пустой индекс подменяет рабочую базу.
+    if !root.is_dir() {
+        anyhow::bail!(
+            "каталог выгрузки не найден или не каталог: {}",
+            root.display()
+        );
+    }
+
     if jobs > 0 {
         // Игнорируем ошибку: глобальный пул rayon можно построить только один
         // раз за процесс (актуально при повторном build() внутри одного теста).
@@ -230,6 +239,13 @@ pub fn build(root: &Path, db_path: &Path, jobs: usize) -> Result<BuildStats> {
         xml: xml_paths,
     } = collect_dump_files(root);
     let walk_ms = t.elapsed().as_millis();
+
+    if bsl_files.is_empty() && xml_paths.is_empty() {
+        anyhow::bail!(
+            "в каталоге выгрузки не найдено ни модулей .bsl, ни метаданных .xml: {}",
+            root.display()
+        );
+    }
 
     // 2. Факты XML — параллельно: чтение и разбор тысяч мелких файлов. Порядок
     // объектов сохраняется (`collect` у rayon повторяет порядок исходной
@@ -431,24 +447,36 @@ pub fn is_application_module_file(file_name: &str) -> bool {
 /// файла на диске нет — только текст, полученный по сети. Правило чтения
 /// объявления должно жить в одном месте.
 pub fn global_export_vars_from_text(text: &str) -> Vec<String> {
+    // Маскируем строки и комментарии: `Перем Секрет Экспорт;` внутри
+    // многострочного литерала — не объявление (раньше попадало фантомом).
+    let masked = bsl_parse::mask_strings_and_comments(text);
     let mut names = Vec::new();
-    for line in text.lines() {
-        let code = line.split("//").next().unwrap_or("").trim();
+    for line in masked.lines() {
+        // `trim` не снимает BOM (U+FEFF не whitespace): объявление в первой
+        // строке BOM-модуля иначе терялось, а все модули выгрузки — с BOM.
+        let code = line
+            .trim_start_matches(|c: char| c.is_whitespace() || c == '\u{FEFF}')
+            .trim_end()
+            .trim_end_matches(';');
         let Some(sep) = code.find(char::is_whitespace) else {
             continue;
         };
         let (keyword, tail) = code.split_at(sep);
         // Сравнение через to_lowercase: eq_ignore_ascii_case кириллицу не сворачивает.
-        if keyword.to_lowercase() != "перем" {
+        let keyword = keyword.to_lowercase();
+        if keyword != "перем" && keyword != "var" {
             continue;
         }
         // `Перем А Экспорт, Б Экспорт;` — `Экспорт` ставится у каждого имени.
-        for part in tail.trim_end().trim_end_matches(';').split(',') {
+        for part in tail.split(',') {
             let mut words = part.split_whitespace();
             let Some(name) = words.next() else {
                 continue;
             };
-            if words.any(|w| w.to_lowercase() == "экспорт") {
+            if words.any(|w| {
+                let w = w.to_lowercase();
+                w == "экспорт" || w == "export"
+            }) {
                 names.push(name.to_string());
             }
         }
@@ -507,6 +535,9 @@ fn collect_dump_files(root: &Path) -> DumpFiles {
         })
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
+    // Ошибки обхода отдельных каталогов (нет прав и т.п.) терпим молча:
+    // фатальный случай — опечатка в корне — отсечён проверкой `is_dir`
+    // до обхода, а падать из-за недоступной подпапки хуже, чем пропустить её.
     {
         let path = entry.path();
         match path.extension().and_then(|ext| ext.to_str()) {
@@ -852,7 +883,13 @@ fn parse_module(
 /// `&ИзменениеИКонтроль`) на строке текста, замаскированного от строк/комментариев.
 fn has_extension_directive(masked: &str) -> bool {
     masked.lines().any(|line| {
-        let Some(rest) = line.trim_start().strip_prefix('&') else {
+        // BOM не снимается `trim_start` (U+FEFF не whitespace): директива в
+        // первой строке BOM-модуля иначе не распознавалась, и модуль
+        // расширения терял льготу (массовые ложные UndeclaredMethod).
+        let Some(rest) = line
+            .trim_start_matches(|c: char| c.is_whitespace() || c == '\u{FEFF}')
+            .strip_prefix('&')
+        else {
             return false;
         };
         let name: String = rest
@@ -1010,9 +1047,10 @@ impl LiteIndex {
     /// Экспортные методы модуля объекта-владельца (для модуля формы внешней обработки).
     ///
     /// Владельца берём из индекса, а если самого модуля там нет — выводим из пути:
-    /// путь формы уже говорит, кто владелец. Иначе новая форма, ещё не попавшая в
-    /// индекс, давала бы ложную находку на законном вызове метода своего объекта.
-    pub fn owner_exports(&self, module_path: &str) -> Result<Vec<String>> {
+    /// путь формы уже говорит, кто владелец. `None` — «не знаю»: владельца нет,
+    /// либо его модуля нет в индексе. Пустой набор в этих случаях дал бы ложную
+    /// находку на законном вызове метода владельца.
+    pub fn owner_exports(&self, module_path: &str) -> Result<Option<Vec<String>>> {
         let owner_path: Option<String> = self
             .conn
             .query_row(
@@ -1025,8 +1063,23 @@ impl LiteIndex {
             .or_else(|| owner_module_path(module_path));
 
         let Some(owner_path) = owner_path else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
+
+        // Модуль-владелец обязан быть в индексе: без него про экспорты ничего
+        // не известно, и молчание обязательно.
+        let owner_present = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM modules WHERE path = ?1",
+                params![owner_path],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !owner_present {
+            return Ok(None);
+        }
 
         let mut stmt = self.conn.prepare(
             "SELECT m.name_lower FROM methods m JOIN modules md ON md.id = m.module_id \
@@ -1037,7 +1090,7 @@ impl LiteIndex {
         for row in rows {
             out.push(row?);
         }
-        Ok(out)
+        Ok(Some(out))
     }
 
     /// Все объявленные имена методов (в нижнем регистре), одним запросом.

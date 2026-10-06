@@ -121,8 +121,18 @@ fn build_indexes_all_modules_and_flags() {
 
     let exports = index
         .owner_exports("external/Обр/Form/Ф/Form.obj.bsl")
-        .unwrap();
+        .unwrap()
+        .expect("владелец есть в индексе — Set, а не None");
     assert_eq!(exports, vec!["экспортныйметодобр".to_string()]);
+
+    // Не форма → владельца нет: «не знаю» (None), а не пустой набор.
+    assert!(
+        index
+            .owner_exports("base/CommonModules/Обычный/Ext/Module.bsl")
+            .unwrap()
+            .is_none(),
+        "у не-формы владельца быть не может"
+    );
 
     // Объект без модуля (перечисление) обязан попасть в objects — источник
     // тут XML, а не таблица modules.

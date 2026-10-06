@@ -85,6 +85,14 @@ impl Token {
     }
 }
 
+/// Ошибка лексического разбора: текст даже на лексемы не распался
+/// (например, строковый литерал не закрыт).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LexError {
+    pub message: String,
+    pub offset: usize,
+}
+
 /// Односложные ключевые слова: русская форма, английская форма, значение.
 const KEYWORDS: &[(&str, &str, Kw)] = &[
     ("ВЫБРАТЬ", "SELECT", Kw::Select),
@@ -135,9 +143,6 @@ const COMPOUND: &[(&[&str], &[&str], Kw)] = &[
     (&["ДЛЯ", "ИЗМЕНЕНИЯ"], &["FOR", "UPDATE"], Kw::ForUpdate),
 ];
 
-/// Максимум слов в составном ключевом слове.
-const COMPOUND_MAX_WORDS: usize = 2;
-
 fn upper(s: &str) -> String {
     s.to_uppercase()
 }
@@ -155,8 +160,9 @@ fn is_ident_char(c: char) -> bool {
 }
 
 /// Разбить текст запроса на лексемы. Незнакомые символы становятся `Punct` —
-/// парсер сам решит, мешают они ему или нет.
-pub fn tokenize(src: &str) -> Vec<Token> {
+/// парсер сам решит, мешают они ему или нет. Незакрытый строковый литерал —
+/// ошибка: молча проглотить остаток запроса значит выдать мусор за разбор.
+pub fn tokenize(src: &str) -> Result<Vec<Token>, LexError> {
     let bytes = src.as_bytes();
     let mut tokens: Vec<Token> = Vec::new();
     let mut i = 0usize;
@@ -165,14 +171,17 @@ pub fn tokenize(src: &str) -> Vec<Token> {
         let rest = &src[i..];
         let Some(c) = rest.chars().next() else { break };
 
-        if c.is_whitespace() {
+        // U+FEFF (BOM) в начале текста запроса — разметка, а не знак.
+        if c.is_whitespace() || c == '\u{FEFF}' {
             i += c.len_utf8();
             continue;
         }
 
-        // Комментарий внутри текста запроса.
+        // Комментарий внутри текста запроса. Кончается по `\r` или `\n`
+        // (грамматика SDBLLexer: тело — `~[\r\n]*`), а не только по `\n`:
+        // иначе CR-only текст молча съедал бы весь остаток запроса.
         if rest.starts_with("//") {
-            while i < bytes.len() && bytes[i] != b'\n' {
+            while i < bytes.len() && bytes[i] != b'\n' && bytes[i] != b'\r' {
                 i += 1;
             }
             continue;
@@ -182,6 +191,7 @@ pub fn tokenize(src: &str) -> Vec<Token> {
         if c == '"' {
             let start = i;
             i += 1;
+            let mut closed = false;
             while i < bytes.len() {
                 if bytes[i] == b'"' {
                     if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
@@ -189,9 +199,16 @@ pub fn tokenize(src: &str) -> Vec<Token> {
                         continue;
                     }
                     i += 1;
+                    closed = true;
                     break;
                 }
                 i += 1;
+            }
+            if !closed {
+                return Err(LexError {
+                    message: "незакрытый строковый литерал".to_string(),
+                    offset: start,
+                });
             }
             tokens.push(Token {
                 kind: Kind::Str,
@@ -224,14 +241,23 @@ pub fn tokenize(src: &str) -> Vec<Token> {
 
         if c.is_ascii_digit() {
             let start = i;
+            let mut seen_dot = false;
             while i < bytes.len() {
                 let Some(ch) = src[i..].chars().next() else {
                     break;
                 };
-                if !ch.is_ascii_digit() && ch != '.' {
-                    break;
+                if ch.is_ascii_digit() {
+                    i += 1;
+                    continue;
                 }
-                i += ch.len_utf8();
+                if ch == '.' && !seen_dot {
+                    // Грамматика FLOAT: DIGIT+ '.' DIGIT* — ровно одна точка.
+                    // Вторая точка начинает другой токен: `1.2.3` — не число.
+                    seen_dot = true;
+                    i += 1;
+                    continue;
+                }
+                break;
             }
             tokens.push(Token {
                 kind: Kind::Number,
@@ -273,42 +299,57 @@ pub fn tokenize(src: &str) -> Vec<Token> {
         i += c.len_utf8();
     }
 
-    merge_compound(tokens)
+    Ok(merge_compound(tokens, src))
 }
 
-/// Склеить составные ключевые слова в одну лексему.
-fn merge_compound(tokens: Vec<Token>) -> Vec<Token> {
+/// Склеить составные ключевые слова (`СГРУППИРОВАТЬ ПО`, `ДЛЯ ИЗМЕНЕНИЯ` …)
+/// в одну лексему.
+///
+/// `text` — точный срез источника от первого слова до конца второго: внутренние
+/// пробелы и переводы строк сохраняются, поэтому `src[offset .. offset +
+/// text.len()]` всегда валиден (раньше пробел синтезировался и при нескольких
+/// пробелах срез уезжал в середину следующего слова).
+///
+/// После `КАК` или точки первое слово — имя (алиас/поле), а не начало
+/// составного ключевого слова: `КАК Упорядочить ПО …` не склеивается.
+fn merge_compound(tokens: Vec<Token>, src: &str) -> Vec<Token> {
+    let uppers: Vec<String> = tokens.iter().map(|t| t.text.to_uppercase()).collect();
     let mut out: Vec<Token> = Vec::with_capacity(tokens.len());
     let mut i = 0usize;
 
     while i < tokens.len() {
+        let name_context = i > 0 && (tokens[i - 1].is(Kw::As) || tokens[i - 1].is_punct('.'));
         let mut matched = false;
 
-        for (ru, en, kw) in COMPOUND {
-            let len = ru.len().min(COMPOUND_MAX_WORDS);
-            if i + len > tokens.len() {
-                continue;
-            }
-            let window = &tokens[i..i + len];
-            let same = |pattern: &[&str]| {
-                window
-                    .iter()
-                    .zip(pattern.iter())
-                    .all(|(tok, word)| upper(&tok.text) == **word)
-            };
-            if same(ru) || same(en) {
-                out.push(Token {
-                    kind: Kind::Keyword(*kw),
-                    text: window
+        if !name_context {
+            for (ru, en, kw) in COMPOUND {
+                debug_assert_eq!(
+                    ru.len(),
+                    en.len(),
+                    "пары COMPOUND должны совпадать по числу слов"
+                );
+                let len = ru.len();
+                if len == 0 || i + len > tokens.len() {
+                    continue;
+                }
+                let same = |pattern: &[&str]| {
+                    pattern
                         .iter()
-                        .map(|t| t.text.as_str())
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                    offset: window[0].offset,
-                });
-                i += len;
-                matched = true;
-                break;
+                        .enumerate()
+                        .all(|(k, word)| uppers[i + k] == **word)
+                };
+                if same(ru) || same(en) {
+                    let first = &tokens[i];
+                    let last = &tokens[i + len - 1];
+                    out.push(Token {
+                        kind: Kind::Keyword(*kw),
+                        text: src[first.offset..last.offset + last.text.len()].to_string(),
+                        offset: first.offset,
+                    });
+                    i += len;
+                    matched = true;
+                    break;
+                }
             }
         }
 
@@ -327,13 +368,13 @@ mod tests {
 
     #[test]
     fn keywords_are_case_and_language_insensitive() {
-        let tokens = tokenize("выбрать SELECT Выбрать");
+        let tokens = tokenize("выбрать SELECT Выбрать").unwrap();
         assert!(tokens.iter().all(|t| t.is(Kw::Select)), "{tokens:?}");
     }
 
     #[test]
     fn compound_keywords_are_one_token() {
-        let tokens = tokenize("СГРУППИРОВАТЬ ПО Поле");
+        let tokens = tokenize("СГРУППИРОВАТЬ ПО Поле").unwrap();
         assert!(tokens[0].is(Kw::GroupBy));
         assert_eq!(tokens[1].kind, Kind::Ident);
     }
@@ -341,26 +382,49 @@ mod tests {
     #[test]
     fn standalone_by_is_not_group_by() {
         // `ПО` условия соединения не должно съедаться составным ключевым словом.
-        let tokens = tokenize("ПО Т.Поле = Д.Поле");
+        let tokens = tokenize("ПО Т.Поле = Д.Поле").unwrap();
         assert!(tokens[0].is(Kw::On));
     }
 
     #[test]
     fn offsets_point_at_source() {
-        let src = "ВЫБРАТЬ Товар ИЗ Справочник.Товары";
-        for token in tokenize(src) {
+        let src = "ВЫБРАТЬ Товар ИЗ Справочник.Товары СГРУППИРОВАТЬ    ПО Товар";
+        for token in tokenize(src).unwrap() {
             assert!(
-                src[token.offset..].starts_with(&token.text)
-                    || token.kind == Kind::Keyword(Kw::GroupBy),
+                src[token.offset..].starts_with(&token.text),
                 "лексема {:?} не на своём месте",
                 token
             );
         }
     }
 
+    /// Несколько пробелов внутри составного ключевого слова: `text` — точный
+    /// срез источника, а не синтезированная склейка через один пробел.
+    #[test]
+    fn compound_text_is_source_slice() {
+        let src = "СГРУППИРОВАТЬ \t ПО Т.Поле";
+        let tokens = tokenize(src).unwrap();
+        assert!(tokens[0].is(Kw::GroupBy));
+        assert_eq!(tokens[0].text, "СГРУППИРОВАТЬ \t ПО");
+        assert_eq!(
+            &src[tokens[0].offset..tokens[0].offset + tokens[0].text.len()],
+            "СГРУППИРОВАТЬ \t ПО"
+        );
+    }
+
+    /// Алиас, совпавший со словом составного ключевого слова, не склеивается:
+    /// `КАК Упорядочить ПО …` — это `КАК` + имя + условие соединения.
+    #[test]
+    fn alias_like_compound_word_is_not_merged() {
+        let tokens = tokenize("КАК Упорядочить ПО А.Поле").unwrap();
+        assert_eq!(tokens[0].kind, Kind::Keyword(Kw::As));
+        assert_eq!(tokens[1].kind, Kind::Ident);
+        assert!(tokens[2].is(Kw::On), "{tokens:?}");
+    }
+
     #[test]
     fn params_and_strings_are_whole() {
-        let tokens = tokenize("ГДЕ Дата >= &НачалоПериода И Имя = \"Иванов\"");
+        let tokens = tokenize("ГДЕ Дата >= &НачалоПериода И Имя = \"Иванов\"").unwrap();
         assert!(tokens
             .iter()
             .any(|t| t.kind == Kind::Param && t.text == "&НачалоПериода"));
@@ -369,8 +433,40 @@ mod tests {
 
     #[test]
     fn cyrillic_identifier_is_one_token() {
-        let tokens = tokenize("ТоварыНаСкладах");
+        let tokens = tokenize("ТоварыНаСкладах").unwrap();
         assert_eq!(tokens.len(), 1);
         assert_eq!(tokens[0].kind, Kind::Ident);
+    }
+
+    #[test]
+    fn unclosed_string_is_error() {
+        assert!(tokenize("ВЫБРАТЬ \"abc").is_err());
+        // Экранированная кавычка в конце — тоже незакрытая строка.
+        assert!(tokenize("ВЫБРАТЬ \"abc\"\"").is_err());
+    }
+
+    /// Комментарий кончается и по `\r`: CR-only текст не должен проглатывать
+    /// остаток запроса.
+    #[test]
+    fn comment_ends_at_carriage_return() {
+        let tokens = tokenize("ВЫБРАТЬ Поле // c\rИЗ Т").unwrap();
+        assert!(tokens.iter().any(|t| t.is(Kw::From)), "{tokens:?}");
+    }
+
+    /// Число — не более одной точки: `1.2.3` бьётся на `1.2`, `.` и `3`.
+    #[test]
+    fn number_has_single_dot() {
+        let tokens = tokenize("1.2.3").unwrap();
+        assert_eq!(tokens.len(), 3, "{tokens:?}");
+        assert_eq!(tokens[0].kind, Kind::Number);
+        assert_eq!(tokens[0].text, "1.2");
+        assert_eq!(tokens[1].kind, Kind::Punct);
+        assert_eq!(tokens[2].kind, Kind::Number);
+    }
+
+    /// BOM в начале текста запроса не мешает разбору.
+    #[test]
+    fn bom_is_whitespace() {
+        assert!(tokenize("\u{FEFF}ВЫБРАТЬ 1").unwrap()[0].is(Kw::Select));
     }
 }

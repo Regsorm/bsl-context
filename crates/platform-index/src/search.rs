@@ -121,7 +121,14 @@ impl SearchEngine {
             HashIndex::from_iter_with(index.global_properties.iter().cloned(), |p| {
                 (p.name_ru.as_str(), p.name_en.as_str())
             });
-        let types_hash = HashIndex::from_iter_with(index.types.values().cloned(), |t| {
+        // Типы — из детерминированно упорядоченного списка: при коллизии
+        // английских имён `or_insert` иначе выбирал бы победителя случайным
+        // обходом HashMap, и `find_type` по en-имени отвечал бы по-разному
+        // в разных процессах.
+        let mut types: Vec<&Type> = index.types.values().collect();
+        types.sort_by(|a, b| a.name_ru.cmp(&b.name_ru));
+
+        let types_hash = HashIndex::from_iter_with(types.iter().map(|t| (*t).clone()), |t| {
             (t.name_ru.as_str(), t.name_en.as_str())
         });
         let methods_prefix =
@@ -132,9 +139,10 @@ impl SearchEngine {
             StartWithIndex::from_iter_with(index.global_properties.iter().cloned(), |p| {
                 (p.name_ru.as_str(), p.name_en.as_str())
             });
-        let types_prefix = StartWithIndex::from_iter_with(index.types.values().cloned(), |t| {
-            (t.name_ru.as_str(), t.name_en.as_str())
-        });
+        let types_prefix =
+            StartWithIndex::from_iter_with(types.iter().map(|t| (*t).clone()), |t| {
+                (t.name_ru.as_str(), t.name_en.as_str())
+            });
         Self {
             methods_hash,
             properties_hash,
@@ -178,11 +186,15 @@ impl SearchEngine {
         None
     }
 
-    /// Универсальный поиск: префиксное совпадение + word-order fallback. Никаких
-    /// весовых тонкостей — выдаём в порядке: типы, методы, свойства, без сортировки.
+    /// Универсальный поиск: префиксное совпадение + word-order fallback.
+    ///
+    /// Порядок выдачи детерминирован: префиксные ветки идут по BTreeMap, а
+    /// fuzzy/substring-кандидаты (обход HashMap) сортируются по имени перед
+    /// добавлением. Без этого при упоре в `limit` каждый запуск возвращал
+    /// разное подмножество совпадений.
     pub fn search(&self, query: &str, limit: usize) -> Vec<Definition> {
         let q = query.trim().to_lowercase();
-        if q.is_empty() {
+        if q.is_empty() || limit == 0 {
             return Vec::new();
         }
 
@@ -203,44 +215,48 @@ impl SearchEngine {
         // 2. Word-order fuzzy — все слова query идут по порядку в name_ru/name_en.
         let words: Vec<&str> = q.split_whitespace().collect();
         if words.len() > 1 {
+            let mut found = Vec::new();
             for ty in self.types_hash.inner.values() {
                 if word_order_match(&ty.name_ru, &words) || word_order_match(&ty.name_en, &words) {
-                    push_unique(&mut out, &mut seen, Definition::Type(ty.clone()));
+                    found.push(Definition::Type(ty.clone()));
                 }
             }
             for m in self.methods_hash.inner.values() {
                 if word_order_match(&m.name_ru, &words) || word_order_match(&m.name_en, &words) {
-                    push_unique(&mut out, &mut seen, Definition::Method(m.clone()));
+                    found.push(Definition::Method(m.clone()));
                 }
             }
             for p in self.properties_hash.inner.values() {
                 if word_order_match(&p.name_ru, &words) || word_order_match(&p.name_en, &words) {
-                    push_unique(&mut out, &mut seen, Definition::Property(p.clone()));
+                    found.push(Definition::Property(p.clone()));
                 }
             }
+            push_sorted(&mut out, &mut seen, found);
         }
 
         // 3. Substring — последний резерв (если префикс ничего не дал).
         if out.is_empty() {
+            let mut found = Vec::new();
             for ty in self.types_hash.inner.values() {
                 if ty.name_ru.to_lowercase().contains(&q) || ty.name_en.to_lowercase().contains(&q)
                 {
-                    push_unique(&mut out, &mut seen, Definition::Type(ty.clone()));
+                    found.push(Definition::Type(ty.clone()));
                 }
             }
             for m in self.methods_hash.inner.values() {
                 if m.name_ru.to_lowercase().contains(&q) || m.name_en.to_lowercase().contains(&q) {
-                    push_unique(&mut out, &mut seen, Definition::Method(m.clone()));
+                    found.push(Definition::Method(m.clone()));
                 }
             }
             for p in self.properties_hash.inner.values() {
                 if p.name_ru.to_lowercase().contains(&q) || p.name_en.to_lowercase().contains(&q) {
-                    push_unique(&mut out, &mut seen, Definition::Property(p.clone()));
+                    found.push(Definition::Property(p.clone()));
                 }
             }
+            push_sorted(&mut out, &mut seen, found);
         }
 
-        out.truncate(limit.clamp(1, 50));
+        out.truncate(limit.min(50));
         out
     }
 }
@@ -253,6 +269,19 @@ fn push_unique(
     let key = format!("{}:{}", def.kind_label(), def.name_ru().to_lowercase());
     if seen.insert(key) {
         out.push(def);
+    }
+}
+
+/// Добавить кандидатов в детерминированном порядке: обход `HashMap` случаен,
+/// а выдача одного и того же запроса обязана совпадать между запусками.
+fn push_sorted(
+    out: &mut Vec<Definition>,
+    seen: &mut std::collections::HashSet<String>,
+    mut candidates: Vec<Definition>,
+) {
+    candidates.sort_by_key(|a| a.name_ru().to_lowercase());
+    for def in candidates {
+        push_unique(out, seen, def);
     }
 }
 

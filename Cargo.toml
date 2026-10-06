@@ -30,7 +30,7 @@ rmcp = { version = "1.3", features = ["server", "transport-io", "transport-strea
 # HTTP-сервер
 axum = "0.8"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "cors"] }
+tower-http = { version = "0.6", features = ["trace", "cors", "limit"] }
 
 # Сериализация
 serde = { version = "1", features = ["derive"] }

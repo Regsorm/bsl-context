@@ -32,11 +32,15 @@ async fn send(writer: &mut (impl AsyncWriteExt + Unpin), value: &Value) {
 /// Прочитать один кадр. Каждая прочитанная строка обязана быть JSON — так
 /// проверяется, что в стандартный вывод не подмешивается журнал. Таймаут
 /// превращает зависание сервера в понятный отказ вместо бесконечного ожидания.
+///
+/// 120 секунд, а не 30: старт процесса с реальным hbk в debug-сборке занимает
+/// больше 30 секунд при параллельной нагрузке nextest (флейк, поймано аудитом),
+/// а первый кадр приходит только после рукопожатия.
 async fn recv(reader: &mut (impl AsyncBufReadExt + Unpin)) -> Value {
     let mut line = String::new();
-    let read = tokio::time::timeout(Duration::from_secs(30), reader.read_line(&mut line))
+    let read = tokio::time::timeout(Duration::from_secs(120), reader.read_line(&mut line))
         .await
-        .expect("кадр не пришёл за 30 секунд")
+        .expect("кадр не пришёл за 120 секунд")
         .expect("чтение кадра");
     assert!(read > 0, "поток закрылся вместо кадра");
     serde_json::from_str(&line).unwrap_or_else(|e| panic!("кадр не является JSON ({e}): {line:?}"))

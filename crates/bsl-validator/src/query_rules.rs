@@ -231,6 +231,13 @@ fn check_register_tables(
         match meta.sub_table.as_deref() {
             // Виртуальная таблица — смотрим, задан ли отбор.
             Some(sub) if sdbl_parse::is_virtual_table(sub) => {
+                // У регистра бухгалтерии ДРУГИЕ сигнатуры виртуальных таблиц
+                // (`Остатки(Момент, УсловиеСчёта, ВидыСубконто, УсловиеСубконто)`),
+                // чем у регистра накопления: правило давало ложные находки на
+                // корректных запросах. Пока сигнатуры не описаны — молчим.
+                if is_accounting_register_kind(&meta.kind) {
+                    continue;
+                }
                 check_virtual_table_filter(src, text, meta, sub, symbols, errors);
             }
             // Третьего сегмента нет — читается физическая таблица движений.
@@ -290,6 +297,25 @@ fn needs_movement_fields(query: &Query, source: &Source, schema: &ObjectSchema) 
     };
     let alias_lower = alias.name.to_lowercase();
 
+    // `ВЫБРАТЬ *`: состав используемых полей неизвестен, среди них может быть
+    // `Регистратор` — молчим, а не советуем сломать запрос.
+    if query.select.as_ref().is_some_and(|c| c.has_star) {
+        return true;
+    }
+
+    // Подзапрос в условии: коррелированные ссылки на внешний алиас парсер не
+    // сохраняет (содержимое подзапроса пропускается), поля известны не
+    // полностью — молчим.
+    if query
+        .select
+        .iter()
+        .chain(query.filter.iter())
+        .chain(query.joins.iter().filter_map(|j| j.on.as_ref()))
+        .any(|c| c.has_subquery)
+    {
+        return true;
+    }
+
     let attributes: HashSet<String> = schema
         .attributes
         .iter()
@@ -318,6 +344,9 @@ fn needs_movement_fields(query: &Query, source: &Source, schema: &ObjectSchema) 
         .chain(query.filter.iter())
         .chain(query.joins.iter().filter_map(|j| j.on.as_ref()))
         .flat_map(|condition| condition.fields.iter())
+        // Поля GROUP BY/HAVING/ORDER BY/ИТОГИ: `Регистратор` и там требует
+        // таблицы движений, а не только в условии.
+        .chain(query.extra_fields.iter())
         .any(|field| {
             // Поле без алиаса (`ГДЕ Активность И Регистратор В (&Р)`) — тоже
             // счёт в пользу движений: так пишут, когда источник один.
@@ -327,6 +356,15 @@ fn needs_movement_fields(query: &Query, source: &Source, schema: &ObjectSchema) 
             };
             belongs && movement_only(&field.name().to_lowercase())
         })
+}
+
+/// Регистр бухгалтерии? У его виртуальных таблиц другие сигнатуры, чем у
+/// регистра накопления, поэтому правило об отборе к ним не применяется.
+fn is_accounting_register_kind(kind: &str) -> bool {
+    matches!(
+        kind.to_uppercase().as_str(),
+        "РЕГИСТРБУХГАЛТЕРИИ" | "ACCOUNTINGREGISTER"
+    )
 }
 
 /// Порядковый номер параметра-условия у виртуальной таблицы.

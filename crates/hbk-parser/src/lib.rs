@@ -5,22 +5,28 @@
 //!
 //! Архитектура отличается от апстрима: апстрим использует SAX-обработчики
 //! поверх Ksoup (см. `BlockHandler.kt`), мы используем DOM-подход через
-//! `scraper` — режем страницу на главы по маркерам `<p class="V8SH_chapter">`/
-//! `<hr>`, потом каждую главу обрабатываем функцией под её тип.
+//! `scraper` — режем страницу на главы по маркерам
+//! `<p|div class="V8SH_chapter">`/`<hr>`, потом каждую главу обрабатываем
+//! функцией под её тип.
 //!
-//! Главное исправление vs апстрима — на уровне business-mapper'а (Phase 3):
-//! апстрим теряет `signature` методов и `constructors`, не сохраняет `EnumInfo`.
-//! Сами hbk-парсеры апстрима в основном корректны.
+//! Все `parse_*`-функции не возвращают `Result`: на пустом/битом html они
+//! отдают структуру по умолчанию (fail-open), а решение «молчать» принимает
+//! вызывающий код.
+//!
+//! ```
+//! let info = hbk_parser::parse_method_page("<body><hr></body>");
+//! assert!(info.name_ru.is_empty());
+//! ```
 
-pub mod blocks;
-pub mod constructor_page;
-pub mod enum_page;
-pub mod enum_value;
-pub mod html;
-pub mod method_page;
-pub mod models;
-pub mod object_page;
-pub mod property_page;
+mod blocks;
+mod constructor_page;
+mod enum_page;
+mod enum_value;
+mod html;
+mod method_page;
+mod models;
+mod object_page;
+mod property_page;
 
 pub use constructor_page::parse_constructor_page;
 pub use enum_page::parse_enum_page;

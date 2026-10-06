@@ -1,11 +1,10 @@
-//! MCP-сервер: базовые tools для запроса контекста платформы 1С.
+//! MCP-сервер: tools для запроса контекста платформы 1С и валидации BSL.
 //!
-//! Phase 4 — 6 tools: `search`, `info`, `getMember`, `getMembers`,
-//! `getConstructors`, `getEnumValues`. Все возвращают Markdown-строку,
-//! сформированную через [`platform_index::format`].
-//!
-//! Phase 5 (когда подключим валидаторы) — добавит `validateEnum`,
-//! `validateMethodCall`. Phase 6 — `validateExpression`.
+//! Справочные (`search`, `info`, `getMember`, `getMembers`, `getConstructors`,
+//! `getEnumValues`) возвращают Markdown через [`platform_index::format`];
+//! проверки (`validateEnum`, `validateMethodCall`, `validateExpression`,
+//! `validateModule`) — JSON. Служебные: `reload_config`,
+//! `symbol_sources_status`, `rebuild_symbol_index`, `reconnect_symbol_source`.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -93,6 +92,31 @@ pub type SourceSlotInit = (
 /// возвращается сама, без перезапуска bsl-context.
 const RECONNECT_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// Предел размера BSL-исходника в `validate_module`. Гигантский или враждебный
+/// вход (в stdio кадр не ограничен) обязан отсекаться явным отказом, а не
+/// блокировать воркер на минуты.
+///
+/// Ровно столько же, сколько у файлового входа (`path`,
+/// [`crate::module_source::MAX_MODULE_BYTES`]): реальные модули 1С доходят до
+/// ~9 МБ, и текстовый вход не должен отказывать там, где файловый работает —
+/// разные потолки у одного и того же модуля давали ложный отказ «исходник
+/// слишком большой» на модуле, который по `path` проверяется.
+pub(crate) const MAX_SOURCE_BYTES: usize = crate::module_source::MAX_MODULE_BYTES as usize;
+
+/// Предел запроса `search`: имена типов и методов — сотни байт.
+const MAX_QUERY_BYTES: usize = 4 * 1024;
+
+/// Сбрасывает атомарный флаг при выходе из области — включая отмену future и
+/// панику: без guard'а прерванная посреди `.await` попытка оставляла
+/// `reconnecting`/`rebuilding` залипшими навсегда.
+struct FlagGuard<'a>(&'a AtomicBool);
+
+impl Drop for FlagGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 impl SourceSlot {
     /// `built` — результат первой попытки подключения (см.
     /// [`crate::sources::build_symbol_source`]): текст ошибки сохраняется в
@@ -117,7 +141,10 @@ impl SourceSlot {
 
     /// Пора ли пробовать снова (прошёл отступ и никто не пробует прямо сейчас).
     fn reconnect_due(&self) -> bool {
-        let last = self.last_reconnect.lock().unwrap();
+        let last = self
+            .last_reconnect
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         match *last {
             Some(at) => at.elapsed() >= RECONNECT_COOLDOWN,
             None => true,
@@ -126,7 +153,10 @@ impl SourceSlot {
 
     /// Текст последней неудачной попытки подключения, если она была.
     fn last_error(&self) -> Option<String> {
-        self.last_error.lock().unwrap().clone()
+        self.last_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 }
 
@@ -297,7 +327,10 @@ impl BslContextServer {
     /// Снимок карты источников. Блокировка берётся на время клонирования `Arc` и
     /// отпускается до любого `await` — это единственное место, где берётся `read()`.
     pub fn sources_snapshot(&self) -> Arc<SourceMap> {
-        self.sources.read().unwrap().clone()
+        self.sources
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Слот по алиасу — через снимок карты.
@@ -308,7 +341,7 @@ impl BslContextServer {
     /// Подменить карту целиком. Блокировка на запись живёт без `await`: у уже
     /// начатых запросов на руках остаётся снимок старой карты.
     fn replace_sources(&self, map: SourceMap) {
-        *self.sources.write().unwrap() = Arc::new(map);
+        *self.sources.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(map);
     }
 
     /// Запомнить путь к config.toml и снять базовый снимок «холодных» полей.
@@ -317,7 +350,7 @@ impl BslContextServer {
     /// `main`, — ронять его из-за недоступного файла незачем.
     pub fn with_config_path(mut self, path: PathBuf) -> Self {
         match crate::config::Config::load_or_default(Some(&path)) {
-            Ok(cfg) => *self.cold_baseline.lock().unwrap() = Some(cfg),
+            Ok(cfg) => *self.cold_baseline.lock().unwrap_or_else(|e| e.into_inner()) = Some(cfg),
             Err(e) => {
                 tracing::warn!(
                     path = %path.display(),
@@ -344,7 +377,7 @@ impl BslContextServer {
     /// предупреждение повторялось бы на каждой перечитке.
     fn warn_on_cold_changes(&self, fresh: &crate::config::Config) {
         let prev = {
-            let mut guard = self.cold_baseline.lock().unwrap();
+            let mut guard = self.cold_baseline.lock().unwrap_or_else(|e| e.into_inner());
             guard.replace(fresh.clone())
         };
         let Some(prev) = prev else { return };
@@ -373,10 +406,12 @@ impl BslContextServer {
         // чтобы опечатка в файле не оставила сервер без рабочих источников.
         let cfg =
             crate::config::Config::load_or_default(Some(path)).map_err(|e| format!("{e:#}"))?;
-        self.warn_on_cold_changes(&cfg);
         let resolved = cfg
             .resolved_symbol_sources()
             .map_err(|e| format!("{e:#}"))?;
+        // Предупреждаем о «холодных» полях только после успешной валидации:
+        // иначе отклонённый файл «съедал» baseline и предупреждение терялось.
+        self.warn_on_cold_changes(&cfg);
 
         let old = self.sources_snapshot();
         let mut new_map: SourceMap = BTreeMap::new();
@@ -550,7 +585,12 @@ impl BslContextServer {
         if (!force && !slot.reconnect_due()) || slot.reconnecting.swap(true, Ordering::SeqCst) {
             return false;
         }
-        *slot.last_reconnect.lock().unwrap() = Some(std::time::Instant::now());
+        // Флаг сбросится и при отмене future, и при панике.
+        let _reconnecting_guard = FlagGuard(&slot.reconnecting);
+        *slot
+            .last_reconnect
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
 
         let cfg = slot.config.clone();
         // Создание синхронное (рукопожатие MCP через `ureq`) — worker-поток
@@ -563,22 +603,21 @@ impl BslContextServer {
             Ok(Some(source)) => {
                 tracing::info!(repo, "источник имён конфигурации переподключён");
                 *slot.source.write().await = Some(source);
-                *slot.last_error.lock().unwrap() = None;
+                *slot.last_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 true
             }
             Ok(None) => {
                 // Штатное «источника нет»: kind = "none" либо lite-индекс ещё
                 // не собран. Ошибкой это не является, но и источника нет.
-                *slot.last_error.lock().unwrap() = None;
+                *slot.last_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 false
             }
             Err(msg) => {
                 tracing::warn!(repo, error = %msg, "переподключить источник имён не удалось");
-                *slot.last_error.lock().unwrap() = Some(msg);
+                *slot.last_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(msg);
                 false
             }
         };
-        slot.reconnecting.store(false, Ordering::SeqCst);
         ok
     }
 
@@ -595,7 +634,7 @@ impl BslContextServer {
             std::fs::create_dir_all(dir)
                 .with_context(|| format!("не удалось создать каталог {}", dir.display()))?;
         }
-        let tmp = db_path.with_extension("db.tmp");
+        let tmp = unique_build_tmp(db_path);
 
         let (root_c, tmp_c) = (root.to_path_buf(), tmp.clone());
         let build = tokio::task::spawn_blocking(move || lite_index::build(&root_c, &tmp_c, 0))
@@ -617,11 +656,22 @@ impl BslContextServer {
         let (tmp_c, db_c) = (tmp.clone(), db_path.to_path_buf());
         let swapped =
             tokio::task::spawn_blocking(move || -> anyhow::Result<symbol_source::LiteSource> {
+                // Старую базу не удаляем, а откладываем в `.bak`: если подмена
+                // не удастся, вернём её на место (на Windows rename поверх файла
+                // запрещён, поэтому просто «переименовать поверх» нельзя).
+                // Имя отката уникально вместе с tmp: две пересборки одного
+                // db_path (reload_config × rebuild) не должны затирать откат
+                // друг друга (аудит PR, M7).
+                let backup = {
+                    let mut name = tmp_c.as_os_str().to_owned();
+                    name.push(".bak");
+                    PathBuf::from(name)
+                };
                 if db_c.exists() {
-                    if let Err(e) = std::fs::remove_file(&db_c) {
-                        // Windows не удаляет файл, открытый другим процессом
-                        // (ERROR_SHARING_VIOLATION = 32): базу держит другой сеанс
-                        // stdio или служба. Называем причину, а не код ОС.
+                    if let Err(e) = std::fs::rename(&db_c, &backup) {
+                        // Windows не переименовывает файл, открытый другим
+                        // процессом (ERROR_SHARING_VIOLATION = 32): базу держит
+                        // другой сеанс stdio или служба.
                         if e.raw_os_error() == Some(32) {
                             anyhow::bail!(
                                 "база {} занята другим процессом (другой сеанс или служба \
@@ -630,19 +680,37 @@ impl BslContextServer {
                             );
                         }
                         return Err(anyhow::Error::new(e).context(format!(
-                            "не удалось удалить старую базу {}",
+                            "не удалось отложить старую базу {}",
                             db_c.display()
                         )));
                     }
                 }
-                std::fs::rename(&tmp_c, &db_c).with_context(|| {
-                    format!(
+                if let Err(e) = std::fs::rename(&tmp_c, &db_c) {
+                    // Возвращаем прежнюю базу: иначе слот останется без источника.
+                    if backup.exists() {
+                        let _ = std::fs::rename(&backup, &db_c);
+                    }
+                    return Err(anyhow::Error::new(e).context(format!(
                         "не удалось переместить {} → {}",
                         tmp_c.display(),
                         db_c.display()
-                    )
-                })?;
-                symbol_source::LiteSource::open(&db_c).context("не удалось открыть свежий индекс")
+                    )));
+                }
+                match symbol_source::LiteSource::open(&db_c) {
+                    Ok(source) => {
+                        // Свежая база открылась — прежняя больше не нужна.
+                        let _ = std::fs::remove_file(&backup);
+                        Ok(source)
+                    }
+                    Err(e) => {
+                        // Свежую не открыть — возвращаем прежнюю.
+                        let _ = std::fs::remove_file(&db_c);
+                        if backup.exists() {
+                            let _ = std::fs::rename(&backup, &db_c);
+                        }
+                        Err(e.context("не удалось открыть свежий индекс"))
+                    }
+                }
             })
             .await
             .context("задача подмены индекса упала")?;
@@ -698,6 +766,17 @@ async fn build_slot(config: crate::config::SymbolSourceConfig) -> SourceSlot {
         .await
         .unwrap_or_else(|e| Err(format!("поток подключения источника упал: {e}")));
     SourceSlot::new(config, built)
+}
+
+/// Уникальное имя временного файла сборки индекса: две пересборки (например,
+/// гонка `reload_config` × `rebuild_symbol_index`) не должны писать в один tmp.
+fn unique_build_tmp(db_path: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let mut name = db_path.as_os_str().to_owned();
+    name.push(format!(".{}.{}.tmp", std::process::id(), n));
+    PathBuf::from(name)
 }
 
 /// Состояние слота в виде JSON.
@@ -956,6 +1035,13 @@ impl BslContextServer {
                        Префиксное совпадение, fallback word-order и подстрока. Возвращает Markdown."
     )]
     pub async fn search(&self, Parameters(p): Parameters<SearchParams>) -> String {
+        if p.query.len() > MAX_QUERY_BYTES {
+            return format!(
+                "❌ Запрос слишком длинный: {} байт (предел {}).",
+                p.query.len(),
+                MAX_QUERY_BYTES
+            );
+        }
         let limit = p.limit.unwrap_or(10);
         let results = self.engine.search(&p.query, limit);
         let mut out = format::format_query_header(&p.query);
@@ -1118,6 +1204,17 @@ impl BslContextServer {
                        {valid, errors:[{line,col,kind,confidence,message,suggestion?}]}."
     )]
     pub async fn validate_module(&self, Parameters(p): Parameters<ValidateModuleParams>) -> String {
+        // Лимит размера ДО любой работы: stdio-кадр не ограничен, а разбор
+        // многомегабайтного текста блокирует воркер на секунды. Файловый вход
+        // (`path`) сюда не попадает — у него собственный потолок
+        // `module_source::MAX_MODULE_BYTES` (16 МиБ).
+        if p.source.len() > MAX_SOURCE_BYTES {
+            return err_json(&format!(
+                "исходник слишком большой: {} байт (предел {} байт)",
+                p.source.len(),
+                MAX_SOURCE_BYTES
+            ));
+        }
         let level = p.level.unwrap_or(self.default_validation_level).clamp(1, 3);
         let profile = match p.profile {
             Some(ref s) => Profile::parse_or_default(Some(s)),
@@ -1461,6 +1558,23 @@ impl BslContextServer {
         };
         // force: попросили явно — отступ между автоматическими попытками здесь
         // ни при чём, иначе вызов «подними сейчас» молча ничего бы не делал.
+        //
+        // Попытка уже идёт: не выдаём ok:true по состоянию ДО неё, сообщаем явно.
+        if slot.reconnecting.load(Ordering::SeqCst) {
+            let state = slot_state_json(repo, &slot).await;
+            let mut out = serde_json::Map::new();
+            out.insert("ok".to_string(), serde_json::Value::Bool(false));
+            out.insert(
+                "message".to_string(),
+                serde_json::Value::String(
+                    "переподключение уже идёт — дождитесь его завершения".to_string(),
+                ),
+            );
+            if let serde_json::Value::Object(fields) = state {
+                out.extend(fields);
+            }
+            return serde_json::Value::Object(out).to_string();
+        }
         self.try_reconnect(repo, &slot, true).await;
 
         // Ответ инструмента — состояние слота плюс собственный флаг `ok`.
@@ -1539,8 +1653,9 @@ impl BslContextServer {
         if slot.rebuilding.swap(true, Ordering::SeqCst) {
             return err_json("пересборка уже идёт");
         }
+        // Флаг сбросится и при отмене future (обрыв клиента), и при панике.
+        let _rebuilding_guard = FlagGuard(&slot.rebuilding);
         let result = self.rebuild_inner(&slot, &root, &db_path).await;
-        slot.rebuilding.store(false, Ordering::SeqCst);
         match result {
             Ok(json) => json,
             Err(e) => err_json(&format!("{e:#}")),

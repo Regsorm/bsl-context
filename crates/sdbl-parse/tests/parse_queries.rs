@@ -333,3 +333,199 @@ fn union_keeps_both_selects() {
     .expect("объединение не разобрано");
     assert_eq!(package.queries.len(), 2);
 }
+
+// ── Регрессии аудита: битый вход даёт Err, а не половину дерева ────────────
+
+#[test]
+fn unclosed_string_is_rejected() {
+    assert!(parse("ВЫБРАТЬ Т.Ссылка ИЗ Справочник.Товары КАК Т ГДЕ Т.Имя = \"Иванов").is_err());
+}
+
+#[test]
+fn unbalanced_paren_does_not_swallow_package() {
+    // Незакрытая скобка не должна съедать `;` и следующий оператор пакета.
+    assert!(parse("ВЫБРАТЬ 1 ИЗ Т1 ГДЕ (А = 1;\nВЫБРАТЬ 2 ИЗ Т2").is_err());
+    assert!(parse("ВЫБРАТЬ 1 ИЗ РегистрНакопления.Р.Остатки(П;\nВЫБРАТЬ 2 ИЗ Т2").is_err());
+}
+
+#[test]
+fn top_without_number_is_rejected() {
+    // `ПЕРВЫЕ` без числа не должно принимать `ИЗ` за «число».
+    assert!(parse("ВЫБРАТЬ ПЕРВЫЕ ИЗ Т").is_err());
+}
+
+#[test]
+fn dangling_as_is_rejected() {
+    assert!(parse("ВЫБРАТЬ 1 ИЗ Т КАК").is_err());
+}
+
+#[test]
+fn dangling_union_is_rejected() {
+    assert!(parse("ВЫБРАТЬ 1 ИЗ Т ОБЪЕДИНИТЬ").is_err());
+}
+
+#[test]
+fn empty_select_and_filter_are_rejected() {
+    assert!(parse("ВЫБРАТЬ").is_err());
+    assert!(parse("ВЫБРАТЬ 1 ИЗ Т ГДЕ").is_err());
+}
+
+#[test]
+fn four_segment_meta_name_is_rejected() {
+    // Тип хранит три сегмента: четвёртый молча терять нельзя.
+    assert!(parse("ВЫБРАТЬ 1 ИЗ Справочник.А.Б.В КАК Т").is_err());
+}
+
+#[test]
+fn select_alias_is_not_a_field() {
+    // Алиас после КАК — не поле источника: иначе `КАК Регистратор` глушит
+    // правило о физической таблице регистра.
+    let query = single("ВЫБРАТЬ Т.Ссылка КАК Регистратор ИЗ Справочник.Товары КАК Т");
+    let select = query.select.expect("select потерян");
+    assert!(
+        !select.fields.iter().any(|f| f.name() == "Регистратор"),
+        "алиас попал в поля: {:?}",
+        select.fields
+    );
+    assert!(select.fields.iter().any(|f| f.name() == "Ссылка"));
+}
+
+#[test]
+fn nested_subquery_fields_do_not_leak_into_condition() {
+    let query = single(
+        "ВЫБРАТЬ 1 ИЗ Справочник.Товары КАК А \
+         ЛЕВОЕ СОЕДИНЕНИЕ Справочник.Склады КАК Б ПО Б.Х = А.Х И Б.У В (ВЫБРАТЬ Ц.У ИЗ Справочник.Цены КАК Ц)",
+    );
+    let on = query.joins[0].on.as_ref().expect("условие соединения");
+    assert!(
+        !on.fields.iter().any(|f| f.qualifier() == Some("Ц")),
+        "поля подзапроса протекли: {:?}",
+        on.fields
+    );
+}
+
+#[test]
+fn hash_template_names_are_tolerated() {
+    let package = parse("ВЫБРАТЬ 1 ПОМЕСТИТЬ #ВТ;\nВЫБРАТЬ 1 ИЗ #ВТ КАК Т")
+        .expect("шаблонные имена с # должны разбираться");
+    assert_eq!(package.queries[0].into.as_ref().unwrap().name, "#ВТ");
+    assert!(matches!(
+        package.queries[1].sources[0].table,
+        Table::Temp(_)
+    ));
+}
+
+#[test]
+fn alias_like_compound_word_keeps_join_condition() {
+    // `КАК Упорядочить ПО …` — алиас и условие соединения, а не `УПОРЯДОЧИТЬ ПО`.
+    let query = single(
+        "ВЫБРАТЬ 1 ИЗ Справочник.Товары КАК А \
+         ЛЕВОЕ СОЕДИНЕНИЕ Справочник.Склады КАК Упорядочить ПО А.Х = Упорядочить.Х",
+    );
+    let join = &query.joins[0];
+    assert_eq!(join.source.alias.as_ref().unwrap().name, "Упорядочить");
+    assert!(join.on.is_some(), "условие соединения потеряно");
+}
+
+#[test]
+fn comment_with_carriage_return_does_not_swallow_query() {
+    let query = single("ВЫБРАТЬ Поле // c\rИЗ Справочник.Товары КАК Т");
+    assert_eq!(query.sources.len(), 1);
+}
+
+#[test]
+fn group_by_fields_are_collected() {
+    let query = single(
+        "ВЫБРАТЬ КОЛИЧЕСТВО(*) КАК К ИЗ РегистрНакопления.ТоварыНаСкладах КАК Т \
+         СГРУППИРОВАТЬ ПО Т.Регистратор",
+    );
+    assert!(
+        query.extra_fields.iter().any(|f| f.name() == "Регистратор"),
+        "{:?}",
+        query.extra_fields
+    );
+}
+
+#[test]
+fn star_select_is_flagged() {
+    let query = single("ВЫБРАТЬ * ИЗ РегистрНакопления.ТоварыНаСкладах КАК Т");
+    assert!(query.select.as_ref().unwrap().has_star);
+}
+
+#[test]
+fn qualified_star_select_is_flagged() {
+    let query = single("ВЫБРАТЬ Т.* ИЗ РегистрНакопления.ТоварыНаСкладах КАК Т");
+    assert!(query.select.as_ref().unwrap().has_star);
+}
+
+#[test]
+fn star_after_top_is_a_select_star() {
+    // `ПЕРВЫЕ 10 *` — тот же джокер: раньше его тоже нельзя было терять.
+    let query = single("ВЫБРАТЬ ПЕРВЫЕ 10 * ИЗ РегистрНакопления.ТоварыНаСкладах КАК Т");
+    assert!(query.select.as_ref().unwrap().has_star);
+}
+
+#[test]
+fn star_inside_function_is_not_a_select_star() {
+    // `КОЛИЧЕСТВО(*)` — не «состав полей неизвестен»: правило о физической
+    // таблице регистра обязано работать (аудит PR: звёздочка в скобках глушила
+    // его на `ВЫБРАТЬ КОЛИЧЕСТВО(*)`).
+    let query = single("ВЫБРАТЬ КОЛИЧЕСТВО(*) КАК К ИЗ РегистрНакопления.ТоварыНаСкладах КАК Т");
+    assert!(!query.select.as_ref().unwrap().has_star);
+}
+
+#[test]
+fn multiplication_is_not_a_select_star() {
+    let query = single("ВЫБРАТЬ Т.Количество * 2 КАК К ИЗ РегистрНакопления.ТоварыНаСкладах КАК Т");
+    assert!(!query.select.as_ref().unwrap().has_star);
+}
+
+#[test]
+fn external_data_source_path_is_parsed_as_unknown_source() {
+    // Составной путь внешнего источника данных подмножество не разбирает — но
+    // ронять из-за него разбор ВСЕГО запроса нельзя: остальные правила по этому
+    // тексту обязаны работать (аудит PR).
+    let query = single(
+        "ВЫБРАТЬ Т.Поле КАК Поле ИЗ ВнешнийИсточникДанных.МойИсточник.Таблица.МояТаблица КАК Т",
+    );
+    assert_eq!(query.sources.len(), 1);
+    assert!(
+        matches!(query.sources[0].table, Table::Unknown(_)),
+        "ожидался Unknown: {:?}",
+        query.sources[0]
+    );
+    assert_eq!(query.sources[0].alias.as_ref().unwrap().name, "Т");
+}
+
+#[test]
+fn subquery_in_condition_is_flagged() {
+    let query = single(
+        "ВЫБРАТЬ 1 ИЗ Справочник.Товары КАК А \
+         ГДЕ А.Ссылка В (ВЫБРАТЬ Т.Ссылка ИЗ Справочник.Цены КАК Т)",
+    );
+    assert!(query.filter.as_ref().unwrap().has_subquery);
+}
+
+#[test]
+fn union_index_is_attached_to_into_query() {
+    let package = parse(
+        "ВЫБРАТЬ Т.Ссылка КАК Ссылка ПОМЕСТИТЬ ВТ ИЗ Справочник.Товары КАК Т \
+         ОБЪЕДИНИТЬ ВСЕ \
+         ВЫБРАТЬ С.Ссылка ИЗ Справочник.Склады КАК С \
+         ИНДЕКСИРОВАТЬ ПО Ссылка ;\
+         ВЫБРАТЬ 1 ИЗ ВТ КАК В",
+    )
+    .expect("пакет с объединением и индексом");
+    assert_eq!(package.queries.len(), 3);
+    assert_eq!(package.queries[0].into.as_ref().unwrap().name, "ВТ");
+    assert_eq!(
+        package.queries[0].index_fields.len(),
+        1,
+        "индекс обязан переехать на запрос с ПОМЕСТИТЬ: {:?}",
+        package.queries[0].index_fields
+    );
+    assert!(
+        package.queries[1].index_fields.is_empty(),
+        "индекс не должен оставаться на последней выборке объединения"
+    );
+}

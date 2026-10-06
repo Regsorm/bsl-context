@@ -1,6 +1,11 @@
 //! Маппинг `*Info` → доменные сущности.
 //!
-//! Главное отличие от апстрима ([`upstream/.../persistent/storage/Mapper.kt`]):
+//! Переносятся имена, описания, `note`, типы, параметры и синтаксис;
+//! `example`/`related_objects` и описание возвращаемого значения в домен
+//! пока не попадают (см. `entities`).
+//!
+//! Отношения к апстриму (`upstream/.../persistent/storage/Mapper.kt`, вне
+//! репозитория):
 //! - `MethodInfo → Method` сохраняет полный `signatures` (апстрим теряет: `signature = emptyList()`).
 //! - `ObjectInfo → Type` переносит реальные `constructors` (апстрим всегда `emptyList()`).
 //! - `EnumInfo → Type` переносит `enum_values` (у апстрима этого пути нет — `EnumInfo` теряется).
@@ -17,6 +22,7 @@ pub fn method_from(info: &MethodInfo) -> Method {
         name_ru: info.name_ru.clone(),
         name_en: info.name_en.clone(),
         description: info.description.clone(),
+        note: info.note.clone(),
         return_type: info
             .return_value
             .as_ref()
@@ -31,6 +37,7 @@ pub fn property_from(info: &PropertyInfo) -> Property {
         name_ru: info.name_ru.clone(),
         name_en: info.name_en.clone(),
         description: info.description.clone(),
+        note: info.note.clone(),
         type_name: info.type_name.clone(),
         readonly: info.readonly,
     }
@@ -39,6 +46,7 @@ pub fn property_from(info: &PropertyInfo) -> Property {
 pub fn signature_from(info: &MethodSignatureInfo) -> Signature {
     Signature {
         name: info.name.clone(),
+        syntax: info.syntax.clone(),
         description: info.description.clone(),
         parameters: info.parameters.iter().map(parameter_from).collect(),
     }
@@ -56,7 +64,10 @@ pub fn parameter_from(info: &MethodParameterInfo) -> Parameter {
 pub fn constructor_from(info: &ConstructorInfo) -> Constructor {
     Constructor {
         name: info.name.clone(),
+        name_en: info.name_en.clone(),
+        syntax: info.syntax.clone(),
         description: info.description.clone(),
+        note: info.note.clone(),
         parameters: info.parameters.iter().map(parameter_from).collect(),
     }
 }
@@ -66,6 +77,7 @@ pub fn enum_value_from(info: &EnumValueInfo) -> EnumValue {
         name_ru: info.name_ru.clone(),
         name_en: info.name_en.clone(),
         description: info.description.clone(),
+        note: info.note.clone(),
     }
 }
 
@@ -75,6 +87,7 @@ pub fn type_from_object(info: &ObjectInfo) -> Type {
         name_ru: info.name_ru.clone(),
         name_en: info.name_en.clone(),
         description: info.description.clone(),
+        note: info.note.clone(),
         methods: info.methods.iter().map(method_from).collect(),
         properties: info.properties.iter().map(property_from).collect(),
         constructors: info.constructors.iter().map(constructor_from).collect(),
@@ -88,6 +101,7 @@ pub fn type_from_enum(info: &EnumInfo) -> Type {
         name_ru: info.name_ru.clone(),
         name_en: info.name_en.clone(),
         description: info.description.clone(),
+        note: info.note.clone(),
         methods: Vec::new(),
         properties: Vec::new(),
         constructors: Vec::new(),

@@ -7,6 +7,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
+use tracing::warn;
+
 use crate::entities::{Method, Property, Type};
 
 /// Storage платформенного контекста (read-only после загрузки).
@@ -28,8 +30,8 @@ pub struct PlatformIndex {
     /// порядок вставки кэш не хранит).
     pub(crate) types_en: HashMap<String, String>,
     /// Ленивый кэш имён методов всех типов (см. `all_type_method_names`).
-    /// Обход 2414 типов стоит десятки миллисекунд — на каждый вызов
-    /// `validate_module` это заметно, а индекс после загрузки неизменен.
+    /// Обход тысяч типов стоит единицы миллисекунд (release ~6 мс) — на каждый
+    /// вызов `validate_module` это заметно, а индекс после загрузки неизменен.
     type_method_names: OnceLock<HashSet<String>>,
 }
 
@@ -62,6 +64,9 @@ impl PlatformIndex {
     /// платформа принимает и `Массив`, и `Array`.
     pub fn find_type(&self, name: &str) -> Option<&Type> {
         let key = name.to_lowercase();
+        if key.is_empty() {
+            return None;
+        }
         self.types
             .get(&key)
             .or_else(|| self.types_en.get(&key).and_then(|ru| self.types.get(ru)))
@@ -75,8 +80,11 @@ impl PlatformIndex {
     /// находил сам себя в `name_en` с нулевым расстоянием.
     pub fn find_global_method(&self, name: &str) -> Option<&Method> {
         let key = name.to_lowercase();
+        if key.is_empty() {
+            return None;
+        }
         self.global_methods.iter().find(|m| {
-            m.name_ru.to_lowercase() == key
+            (!m.name_ru.is_empty() && m.name_ru.to_lowercase() == key)
                 || (!m.name_en.is_empty() && m.name_en.to_lowercase() == key)
         })
     }
@@ -87,8 +95,11 @@ impl PlatformIndex {
     /// свойство глобального контекста.
     pub fn find_global_property(&self, name: &str) -> Option<&Property> {
         let key = name.to_lowercase();
+        if key.is_empty() {
+            return None;
+        }
         self.global_properties.iter().find(|p| {
-            p.name_ru.to_lowercase() == key
+            (!p.name_ru.is_empty() && p.name_ru.to_lowercase() == key)
                 || (!p.name_en.is_empty() && p.name_en.to_lowercase() == key)
         })
     }
@@ -120,13 +131,39 @@ impl PlatformIndex {
         })
     }
 
-    /// Вставка типа в storage. Перезаписывает по ключу `name_ru.lowercase()`.
+    /// Вставка типа в storage. Ключ — `name_ru` в нижнем регистре.
+    ///
+    /// Два разных корня TOC могут дать один `name_ru` (например «Интерфейс
+    /// (обычный)» и «Интерфейс (управляемый)»): молча затирать более полную
+    /// запись более бедной нельзя — оставляем запись с большим числом членов,
+    /// о конфликте пишем в журнал. Устаревший английский алиас перезаписанного
+    /// типа удаляется, чтобы `find_type` по нему не возвращал чужой тип.
     pub fn insert_type(&mut self, ty: Type) {
         let key = ty.name_ru.to_lowercase();
+        if let Some(old) = self.types.get(&key) {
+            let score = |t: &Type| {
+                t.methods.len() + t.properties.len() + t.constructors.len() + t.enum_values.len()
+            };
+            if old != &ty && score(old) > score(&ty) {
+                warn!(
+                    type_name = %ty.name_ru,
+                    kept = score(old),
+                    dropped = score(&ty),
+                    "тип с тем же именем уже есть в индексе — более полная запись сохранена"
+                );
+                return;
+            }
+            if old.name_en.to_lowercase() != ty.name_en.to_lowercase() && !old.name_en.is_empty() {
+                self.types_en.remove(&old.name_en.to_lowercase());
+            }
+        }
         if !ty.name_en.is_empty() {
             self.types_en.insert(ty.name_en.to_lowercase(), key.clone());
         }
         self.types.insert(key, ty);
+        // Индекс после загрузки не меняется, но публичный мутатор обязан
+        // сбрасывать производный кэш имён.
+        self.type_method_names = OnceLock::new();
     }
 }
 
@@ -142,6 +179,7 @@ mod tests {
             description: String::new(),
             return_type: String::new(),
             signatures: Vec::new(),
+            note: None,
         }
     }
 

@@ -18,8 +18,13 @@ pub struct ObjectField {
 }
 
 impl ObjectField {
+    /// Поле с индексом? `DontIndex`/пусто индексом не является: инвариант
+    /// держится фильтрацией в источниках, но публичный метод обязан
+    /// различать сам (иначе чужой producer молча выключит правило).
     pub fn is_indexed(&self) -> bool {
-        self.indexing.is_some()
+        self.indexing
+            .as_deref()
+            .is_some_and(|v| !v.is_empty() && !v.eq_ignore_ascii_case("DontIndex"))
     }
 }
 
@@ -39,17 +44,21 @@ impl ObjectSchema {
     /// Регистр остатков — у него есть виртуальные таблицы `Остатки`
     /// и `ОстаткиИОбороты`, ради которых физическую таблицу читать не нужно.
     pub fn is_balance_register(&self) -> bool {
-        self.register_type.as_deref() == Some("Balance")
+        self.register_type
+            .as_deref()
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("Balance"))
     }
 
     /// Найти поле среди реквизитов, измерений и ресурсов.
     /// Имя сворачивается в Rust: SQLite-подобный `lower()` кириллицу не берёт.
+    /// Регистр аргумента значения не имеет.
     pub fn field(&self, name_lower: &str) -> Option<&ObjectField> {
+        let key = name_lower.to_lowercase();
         self.attributes
             .iter()
             .chain(self.dimensions.iter())
             .chain(self.resources.iter())
-            .find(|f| f.name.to_lowercase() == name_lower)
+            .find(|f| f.name.to_lowercase() == key)
     }
 }
 
@@ -72,6 +81,25 @@ pub trait SymbolSource: Send + Sync {
     /// внешней обработки. `None` — источник не знает про такой модуль.
     fn owner_exports(&self, _module_path: &str) -> Option<HashSet<String>> {
         None
+    }
+
+    /// Источник УМЕЕТ вывести модуль-владельца для такого пути (раскладка
+    /// распознана) — независимо от того, есть ли владелец в базе.
+    ///
+    /// Нужен, чтобы различить два случая, которые `owner_exports` отдаёт
+    /// одинаково — `None`:
+    ///
+    /// * «владельца в источнике нет» — молчание проверок глобальных вызовов
+    ///   обосновано: вызов без префикса может быть методом владельца;
+    /// * «раскладка пути не поддерживается, спросить не умеем» — молчание
+    ///   НЕобоснованно: под него попадали все модули форм конфигурации
+    ///   (`<Вид>/<Имя>/Forms/<Форма>/Ext/Form/Module.bsl`), и настоящие опечатки
+    ///   в них перестали находиться.
+    ///
+    /// Дефолт `false`: источник не заявляет умения, и валидатор проверяет
+    /// глобальные вызовы как раньше.
+    fn owner_resolvable(&self, _module_path: &str) -> bool {
+        false
     }
 
     /// Объект конфигурации с таким именем существует в указанной коллекции.

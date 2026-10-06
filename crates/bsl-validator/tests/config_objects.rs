@@ -115,6 +115,56 @@ fn empty_index() -> PlatformIndex {
     PlatformIndex::new()
 }
 
+/// Индекс с менеджерами объектов. Ветка (б) проверки объектов работает,
+/// только когда справка знает глобальное свойство коллекции (иначе правило
+/// молчит: по одному имени `Справочники.Х` нельзя отличить метод менеджера
+/// `ТипВсеСсылки()` от имени объекта). Настоящая справка платформы всегда
+/// содержит свойства `Справочники`/`Документы` — здесь заводим их минимально.
+fn manager_index() -> PlatformIndex {
+    let mut index = empty_index();
+    for (collection, collection_en, manager, manager_en) in [
+        (
+            "Справочники",
+            "Catalogs",
+            "СправочникиМенеджер",
+            "CatalogsManager",
+        ),
+        (
+            "Документы",
+            "Documents",
+            "ДокументыМенеджер",
+            "DocumentsManager",
+        ),
+    ] {
+        index.global_properties.push(Property {
+            name_ru: collection.into(),
+            name_en: collection_en.into(),
+            description: String::new(),
+            type_name: manager.into(),
+            readonly: true,
+            note: None,
+        });
+        index.insert_type(Type {
+            name_ru: manager.into(),
+            name_en: manager_en.into(),
+            description: String::new(),
+            methods: vec![Method {
+                name_ru: "ТипВсеСсылки".into(),
+                name_en: "AllRefsType".into(),
+                description: String::new(),
+                return_type: String::new(),
+                signatures: Vec::new(),
+                note: None,
+            }],
+            properties: Vec::new(),
+            constructors: Vec::new(),
+            enum_values: Vec::new(),
+            note: None,
+        });
+    }
+    index
+}
+
 /// Синтетический индекс платформы для проверки гейтов молчания. На ПУСТОМ
 /// индексе три условия «это платформа, а не общий модуль» не работают вовсе
 /// (`find_type`/`find_global_property` всегда отвечают «нет»), то есть тесты
@@ -130,6 +180,7 @@ fn index_with_platform_context() -> PlatformIndex {
         description: String::new(),
         type_name: String::new(),
         readonly: true,
+        note: None,
     });
 
     index.insert_type(Type {
@@ -140,6 +191,7 @@ fn index_with_platform_context() -> PlatformIndex {
         properties: Vec::new(),
         constructors: Vec::new(),
         enum_values: Vec::new(),
+        note: None,
     });
 
     index.insert_type(Type {
@@ -152,6 +204,7 @@ fn index_with_platform_context() -> PlatformIndex {
             description: String::new(),
             return_type: String::new(),
             signatures: Vec::new(),
+            note: None,
         }],
         properties: vec![Property {
             name_ru: "Элементы".into(),
@@ -159,9 +212,11 @@ fn index_with_platform_context() -> PlatformIndex {
             description: String::new(),
             type_name: String::new(),
             readonly: true,
+            note: None,
         }],
         constructors: Vec::new(),
         enum_values: Vec::new(),
+        note: None,
     });
 
     index
@@ -217,7 +272,7 @@ fn known_common_module_is_silent() {
 /// 3. Выдуманный справочник — `UnknownMetadataObject`.
 #[test]
 fn invented_catalog_is_reported() {
-    let index = empty_index();
+    let index = manager_index();
     let source = StubSource::new();
     let result = validate_module_with_symbols(
         &index,
@@ -241,7 +296,7 @@ fn invented_catalog_is_reported() {
 /// 4. Существующий справочник (`Номенклатура` есть в стабе) — находок нет.
 #[test]
 fn known_catalog_is_silent() {
-    let index = empty_index();
+    let index = manager_index();
     let source = StubSource::new();
     let result = validate_module_with_symbols(
         &index,
@@ -328,7 +383,7 @@ fn silent_source_suppresses_catalog_finding() {
 ///    `Catalogs`, но `Documents` пуста — находка только на втором.
 #[test]
 fn same_name_different_collections() {
-    let index = empty_index();
+    let index = manager_index();
     let source = StubSource::new();
 
     let catalog_result = validate_module_with_symbols(
@@ -593,7 +648,7 @@ fn application_module_variable_is_not_a_common_module() {
 /// менеджер платформы, а не произвольное имя.
 #[test]
 fn source_without_global_variables_disables_common_module_rule_only() {
-    let index = empty_index();
+    let index = manager_index();
     let source = StubSource::without_global_vars();
     let result = validate_module_with_symbols(
         &index,
@@ -793,6 +848,7 @@ fn index_with_catalog_manager() -> PlatformIndex {
         description: String::new(),
         return_type: String::new(),
         signatures: Vec::new(),
+        note: None,
     };
     index.insert_type(Type {
         name_ru: "СправочникМенеджер.<Имя справочника>".into(),
@@ -809,6 +865,7 @@ fn index_with_catalog_manager() -> PlatformIndex {
         properties: Vec::new(),
         constructors: Vec::new(),
         enum_values: Vec::new(),
+        note: None,
     });
     index
 }

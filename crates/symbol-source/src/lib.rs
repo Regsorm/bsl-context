@@ -99,12 +99,23 @@ impl SymbolSource for LiteSource {
 
     fn owner_exports(&self, module_path: &str) -> Option<HashSet<String>> {
         match self.index.lock().unwrap().owner_exports(module_path) {
-            Ok(names) => Some(names.into_iter().collect()),
+            Ok(Some(names)) => Some(names.into_iter().collect()),
+            // «Не знаю»: владельца нет или его модуля нет в индексе — молчание,
+            // а не пустой набор (пустой дал бы ложную находку на вызове метода).
+            Ok(None) => None,
             Err(e) => {
                 tracing::warn!(error = %e, module_path, "lite-index: ошибка owner_exports");
                 None
             }
         }
+    }
+
+    /// Раскладка, для которой источник умеет вывести модуль-владельца, —
+    /// модуль обычной формы внешней обработки (см. `lite_index::owner_module_path`).
+    /// Для модулей форм конфигурации владелец не выводится, и `None` из
+    /// `owner_exports` означает «спросить не умеем», а не «владельца нет».
+    fn owner_resolvable(&self, module_path: &str) -> bool {
+        lite_index::owner_module_path(module_path).is_some()
     }
 
     fn object_exists(&self, collection: &str, name_lower: &str) -> Option<bool> {
@@ -202,8 +213,10 @@ struct DbSnapshot {
     /// (zstd), признак — `<Global>true</Global>`. Отдельного флага у
     /// `code-index` нет, но исходный XML он хранит.
     global_exports: HashSet<String>,
-    /// Экспортные переменные модулей приложения (нижний регистр).
-    global_vars: HashSet<String>,
+    /// Экспортные переменные модулей приложения (нижний регистр). `None` —
+    /// сбор не удался (нет таблицы/колонки, ошибка чтения): правило о переменных
+    /// модуля приложения обязано молчать, а не считать, что переменных нет.
+    global_vars: Option<HashSet<String>>,
     /// Объекты конфигурации по `meta_type` (таблица `metadata_objects`), в
     /// исходном регистре. `None` — таблицы нет: это не BSL-индекс, либо старая
     /// версия без неё. НИКАКОГО вывода имён из путей модулей — у объекта может
@@ -403,19 +416,24 @@ impl CodeIndexDbSource {
     /// базе (`file_contents`, zstd) — тем же путём, что и XML общих модулей для
     /// `collect_global_exports`. Разбор строк — общий с `lite-index`, чтобы
     /// правило чтения `Перем Имя Экспорт;` жило в одном месте.
-    /// Ошибка не фатальна: источник продолжит работать, просто без этих имён.
-    fn collect_global_vars(conn: &Connection) -> HashSet<String> {
-        Self::try_collect_global_vars(conn).unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "code-index база: не удалось собрать переменные модуля приложения");
-            HashSet::new()
-        })
+    /// Ошибка сбора — `None` («не знаю»), а не пустой набор: пустой набор
+    /// включил бы правило общего модуля и дал ложные `UnknownCommonModule`.
+    fn collect_global_vars(conn: &Connection) -> Option<HashSet<String>> {
+        match Self::try_collect_global_vars(conn) {
+            Ok(vars) => Some(vars),
+            Err(e) => {
+                tracing::warn!(error = %e, "code-index база: не удалось собрать переменные модуля приложения");
+                None
+            }
+        }
     }
 
     fn try_collect_global_vars(conn: &Connection) -> Result<HashSet<String>> {
         let mut stmt = conn.prepare(
             "SELECT f.path, fc.content_blob FROM files f \
              JOIN file_contents fc ON fc.file_id = f.id \
-             WHERE f.path LIKE '%ApplicationModule.bsl' OR f.path LIKE '%SessionModule.bsl'",
+             WHERE f.path LIKE '%ApplicationModule.bsl' OR f.path LIKE '%SessionModule.bsl' \
+                OR f.path LIKE '%ExternalConnectionModule.bsl'",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
@@ -428,9 +446,12 @@ impl CodeIndexDbSource {
             if !lite_index::is_application_module_file(file_name) {
                 continue;
             }
-            let Ok(bytes) = zstd::stream::decode_all(&blob[..]) else {
-                continue;
-            };
+            // Повреждённый блоб хотя бы одного модуля делает недостоверным
+            // ВЕСЬ набор: потребитель должен молчать (`None`), а не считать,
+            // что объявленных переменных нет, — иначе на реальную экспортную
+            // переменную появится ложный `UnknownCommonModule`.
+            let bytes = zstd::stream::decode_all(&blob[..])
+                .with_context(|| format!("не удалось распаковать модуль {path}"))?;
             let content = String::from_utf8_lossy(&bytes);
             for name in lite_index::global_export_vars_from_text(&content) {
                 out.insert(name.to_lowercase());
@@ -506,7 +527,15 @@ impl CodeIndexDbSource {
         let mut out = HashSet::new();
         for row in rows {
             let (xml_path, blob) = row?;
+            // Повреждённый XML пропускаем с предупреждением: в отличие от
+            // переменных модулей приложения, «не знаю» здесь выразить нечем
+            // (`is_global_export` — bool), а неполный набор лишь теряет
+            // подавление, не создавая находок на пустом месте.
             let Ok(bytes) = zstd::stream::decode_all(&blob[..]) else {
+                tracing::warn!(
+                    path = %xml_path,
+                    "code-index база: XML общего модуля не распаковался — экспорты могут быть неполными"
+                );
                 continue;
             };
             let content = String::from_utf8_lossy(&bytes);
@@ -552,6 +581,19 @@ impl SymbolSource for CodeIndexDbSource {
         self.refresh_if_stale();
         let owner = lite_index::owner_module_path(module_path)?;
         let conn = self.conn.lock().unwrap();
+        // Модуль-владелец есть в базе? Нет — «не знаю» (`None`), как в
+        // LiteSource: иначе пустой набор выглядел бы как «у владельца нет
+        // экспортов» и давал ложную находку на каждый его вызов (аудит PR).
+        let owner_present = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM files WHERE path = ?1)",
+                params![owner],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap_or(false);
+        if !owner_present {
+            return None;
+        }
         let mut stmt = conn
             .prepare(
                 "SELECT fn.name FROM functions fn JOIN files fl ON fl.id = fn.file_id \
@@ -567,6 +609,12 @@ impl SymbolSource for CodeIndexDbSource {
             out.insert(row.ok()?.to_lowercase());
         }
         Some(out)
+    }
+
+    /// См. `SymbolSource::owner_resolvable`: раскладка внешней обработки —
+    /// единственная, для которой путь владельца выводится из пути формы.
+    fn owner_resolvable(&self, module_path: &str) -> bool {
+        lite_index::owner_module_path(module_path).is_some()
     }
 
     fn object_exists(&self, collection: &str, name_lower: &str) -> Option<bool> {
@@ -620,7 +668,7 @@ impl SymbolSource for CodeIndexDbSource {
 
     fn global_variables(&self) -> Option<HashSet<String>> {
         self.refresh_if_stale();
-        Some(self.snapshot.lock().unwrap().global_vars.clone())
+        self.snapshot.lock().unwrap().global_vars.clone()
     }
 
     fn describe(&self) -> String {
@@ -743,7 +791,12 @@ impl CodeIndexMcpSource {
             .set("Content-Type", "application/json")
             .set("Accept", "application/json, text/event-stream")
             .send_json(body)
-            .with_context(|| format!("code-index mcp: initialize к {} не прошёл", self.url))?;
+            .with_context(|| {
+                format!(
+                    "code-index mcp: initialize к {} не прошёл",
+                    redact_url(&self.url)
+                )
+            })?;
 
         if let Some(session_id) = resp.header("Mcp-Session-Id") {
             *self.session_id.lock().unwrap() = Some(session_id.to_string());
@@ -785,22 +838,29 @@ impl CodeIndexMcpSource {
                 "arguments": {"repo": self.repo}
             }
         });
-        let resp = self
-            .post(body)
-            .with_context(|| format!("code-index mcp: get_stats к {} не прошёл", self.url))?;
+        let resp = self.post(body).with_context(|| {
+            format!(
+                "code-index mcp: get_stats к {} не прошёл",
+                redact_url(&self.url)
+            )
+        })?;
         let text = resp.into_string().context("code-index mcp: тело ответа")?;
         let value = parse_sse_json(&text)
             .ok_or_else(|| anyhow::anyhow!("code-index mcp: пустой/неразбираемый SSE-ответ"))?;
         match repo_check_from_get_stats(&value, &self.repo) {
             RepoCheck::Known => Ok(()),
             RepoCheck::Unknown(message) => {
-                anyhow::bail!("code-index по адресу {}: {}", self.url, message)
+                anyhow::bail!(
+                    "code-index по адресу {}: {}",
+                    redact_url(&self.url),
+                    message
+                )
             }
             // Форма ответа может смениться в новой версии code-index — это чужой продукт.
             // Не распознали — не блокируем старт, просто не проверяем.
             RepoCheck::Unrecognized => {
                 tracing::warn!(
-                    url = %self.url,
+                    url = %redact_url(&self.url),
                     repo = %self.repo,
                     "code-index mcp: ответ get_stats не распознан, проверка репозитория пропущена"
                 );
@@ -850,7 +910,7 @@ impl CodeIndexMcpSource {
                     unreachable!();
                 };
                 tracing::info!(
-                    url = %self.url,
+                    url = %redact_url(&self.url),
                     repo = %self.repo,
                     error = %transport,
                     "code-index mcp: обрыв соединения, повторяю запрос по новому"
@@ -867,7 +927,7 @@ impl CodeIndexMcpSource {
                 };
                 let reason = resp.into_string().unwrap_or_default();
                 tracing::info!(
-                    url = %self.url,
+                    url = %redact_url(&self.url),
                     repo = %self.repo,
                     code,
                     reason = reason.trim(),
@@ -1170,7 +1230,7 @@ impl SymbolSource for CodeIndexMcpSource {
         self.search(name_lower).into_iter().any(|f| {
             f.name_lower == name_lower
                 && f.args.contains(") Экспорт")
-                && f.file_path.contains("/CommonModules/")
+                && is_common_module_file_path(&f.file_path)
                 && common_module_xml_path(&f.file_path)
                     .is_some_and(|xml_path| self.module_is_global(&xml_path))
         })
@@ -1204,6 +1264,13 @@ impl SymbolSource for CodeIndexMcpSource {
                 None
             }
         }
+    }
+
+    /// См. `SymbolSource::owner_resolvable`. Наличия владельца в соседнем
+    /// code-index здесь не требуется: важно лишь, что раскладка пути позволяет
+    /// его вывести.
+    fn owner_resolvable(&self, module_path: &str) -> bool {
+        lite_index::owner_module_path(module_path).is_some()
     }
 
     fn object_exists(&self, collection: &str, name_lower: &str) -> Option<bool> {
@@ -1295,8 +1362,41 @@ impl SymbolSource for CodeIndexMcpSource {
     }
 
     fn describe(&self) -> String {
-        format!("code-index mcp: {} repo={}", self.url, self.repo)
+        format!(
+            "code-index mcp: {} repo={}",
+            redact_url(&self.url),
+            self.repo
+        )
     }
+}
+
+/// URL для журнала и сообщений об ошибках — без учётных данных и query:
+/// `http://user:pass@host/mcp?token=…` → `http://host/mcp`. Секреты из
+/// конфигурации не должны попадать в логи и ответы MCP-клиентам.
+///
+/// URL без схемы (`127.0.0.1:8011/mcp?token=…`) тоже маскируется: строка из
+/// конфига уходит в `last_error`, и оставлять в ней токен нельзя (аудит PR).
+/// Учётные данные отделены от хоста ПОСЛЕДНИМ `@` в authority-части — до
+/// первого `/`, а не по всему пути: `http://host/path@x` — это хост `host`.
+pub fn redact_url(url: &str) -> String {
+    let url = url.split(['?', '#']).next().unwrap_or(url);
+    let (scheme, rest) = match url.find("://") {
+        Some(pos) => url.split_at(pos + 3),
+        None => ("", url),
+    };
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let redacted = match authority.rfind('@') {
+        Some(at) => &rest[at + 1..],
+        None => rest,
+    };
+    format!("{scheme}{redacted}")
+}
+
+/// Путь файла — модуль общего модуля? Выгрузка встречается в двух видах:
+/// с ведущим сегментом (`base/CommonModules/…`) и от корня репозитория
+/// (`CommonModules/…`). Сегмент проверяется целиком: `MyCommonModules/…` — не он.
+fn is_common_module_file_path(file_path: &str) -> bool {
+    file_path.contains("/CommonModules/") || file_path.starts_with("CommonModules/")
 }
 
 /// Разобрать SSE-ответ MCP-сервера: строки `data: {...}`, первая бывает
@@ -2232,6 +2332,36 @@ data: {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabili
         assert!(parse_sse_json("не json и не SSE").is_none());
     }
 
+    #[test]
+    fn redact_url_strips_credentials_and_query() {
+        assert_eq!(
+            redact_url("http://user:pass@host:8011/mcp?token=SECRET#frag"),
+            "http://host:8011/mcp"
+        );
+        // Без схемы: query и userinfo тоже не должны утечь в last_error,
+        // который сервер отдаёт MCP-клиенту (аудит PR).
+        assert_eq!(
+            redact_url("127.0.0.1:8011/mcp?token=SECRET"),
+            "127.0.0.1:8011/mcp"
+        );
+        assert_eq!(redact_url("user:pass@host/mcp"), "host/mcp");
+        // `@` в пути — не userinfo: хост не подменяется.
+        assert_eq!(redact_url("http://host/path@x"), "http://host/path@x");
+        assert_eq!(redact_url("not-a-url"), "not-a-url");
+    }
+
+    #[test]
+    fn common_module_path_accepts_both_layouts() {
+        assert!(is_common_module_file_path(
+            "base/CommonModules/М/Ext/Module.bsl"
+        ));
+        assert!(is_common_module_file_path("CommonModules/М/Ext/Module.bsl"));
+        assert!(!is_common_module_file_path("MyCommonModules/М.xml"));
+        assert!(!is_common_module_file_path(
+            "base/Documents/Х/Ext/Module.bsl"
+        ));
+    }
+
     // ── CodeIndexDbSource ─────────────────────────────────────────────────
 
     #[test]
@@ -2253,6 +2383,144 @@ data: {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabili
         assert!(!source.method_exists("несуществующийметод"));
         assert!(!source.is_global_export("датасообщенияedi"));
         assert!(source.describe().contains("index.db"));
+    }
+
+    #[test]
+    fn code_index_db_source_reads_external_connection_module_vars() {
+        // Модуль внешнего соединения объявляет экспортные переменные наравне с
+        // модулями приложения (issue #35-соседнее: без него на реальную
+        // переменную появлялся ложный UnknownCommonModule).
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute("CREATE TABLE functions (name TEXT NOT NULL)", [])
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE files (id INTEGER PRIMARY KEY, path TEXT NOT NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE file_contents (file_id INTEGER NOT NULL, content_blob BLOB NOT NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO files (id, path) VALUES (1, 'base/Ext/ExternalConnectionModule.bsl')",
+            [],
+        )
+        .unwrap();
+        let text = "Перем ИзВнешнегоСоединения Экспорт;\n";
+        let blob = zstd::stream::encode_all(text.as_bytes(), 0).unwrap();
+        conn.execute(
+            "INSERT INTO file_contents (file_id, content_blob) VALUES (1, ?1)",
+            params![blob],
+        )
+        .unwrap();
+        drop(conn);
+
+        let source = CodeIndexDbSource::open(&db_path).unwrap();
+        let vars = source.global_variables().expect("набор должен собраться");
+        assert!(
+            vars.contains("извнешнегосоединения"),
+            "нет экспортной переменной модуля внешнего соединения: {vars:?}"
+        );
+    }
+
+    #[test]
+    fn code_index_db_source_global_vars_none_when_blob_corrupt() {
+        // Один повреждённый блоб делает недостоверным весь набор: «не знаю»
+        // (`None`) выключает правило целиком, вместо ложных срабатываний на
+        // реальные экспортные переменные.
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute("CREATE TABLE functions (name TEXT NOT NULL)", [])
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE files (id INTEGER PRIMARY KEY, path TEXT NOT NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE file_contents (file_id INTEGER NOT NULL, content_blob BLOB NOT NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO files (id, path) VALUES (1, 'base/Ext/ManagedApplicationModule.bsl')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO file_contents (file_id, content_blob) VALUES (1, ?1)",
+            params![vec![0u8, 1, 2, 3]],
+        )
+        .unwrap();
+        drop(conn);
+
+        let source = CodeIndexDbSource::open(&db_path).unwrap();
+        assert!(
+            source.global_variables().is_none(),
+            "повреждённый блоб — «не знаю», а не пустой набор"
+        );
+    }
+
+    #[test]
+    fn code_index_db_source_owner_missing_is_none_not_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "CREATE TABLE functions (name TEXT NOT NULL, file_id INTEGER, args TEXT)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE files (id INTEGER PRIMARY KEY, path TEXT NOT NULL)",
+            [],
+        )
+        .unwrap();
+        // Форма есть, модуля-владельца в базе нет — «не знаю», не пустой набор.
+        conn.execute(
+            "INSERT INTO files (id, path) VALUES (1, 'external/Обр/Form/Ф/Form.obj.bsl')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let source = CodeIndexDbSource::open(&db_path).unwrap();
+        assert!(
+            source
+                .owner_exports("external/Обр/Form/Ф/Form.obj.bsl")
+                .is_none(),
+            "владельца нет в базе — «не знаю»"
+        );
+
+        // Владелец появился, но экспортных методов у него нет: пустой набор —
+        // законный ответ «экспортов нет» (вызов владельца здесь невозможен).
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO files (id, path) VALUES (2, 'external/Обр/ExternalDataProcessor.obj.bsl')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let source = CodeIndexDbSource::open(&db_path).unwrap();
+        assert_eq!(
+            source.owner_exports("external/Обр/Form/Ф/Form.obj.bsl"),
+            Some(HashSet::new())
+        );
+
+        // `owner_resolvable` различает «владельца нет в базе» и «раскладка не
+        // разбирается»: во втором случае валидатор молчать не должен.
+        assert!(
+            source.owner_resolvable("external/Обр/Form/Ф/Form.obj.bsl"),
+            "раскладка внешней обработки — владелец выводится из пути"
+        );
+        assert!(
+            !source.owner_resolvable("base/Catalogs/Х/Forms/ФормаЭлемента/Ext/Form/Module.bsl"),
+            "раскладка формы конфигурации — владелец не выводится, молчание включать нельзя"
+        );
     }
 
     // ── LiteSource ────────────────────────────────────────────────────────
@@ -2377,6 +2645,18 @@ data: {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabili
             "экспорты владельца не найдены, получено {} имён",
             names.len()
         );
+        assert!(
+            src.owner_resolvable(
+                "external/Выгрузка накладных в Docsinbox/Form/НоваяФорма/Form.obj.bsl"
+            ),
+            "раскладка внешней обработки — владелец выводится из пути"
+        );
+        assert!(
+            !src.owner_resolvable(
+                "base/Catalogs/Номенклатура/Forms/ФормаЭлемента/Ext/Form/Module.bsl"
+            ),
+            "раскладка формы конфигурации — владелец не выводится"
+        );
     }
 
     /// Issue #35: объект и метод, появившиеся в базе ПОСЛЕ подключения
@@ -2483,6 +2763,23 @@ data: {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabili
         let db = db.as_path();
         if !db.exists() {
             eprintln!("skip: базы code-index нет");
+            return;
+        }
+        // Выгрузка может не содержать внешних обработок (`external/`): тогда
+        // форм с владельцем в ней нет, и проверять нечего (аудит PR: на таком
+        // корпусе тест падал «получено: 0 имён»).
+        let has_external = Connection::open(db)
+            .and_then(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM files WHERE path LIKE 'external/%'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .unwrap_or(0)
+            > 0;
+        if !has_external {
+            eprintln!("skip: в выгрузке нет external/ — фикстура другой конфигурации");
             return;
         }
         let src = CodeIndexDbSource::open(db).unwrap();

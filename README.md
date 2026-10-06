@@ -256,6 +256,12 @@ otherwise networked requests get `403 Forbidden: Host header is not allowed`:
 allowed_hosts = ["localhost", "127.0.0.1", "::1", "<server-ip>"]
 ```
 
+The filter applies to **every** route, `/health` included: a health check over the
+external address needs its entry in the list too (the supervisor's loopback probe
+goes to `127.0.0.1` and is covered by the default). An empty
+`allowed_hosts = []` does NOT mean "allow everything": rmcp treats an empty list
+as "any Host", so the server substitutes the loopback default and warns in the log.
+
 ### External source of configuration names
 
 The validator receives the text of a SINGLE module, so a call to a procedure declared

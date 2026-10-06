@@ -1,13 +1,15 @@
 //! Парсер страницы свойства типа платформы.
 //!
-//! Главы: «Описание:» (текст с типом), «Использование:» (флаг readonly),
-//! «См. также:», «Примечание:».
+//! Главы: «Описание:» (текст с типом либо, если типа нет, только описание),
+//! «Использование:» (флаг readonly), «См. также:», «Примечание:».
 //!
 //! Порт `PropertyPageParser.kt`. У апстрима блок «Описание:» парсится через
-//! `ValueInfoBlockHandler` — вытаскивает type_name + description.
+//! `ValueInfoBlockHandler` — вытаскивает type_name + description; порт
+//! дополнительно сохраняет описание на страницах без маркера «Тип:» (их
+//! тысячи: 3048 из 13665 в 8.3.27).
 
 use crate::blocks::{
-    parse_head_name, parse_note, parse_readonly, parse_related_objects, parse_value_info,
+    non_empty, parse_head_name, parse_note, parse_readonly, parse_related_objects, parse_value_info,
 };
 use crate::html::split_chapters;
 use crate::models::PropertyInfo;
@@ -34,10 +36,16 @@ pub fn parse_property_page(html: &str) -> PropertyInfo {
             }
             "Использование:" => readonly = parse_readonly(&ch.body_html),
             "См. также:" => related = parse_related_objects(&ch.body_html),
-            "Примечание:" => note = Some(parse_note(&ch.body_html)),
+            "Примечание:" => note = non_empty(parse_note(&ch.body_html)),
             "Доступность:" | "Использование в версии:" | "Использование в интерфейсе:" =>
-                {}
-            _ => {}
+            {
+                // Известные главы, ничего не дающие правилам.
+            }
+            _ => {
+                if !ch.title.is_empty() {
+                    tracing::warn!(chapter = ch.title, "неизвестная глава страницы свойства");
+                }
+            }
         }
     }
 

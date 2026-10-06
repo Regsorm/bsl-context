@@ -57,6 +57,10 @@ pub struct Config {
     /// которому клиенты обращаются к серверу (например, IP/имя хоста сервера),
     /// иначе rmcp вернёт `403 Forbidden: Host header is not allowed`. Запись без
     /// порта разрешает любой порт этого хоста.
+    ///
+    /// Origin-заголовок сервер не проверяет (у rmcp `allowed_origins` пуст):
+    /// защита от браузерных cross-origin запросов держится на Host — браузерный
+    /// DNS-rebinding шлёт чужой Host и получает 403.
     pub allowed_hosts: Vec<String>,
 
     /// Путь к файлу кэша собранного платформенного индекса.
@@ -148,11 +152,33 @@ impl SymbolSourceConfig {
         self.code_index_repo.as_deref().or(self.repo.as_deref())
     }
 
+    /// Разрешить относительные пути источника от каталога конфига.
+    fn resolve_paths(&mut self, base: &Path) {
+        self.db_path = self.db_path.take().map(|p| resolve_relative(base, p));
+        self.root = self.root.take().map(|p| resolve_relative(base, p));
+    }
+
     /// Проверка обязательных полей по `kind`. Понятная ошибка на загрузке
     /// конфига вместо тихого падения источника при первом обращении.
     fn validate(&self) -> anyhow::Result<()> {
         match self.kind.as_str() {
-            "none" => Ok(()),
+            "none" => {
+                // Секция есть, но источник не выбран: перечисленные поля молча
+                // игнорировались бы — предупреждаем (в списке это ошибка).
+                if self.db_path.is_some()
+                    || self.root.is_some()
+                    || self.url.is_some()
+                    || self.repo.is_some()
+                    || self.code_index_repo.is_some()
+                {
+                    tracing::warn!(
+                        "symbol_source.kind = \"none\": поля \
+                         db_path/root/url/repo/code_index_repo заданы, но не используются — \
+                         укажите kind источника"
+                    );
+                }
+                Ok(())
+            }
             "lite" | "code_index_db" => {
                 if self.db_path.is_none() {
                     anyhow::bail!(
@@ -174,6 +200,12 @@ impl SymbolSourceConfig {
                          либо code_index_repo"
                     );
                 }
+                if self.timeout_ms == 0 {
+                    anyhow::bail!(
+                        "symbol_source.timeout_ms = 0 недопустим: каждый запрос к code-index \
+                         немедленно упирался бы в таймаут"
+                    );
+                }
                 Ok(())
             }
             other => anyhow::bail!(
@@ -181,6 +213,16 @@ impl SymbolSourceConfig {
                  none, lite, code_index_db, code_index_mcp"
             ),
         }
+    }
+}
+
+/// Относительный путь — от каталога конфига; пустой (им выключается кэш) и
+/// абсолютный остаются как есть.
+fn resolve_relative(base: &Path, path: PathBuf) -> PathBuf {
+    if path.as_os_str().is_empty() || path.is_absolute() {
+        path
+    } else {
+        base.join(path)
     }
 }
 
@@ -239,22 +281,67 @@ impl Config {
         let Some(path) = path else {
             return Ok(Self::default());
         };
-        let raw = std::fs::read_to_string(path)
-            .map_err(|e| anyhow::anyhow!("read config {}: {}", path.display(), e))?;
+        let raw = std::fs::read_to_string(path).map_err(|e| {
+            anyhow::anyhow!(
+                "read config {}: {} (файл должен быть в UTF-8: UTF-16/ANSI не поддерживаются)",
+                path.display(),
+                e
+            )
+        })?;
         let mut cfg: Config = toml::from_str(&raw)
             .map_err(|e| anyhow::anyhow!("parse config {}: {}", path.display(), e))?;
         // Кламп уровня в безопасный диапазон, чтобы конфиг с опечаткой
         // (`level = 5`) не валил сервер и не приводил к скрытым ошибкам.
         cfg.default_validation_level = cfg.default_validation_level.clamp(1, 3);
+        if cfg.port == 0 {
+            anyhow::bail!("port = 0 недопустим: укажите порт 1..=65535");
+        }
+        // Пустой allowed_hosts rmcp трактует как «разрешить ЛЮБОЙ Host» —
+        // защита от DNS-rebinding молча выключалась бы. Пустой список —
+        // почти всегда недописанный конфиг: возвращаем loopback-дефолт.
+        if cfg.allowed_hosts.is_empty() {
+            tracing::warn!(
+                "allowed_hosts пуст — rmcp принял бы любой Host; подставлен loopback-дефолт. \
+                 Для сетевого деплоя перечислите адреса клиентов явно"
+            );
+            cfg.allowed_hosts = Self::default().allowed_hosts;
+        }
+        // Относительные пути — от каталога конфига, а не от CWD процесса
+        // (у службы это System32: логи, кэш и база уезжали бы туда).
+        let base = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        cfg.resolve_paths(&base);
         cfg.resolved_symbol_sources()?;
         Ok(cfg)
+    }
+
+    /// Разрешить относительные пути настроек от каталога конфига.
+    fn resolve_paths(&mut self, base: &Path) {
+        self.log_dir = resolve_relative(base, std::mem::take(&mut self.log_dir));
+        self.platform_path = self.platform_path.take().map(|p| resolve_relative(base, p));
+        self.platform_cache_path = self
+            .platform_cache_path
+            .take()
+            .map(|p| resolve_relative(base, p));
+        self.symbol_source.resolve_paths(base);
+        for source in &mut self.symbol_sources {
+            source.resolve_paths(base);
+        }
     }
 
     /// Именованные источники имён: либо одна секция `[symbol_source]`, либо
     /// список `[[symbol_sources]]`. Возвращает пары (алиас, конфиг) — алиас и
     /// есть значение параметра `repo` у инструментов.
     pub fn resolved_symbol_sources(&self) -> anyhow::Result<Vec<(String, SymbolSourceConfig)>> {
-        if !self.symbol_sources.is_empty() && self.symbol_source.kind != "none" {
+        let single_present = self.symbol_source.kind != "none"
+            || self.symbol_source.db_path.is_some()
+            || self.symbol_source.root.is_some()
+            || self.symbol_source.url.is_some()
+            || self.symbol_source.repo.is_some()
+            || self.symbol_source.code_index_repo.is_some();
+        if !self.symbol_sources.is_empty() && single_present {
             anyhow::bail!(
                 "укажите либо [symbol_source] (одна конфигурация), либо [[symbol_sources]] \
                  (несколько) — но не обе секции сразу"
@@ -273,21 +360,38 @@ impl Config {
                 if !seen.insert(name.to_string()) {
                     anyhow::bail!("повторяющийся repo в [[symbol_sources]]: \"{name}\"");
                 }
+                // kind = "none" в списке — явно отключённый источник (алиас
+                // остаётся виден в symbol_sources_status). Поля источника при
+                // этом НЕ валят старт (аудит PR): конфиг с закомментированным
+                // kind иначе не поднимался бы вовсе, а причина видна в журнале —
+                // `validate()` ниже предупреждает про каждое заданное поле.
+                if entry.kind == "none" {
+                    tracing::warn!(
+                        source = %name,
+                        "источник [[symbol_sources]] отключён (kind = \"none\")"
+                    );
+                }
                 entry.validate()?;
                 result.push((name.to_string(), entry.clone()));
             }
             return Ok(result);
         }
-        if self.symbol_source.kind != "none" {
+        if self.symbol_source.kind == "none" {
+            // Одиночная секция с полями источника — тот же недописанный
+            // конфиг, что и в списке `[[symbol_sources]]`: источник просто
+            // отключён, а `validate()` предупреждает про каждое заданное поле
+            // (раньше здесь был отказ старта — аудит PR).
             self.symbol_source.validate()?;
-            let name = self
-                .symbol_source
-                .repo
-                .clone()
-                .unwrap_or_else(|| DEFAULT_SOURCE_NAME.to_string());
-            return Ok(vec![(name, self.symbol_source.clone())]);
+            return Ok(Vec::new());
         }
-        Ok(Vec::new())
+        self.symbol_source.validate()?;
+        let name = self
+            .symbol_source
+            .repo
+            .clone()
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| DEFAULT_SOURCE_NAME.to_string());
+        Ok(vec![(name, self.symbol_source.clone())])
     }
 }
 
@@ -434,5 +538,108 @@ mod tests {
             cfg.platform_cache_path_effective(),
             Some(PathBuf::from("C:/tmp/pc.cache"))
         );
+    }
+
+    #[test]
+    fn empty_allowed_hosts_restored_to_loopback() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("c.toml");
+        std::fs::write(&path, "allowed_hosts = []\n").unwrap();
+        let cfg = Config::load_or_default(Some(&path)).unwrap();
+        assert_eq!(cfg.allowed_hosts, Config::default().allowed_hosts);
+    }
+
+    #[test]
+    fn relative_paths_resolve_against_config_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("c.toml");
+        std::fs::write(&path, "log_dir = \"logs\"\nplatform_path = \"1cv8\"\n").unwrap();
+        let cfg = Config::load_or_default(Some(&path)).unwrap();
+        assert_eq!(cfg.log_dir, dir.path().join("logs"));
+        assert_eq!(
+            cfg.platform_path.as_deref(),
+            Some(dir.path().join("1cv8").as_path())
+        );
+    }
+
+    #[test]
+    fn port_zero_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("c.toml");
+        std::fs::write(&path, "port = 0\n").unwrap();
+        assert!(Config::load_or_default(Some(&path)).is_err());
+    }
+
+    #[test]
+    fn list_entry_with_kind_none_is_disabled_not_error() {
+        // Явно отключённый источник: алиас остаётся видимым для
+        // symbol_sources_status, ошибки нет.
+        let cfg: Config =
+            toml::from_str("[[symbol_sources]]\nrepo = \"ut\"\nkind = \"none\"\n").unwrap();
+        let resolved = cfg.resolved_symbol_sources().unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].0, "ut");
+    }
+
+    #[test]
+    fn list_entry_with_kind_none_and_fields_is_disabled_not_fatal() {
+        // kind = "none" с полями источника — источник отключён, поля
+        // игнорируются, но старт из-за этого не валится: конфиг с
+        // закомментированным kind раньше просто не поднимался (аудит PR).
+        let cfg: Config = toml::from_str(
+            "[[symbol_sources]]\nrepo = \"ut\"\nkind = \"none\"\ndb_path = \"ut.db\"\n",
+        )
+        .unwrap();
+        let resolved = cfg.resolved_symbol_sources().unwrap();
+        assert_eq!(
+            resolved.len(),
+            1,
+            "алиас остаётся видимым в symbol_sources_status"
+        );
+        assert_eq!(resolved[0].0, "ut");
+    }
+
+    #[test]
+    fn single_section_kind_none_with_fields_is_disabled_not_fatal() {
+        // Та же недописанная секция, но одиночная: поля игнорируются,
+        // источника нет, старт продолжается (раньше — отказ старта).
+        let cfg: Config =
+            toml::from_str("[symbol_source]\nkind = \"none\"\ndb_path = \"ut.db\"\n").unwrap();
+        assert!(cfg.resolved_symbol_sources().unwrap().is_empty());
+    }
+
+    #[test]
+    fn single_section_kind_none_with_only_repo_is_disabled_not_fatal() {
+        // `repo` тоже адресует источник: секция с одним `repo` и без `kind`
+        // не должна ни валить старт, ни давать источник (асимметрия из аудита).
+        let cfg: Config =
+            toml::from_str("[symbol_source]\nkind = \"none\"\nrepo = \"ut\"\n").unwrap();
+        assert!(cfg.resolved_symbol_sources().unwrap().is_empty());
+    }
+
+    #[test]
+    fn single_section_kind_none_without_fields_is_disabled() {
+        let cfg: Config = toml::from_str("[symbol_source]\nkind = \"none\"\n").unwrap();
+        assert!(cfg.resolved_symbol_sources().unwrap().is_empty());
+    }
+
+    #[test]
+    fn empty_repo_in_single_section_gets_default_name() {
+        let cfg: Config =
+            toml::from_str("[symbol_source]\nkind = \"lite\"\ndb_path = \"a.db\"\nrepo = \"\"\n")
+                .unwrap();
+        let resolved = cfg.resolved_symbol_sources().unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].0, DEFAULT_SOURCE_NAME);
+    }
+
+    #[test]
+    fn code_index_mcp_zero_timeout_rejected() {
+        let cfg: Config = toml::from_str(
+            "[symbol_source]\nkind = \"code_index_mcp\"\nurl = \"http://x/mcp\"\n\
+             repo = \"r\"\ntimeout_ms = 0\n",
+        )
+        .unwrap();
+        assert!(cfg.resolved_symbol_sources().is_err());
     }
 }

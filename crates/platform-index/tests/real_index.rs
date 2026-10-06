@@ -15,7 +15,7 @@
 
 use std::path::PathBuf;
 
-use platform_index::load_from_hbk;
+use platform_index::{load_from_hbk, Definition};
 
 fn hbk_path() -> Option<PathBuf> {
     let root = std::env::var("BSL_CONTEXT_PLATFORM_PATH")
@@ -213,4 +213,139 @@ fn cache_round_trip_matches_fresh_build() {
         "второй старт обязан прочитать кэш, а не собирать индекс заново"
     );
     assert_eq!(cached, fresh, "индекс из кэша разошёлся со свежей сборкой");
+}
+
+/// Есть ли у сущности непустое примечание.
+fn has_note(note: &Option<String>) -> bool {
+    note.as_deref().is_some_and(|n| !n.trim().is_empty())
+}
+
+/// `note` и английские имена обязаны доезжать от страницы справки до вывода
+/// инструментов: до этого `note` разбирался, но в домен не попадал вовсе, а
+/// `name_en` не показывался нигде, кроме значений перечислений.
+#[test]
+fn notes_and_english_names_reach_the_output() {
+    let Some(path) = hbk_path() else {
+        eprintln!("skip: hbk не найден");
+        return;
+    };
+    let index = load_from_hbk(&path).expect("PlatformIndex должен загружаться");
+
+    let mut notes = 0usize;
+    let mut rendered = 0usize;
+    let mut examples: Vec<String> = Vec::new();
+
+    for ty in index.types.values() {
+        // Английское имя — в заголовке типа.
+        if !ty.name_en.is_empty() {
+            let out = platform_index::format::format_type(ty);
+            assert!(
+                out.contains(&ty.name_en),
+                "английское имя типа '{}' обязано быть в выводе",
+                ty.name_ru
+            );
+        }
+        // Примечание: тип, значение перечисления, метод, свойство, конструктор.
+        if let Some(note) = ty.note.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+            notes += 1;
+            let out = platform_index::format::format_type(ty);
+            assert!(
+                out.contains("**Примечание:**"),
+                "примечание типа '{}' не в выводе",
+                ty.name_ru
+            );
+            assert!(
+                out.contains(note.lines().next().unwrap_or("")),
+                "текст примечания типа '{}' потерян",
+                ty.name_ru
+            );
+            rendered += 1;
+            if examples.len() < 3 {
+                examples.push(format!(
+                    "тип {} — {}",
+                    ty.name_ru,
+                    note.lines().next().unwrap_or("")
+                ));
+            }
+        }
+        if let Some(v) = ty.enum_values.iter().find(|v| has_note(&v.note)) {
+            notes += 1;
+            let out = platform_index::format::format_enum_values(&ty.enum_values, &ty.name_ru);
+            assert!(
+                out.contains("**Примечание:**"),
+                "примечание значения '{}' не в выводе",
+                v.name_ru
+            );
+            rendered += 1;
+            if examples.len() < 3 {
+                examples.push(format!(
+                    "значение {} — {}",
+                    v.name_ru,
+                    v.note.as_deref().unwrap_or("").lines().next().unwrap_or("")
+                ));
+            }
+        }
+        if let Some(m) = ty.methods.iter().find(|m| has_note(&m.note)) {
+            notes += 1;
+            let out = platform_index::format::format_member(&Definition::Method(m.clone()));
+            assert!(
+                out.contains("**Примечание:**"),
+                "примечание метода '{}' не в выводе",
+                m.name_ru
+            );
+            rendered += 1;
+            if examples.len() < 3 {
+                examples.push(format!(
+                    "метод {} — {}",
+                    m.name_ru,
+                    m.note.as_deref().unwrap_or("").lines().next().unwrap_or("")
+                ));
+            }
+        }
+        if let Some(p) = ty.properties.iter().find(|p| has_note(&p.note)) {
+            notes += 1;
+            let out = platform_index::format::format_member(&Definition::Property(p.clone()));
+            assert!(
+                out.contains("**Примечание:**"),
+                "примечание свойства '{}' не в выводе",
+                p.name_ru
+            );
+            rendered += 1;
+            if examples.len() < 3 {
+                examples.push(format!(
+                    "свойство {} — {}",
+                    p.name_ru,
+                    p.note.as_deref().unwrap_or("").lines().next().unwrap_or("")
+                ));
+            }
+        }
+        if let Some(c) = ty.constructors.iter().find(|c| has_note(&c.note)) {
+            notes += 1;
+            let out =
+                platform_index::format::format_constructors(std::slice::from_ref(c), &ty.name_ru);
+            assert!(
+                out.contains("**Примечание:**"),
+                "примечание конструктора '{}' не в выводе",
+                c.name
+            );
+            rendered += 1;
+            if examples.len() < 3 {
+                examples.push(format!(
+                    "конструктор {} — {}",
+                    c.name,
+                    c.note.as_deref().unwrap_or("").lines().next().unwrap_or("")
+                ));
+            }
+        }
+    }
+
+    println!("сущностей с примечанием: {notes}; проверок вывода: {rendered}");
+    for example in &examples {
+        println!("  пример: {example}");
+    }
+    assert!(
+        notes > 0,
+        "на 8.3.27 примечания есть (52 страницы значений перечислений и др.) — поле обязано доезжать до домена"
+    );
+    assert!(rendered > 0, "примечание обязано попадать в markdown-вывод");
 }

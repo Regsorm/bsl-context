@@ -210,7 +210,10 @@ pub fn normalize_for_parser(source: &str) -> std::borrow::Cow<'_, str> {
     let has_ternary_gap = find_ternary_gap(bytes).is_some();
     let has_bare_raise = find_bare_raise(bytes, 0).is_some();
     let has_preproc_gap = find_preproc_gap(bytes, 0).is_some();
-    let has_neg_default = !negative_defaults(bytes).is_empty();
+    // Позиции минусов считаем один раз: повторный вызов на выходном буфере
+    // означал бы ещё один полный проход с обратными сканами заголовков.
+    let neg_defaults = negative_defaults(bytes);
+    let has_neg_default = !neg_defaults.is_empty();
     let has_other_cyrillic = has_non_russian_cyrillic(bytes);
     if !has_yo
         && !has_nbsp
@@ -286,8 +289,10 @@ pub fn normalize_for_parser(source: &str) -> std::borrow::Cow<'_, str> {
     }
 
     // ── 6. `= -1` в заголовке процедуры/функции → минус меняем на пробел
-    for pos in negative_defaults(&out) {
-        out[pos] = b' ';
+    for pos in neg_defaults {
+        if out[pos] == b'-' {
+            out[pos] = b' ';
+        }
     }
 
     std::borrow::Cow::Owned(String::from_utf8(out).expect("побайтные замены сохраняют UTF-8"))
@@ -996,14 +1001,42 @@ fn two_segment_head(node: Option<tree_sitter::Node>, src: &[u8]) -> Option<(Stri
 /// Директива компиляции процедуры/функции без амперсанда (`НаСервере`, `Вместо`).
 ///
 /// В дереве она лежит ПЕРЕД узлом определения: предыдущий сосед — `preprocessor`,
-/// внутри которого узел `annotation` вида `&НаСервере`.
+/// внутри которого узел `annotation` вида `&НаСервере`. Между директивой и
+/// объявлением встречаются комментарии (на УТ — сотни случаев, из них десятки
+/// `…БезКонтекста`), а директив бывает несколько подряд (`&НаКлиенте` +
+/// `&Вместо(…)`): комментарии пропускаем, а из директив предпочитаем контекстную
+/// (без параметров) — именно она решает, существует ли контекст формы.
 fn directive_of(node: tree_sitter::Node, src: &[u8]) -> Option<String> {
-    let prev = node.prev_sibling()?;
-    if prev.kind() != "preprocessor" {
-        return None;
+    let mut nearest: Option<String> = None;
+    let mut context: Option<String> = None;
+    let mut prev = node.prev_sibling();
+    while let Some(p) = prev {
+        match p.kind() {
+            "line_comment" | "comment" => {
+                prev = p.prev_sibling();
+            }
+            "preprocessor" => {
+                if let Some(directive) = annotation_text(p, src) {
+                    let with_params = p.utf8_text(src).is_ok_and(|t| t.contains('('));
+                    if !with_params && context.is_none() {
+                        context = Some(directive.clone());
+                    }
+                    if nearest.is_none() {
+                        nearest = Some(directive);
+                    }
+                }
+                prev = p.prev_sibling();
+            }
+            _ => break,
+        }
     }
-    let mut cursor = prev.walk();
-    let annotation = prev
+    context.or(nearest)
+}
+
+/// Текст аннотации внутри `preprocessor` без ведущего амперсанда.
+fn annotation_text(preprocessor: tree_sitter::Node, src: &[u8]) -> Option<String> {
+    let mut cursor = preprocessor.walk();
+    let annotation = preprocessor
         .named_children(&mut cursor)
         .find(|c| c.kind() == "annotation")?;
     annotation
@@ -1199,15 +1232,15 @@ fn count_arguments_in_text(text: &[u8]) -> usize {
         }
         i += 1;
     }
-    if has_content {
+    if has_content || commas > 0 {
+        // Запятые — это СЛОТЫ аргументов, а не пустой список: `Ф(,)` платформа
+        // видит как два аргумента (пропущенный первый и пустой второй). Отдавать
+        // такой список как один аргумент нельзя: с позиционным минимумом подписи
+        // (`check::brief_signature`) рабочий вызов `ПоказатьПредупреждение(,)`
+        // из реальной выгрузки получал ложное «не принимает 1 аргумент. Допустимо: 2..4».
         commas + 1
-    } else if commas > 0 {
-        // Список из одних запятых — это ПРОПУЩЕННЫЙ аргумент: в выгрузке УТ есть
-        // `ПоказатьПредупреждение(,)`, и дерево отдаёт на него ровно один узел
-        // `omitted_argument`. Считать такое за ноль аргументов значит выдать
-        // ложную находку на рабочем коде.
-        1
     } else {
+        // Ни содержимого, ни запятых: `Ф()` — ноль аргументов.
         0
     }
 }
@@ -1215,9 +1248,9 @@ fn count_arguments_in_text(text: &[u8]) -> usize {
 // ── Очистка строк и комментариев ──────────────────────────────────────────
 
 /// Замаскировать пробелами строковые литералы и комментарии. Длина и позиции
-/// строк сохраняются — это важно для line/col, передаваемых в ошибки. Русские
-/// буквы и прочие multi-byte UTF-8 символы НЕ трогаются — пробелами заменяются
-/// только байты внутри строк/комментариев (ASCII содержимое).
+/// строк сохраняются — это важно для line/col, передаваемых в ошибки. Пробелами
+/// заменяются ВСЕ байты содержимого (кроме переводов строк): многобайтный символ
+/// превращается в несколько пробелов, UTF-8 остаётся валидным.
 /// Убрать директивы препроцессора расширений, сохранив длину строк.
 ///
 /// В модуле расширения блок `#Удаление … #КонецУдаления` содержит код исходного
@@ -1238,16 +1271,21 @@ pub fn strip_extension_directives(src: &str) -> String {
 
     for line in src.split_inclusive('\n') {
         let body_len = line.trim_end_matches(['\n', '\r']).len();
-        let head = line.trim_start().to_lowercase();
+        let head = line
+            .trim_start_matches(|c: char| c.is_whitespace() || c == '\u{FEFF}')
+            .to_lowercase();
 
-        let starts_delete = head.starts_with("#удаление") || head.starts_with("#delete");
-        let ends_delete = head.starts_with("#конецудаления") || head.starts_with("#enddelete");
+        // Имя директивы — до пробела: `#УдалениеВременныхТаблиц` не должно
+        // считаться маркером `#Удаление` и затирать весь остаток файла.
+        let name = head.split_whitespace().next().unwrap_or("");
+        let starts_delete = matches!(name, "#удаление" | "#delete");
+        let ends_delete = matches!(name, "#конецудаления" | "#enddelete");
         let is_marker = starts_delete
             || ends_delete
-            || head.starts_with("#вставка")
-            || head.starts_with("#конецвставки")
-            || head.starts_with("#insert")
-            || head.starts_with("#endinsert");
+            || matches!(
+                name,
+                "#вставка" | "#конецвставки" | "#insert" | "#endinsert"
+            );
 
         if starts_delete {
             in_deleted = true;
@@ -1351,12 +1389,20 @@ pub fn scan_declarations(source: &str) -> HashSet<String> {
     let cleaned = mask_strings_and_comments(source);
     let mut names = HashSet::new();
     for line in cleaned.lines() {
-        let trimmed = line.trim_start();
+        let trimmed = line.trim_start_matches(|c: char| c.is_whitespace() || c == '\u{FEFF}');
         let lower = trimmed.to_lowercase();
-        let rest = ["процедура ", "функция ", "procedure ", "function "]
+        // После ключевого слова — ЛЮБОЙ пробельный разделитель (в корпусе
+        // встречается табуляция: `Функция\tИмя()`), поэтому пробел в шаблон
+        // не входит, но разделитель обязателен.
+        let Some(rest) = ["процедура", "функция", "procedure", "function"]
             .iter()
-            .find_map(|kw| lower.strip_prefix(kw));
-        let Some(rest) = rest else { continue };
+            .find_map(|kw| lower.strip_prefix(kw))
+        else {
+            continue;
+        };
+        let Some(rest) = rest.strip_prefix(char::is_whitespace) else {
+            continue;
+        };
         let Some((name, _)) = rest.split_once('(') else {
             continue;
         };
@@ -1631,6 +1677,16 @@ fn scan_literals(bytes: &[u8]) -> Vec<Literal> {
                 break;
             }
 
+            if bytes[j] == b'\r' && j + 1 < bytes.len() && bytes[j + 1] == b'\n' {
+                // CRLF: в значение входит только `\n`. `\r` разрывает кусок
+                // карты — иначе он попал бы в собираемый текст, а смещение
+                // куска указывало бы на последовательность с `\r`.
+                if let Some(p) = part.take() {
+                    parts.push(p);
+                }
+                j += 1;
+                continue;
+            }
             if bytes[j] == b'\n' {
                 // Перевод строки — часть значения, а вот отступ, символ
                 // продолжения `|` и комментарий между строками — нет.
@@ -1705,16 +1761,57 @@ fn skip_ws_and_comments(bytes: &[u8], mut i: usize) -> usize {
 }
 
 /// Стоит ли слева от литерала знак конкатенации.
+///
+/// Пробелы, переводы строк И однострочные комментарии между `+` и литералом не
+/// делают текст «чистым»: `X + // c\n "ВЫБРАТЬ 1"` — вычисляемая часть, и
+/// пропустить её значит выдать динамический текст за статический запрос.
 fn preceded_by_plus(bytes: &[u8], start: usize) -> bool {
     let mut i = start;
-    while i > 0 {
-        i -= 1;
-        if (bytes[i] as char).is_ascii_whitespace() {
+    loop {
+        while i > 0 && (bytes[i - 1] as char).is_ascii_whitespace() {
+            i -= 1;
+        }
+        if i == 0 {
+            return false;
+        }
+        // Хвост текущей строки может быть комментарием (в том числе после
+        // `+`): пропускаем его и смотрим, что было до него.
+        let line_start = bytes[..i]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map(|p| p + 1)
+            .unwrap_or(0);
+        if let Some(comment) = comment_start_on_line(&bytes[line_start..i], line_start) {
+            i = comment;
             continue;
         }
-        return bytes[i] == b'+';
+        return bytes[i - 1] == b'+';
     }
-    false
+}
+
+/// Начало хвостового `//`-комментария в срезе строки — при условии, что `//`
+/// не находится внутри строкового литерала. `line_start` — смещение среза
+/// в исходном массиве.
+fn comment_start_on_line(line: &[u8], line_start: usize) -> Option<usize> {
+    let mut in_string = false;
+    let mut i = 0;
+    while i < line.len() {
+        match line[i] {
+            b'"' => {
+                if in_string && i + 1 < line.len() && line[i + 1] == b'"' {
+                    i += 2; // удвоенная кавычка — экранирование, строка не кончилась
+                    continue;
+                }
+                in_string = !in_string;
+                i += 1;
+            }
+            b'/' if !in_string && i + 1 < line.len() && line[i + 1] == b'/' => {
+                return Some(line_start + i);
+            }
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 /// Склеить значение группы литералов и отсеять всё, что не является запросом.
@@ -1748,10 +1845,17 @@ fn assemble_query(bytes: &[u8], group: &[Literal]) -> Option<QueryText> {
 /// Начинается ли значение с ключевого слова, с которого может начинаться запрос.
 ///
 /// Проверяется именно первое слово: подстроки вроде «выбрать» где-то в середине
-/// сообщения пользователю запросом не являются.
+/// сообщения пользователю запросом не являются. Ведущие `//`-строки —
+/// комментарии языка запросов: запросы нередко начинаются с них.
 fn looks_like_query(text: &str) -> bool {
-    let head: String = text
-        .trim_start()
+    let mut rest = text.trim_start();
+    while let Some(after) = rest.strip_prefix("//") {
+        let Some(eol) = after.find('\n') else {
+            return false;
+        };
+        rest = after[eol + 1..].trim_start();
+    }
+    let head: String = rest
         .chars()
         .take_while(|c| c.is_alphanumeric() || *c == '_')
         .collect();
@@ -1915,9 +2019,11 @@ mod tests {
         assert_eq!(arg_count_of(real, "НСтр"), 2);
         // Запятые в тексте запроса внутри литерала — тоже не разделители.
         assert_eq!(arg_count_of("Ф(\"ВЫБРАТЬ А, Б, В\");", "Ф"), 1);
-        // Список из одних запятых — пропущенный аргумент (в выгрузке УТ есть
-        // `ПоказатьПредупреждение(,)`); пустой список — ноль.
-        assert_eq!(arg_count_of("Ф(,);", "Ф"), 1);
+        // Список из одних запятых — это СЛОТЫ аргументов: `Ф(,)` платформа
+        // видит как два (пропущенный и пустой), именно так выглядит рабочий
+        // `ПоказатьПредупреждение(,)` из реальной выгрузки. Пустой список — ноль.
+        assert_eq!(arg_count_of("Ф(,);", "Ф"), 2);
+        assert_eq!(arg_count_of("Ф(,,);", "Ф"), 3);
         assert_eq!(arg_count_of("Ф();", "Ф"), 0);
     }
 
@@ -2552,5 +2658,85 @@ mod tests {
         );
         assert_eq!(queries[0].text, "ВЫБРАТЬ 1");
         assert_eq!(queries[1].text, "ВЫБРАТЬ 2");
+    }
+
+    // ── Регрессии аудита ─────────────────────────────────────────────────
+
+    /// Директива не теряется, если между ней и объявлением стоит комментарий
+    /// (на корпусе УТ — сотни таких мест).
+    #[test]
+    fn directive_with_comment_between_is_seen() {
+        let src = "&НаКлиентеНаСервереБезКонтекста\n// пояснение\nПроцедура П()\nЭлементы = 1;\nКонецПроцедуры";
+        let facts = collect_facts(src);
+        assert!(facts.has_directives);
+        assert_eq!(facts.procs.len(), 1);
+        assert!(
+            facts.procs[0].no_context,
+            "директива потеряна из-за комментария между ней и объявлением"
+        );
+    }
+
+    /// Стековые директивы расширений: контекстная (`&НаКлиенте`) важнее
+    /// ближайшей `&Вместо("…")`.
+    #[test]
+    fn stacked_directives_prefer_context() {
+        let methods = collect_methods("&НаКлиенте\n&Вместо(\"Х\")\nПроцедура Р()\nКонецПроцедуры");
+        assert_eq!(methods.len(), 1);
+        assert_eq!(methods[0].directive.as_deref(), Some("НаКлиенте"));
+    }
+
+    /// CRLF: в значение многострочного литерала входит только `\n`.
+    #[test]
+    fn crlf_multiline_query_has_lf_only() {
+        let src = "Т = \"ВЫБРАТЬ\r\n\t|\t1\";";
+        let queries = collect_query_texts(src);
+        assert_eq!(queries.len(), 1);
+        assert_eq!(queries[0].text, "ВЫБРАТЬ\n\t1");
+    }
+
+    /// Комментарий между `+` и литералом не делает текст статическим: часть
+    /// выражения вычисляется, запрос не возвращается.
+    #[test]
+    fn plus_separated_by_comment_is_dirty() {
+        assert!(collect_query_texts("Т = X + // c\n\"ВЫБРАТЬ 1\";").is_empty());
+        assert!(collect_query_texts("Т = X + \"//в строке\" + // c\n\"ВЫБРАТЬ 1\";").is_empty());
+    }
+
+    /// Префиксное совпадение с `#Удаление` не должно затирать остаток файла.
+    #[test]
+    fn deletion_prefix_is_not_a_marker() {
+        let src = "#УдалениеВременныхТаблиц\nТ = \"ВЫБРАТЬ 1\";\n";
+        assert!(!strip_extension_directives(src).trim().is_empty());
+        assert_eq!(collect_query_texts(src).len(), 1);
+    }
+
+    /// Запрос может начинаться с `//`-комментария языка запросов.
+    #[test]
+    fn query_starting_with_comment_is_found() {
+        let queries = collect_query_texts("Т = \"// c\nВЫБРАТЬ 1\";");
+        assert_eq!(queries.len(), 1);
+        assert!(queries[0].text.starts_with("// c"));
+    }
+
+    /// Разделитель после ключевого слова — не только пробел: в корпусе
+    /// встречается `Функция\tИмя()`.
+    #[test]
+    fn scan_declarations_accepts_tab_separator() {
+        let names = scan_declarations("Процедура\tТаб()\nКонецПроцедуры");
+        assert!(names.contains("таб"), "{names:?}");
+    }
+
+    /// BOM в первой строке не скрывает объявление (trim_start его не снимает).
+    #[test]
+    fn scan_declarations_sees_through_bom() {
+        let names = scan_declarations("\u{FEFF}Процедура Моя()\nКонецПроцедуры");
+        assert!(names.contains("моя"), "{names:?}");
+    }
+
+    /// BOM в первой строке не отменяет блочную директиву `#Удаление`.
+    #[test]
+    fn strip_extension_sees_through_bom() {
+        let src = "\u{FEFF}#Удаление\nТ = \"ВЫБРАТЬ 1\";\n#КонецУдаления\n";
+        assert!(collect_query_texts(src).is_empty());
     }
 }

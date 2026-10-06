@@ -3,14 +3,33 @@
 
 use std::sync::Arc;
 
-use axum::{extract::State, response::Json, routing::get, Router};
+use axum::{
+    extract::{Request, State},
+    http::StatusCode,
+    middleware::{self, Next},
+    response::{IntoResponse, Json, Response},
+    routing::get,
+    Router,
+};
 use rmcp::transport::streamable_http_server::{
     session::never::NeverSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
 use serde::Serialize;
+use tower_http::limit::RequestBodyLimitLayer;
 
 use crate::config::Config;
 use crate::mcp_server::BslContextServer;
+
+/// Предел размера тела запроса MCP-кадра. rmcp читает тело без границы
+/// (`body.collect()`), поэтому без явного лимита один клиент выедал бы память.
+///
+/// Тело — это JSON-кадр целиком, а кириллица в нём может прийти
+/// `\uXXXX`-экранированной: шесть байт на символ вместо двух (так делает,
+/// например, `json.dumps` в Python по умолчанию). Предел берётся с четырёхкратным
+/// запасом от [`crate::mcp_server::MAX_SOURCE_BYTES`]: иначе модуль, проходящий
+/// проверку размера исходника, до неё бы не доехал — сервер обрывал бы соединение
+/// вместо внятного отказа (наблюдалось на модуле 8,4 МиБ).
+const MAX_REQUEST_BYTES: usize = crate::mcp_server::MAX_SOURCE_BYTES * 4;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -58,8 +77,16 @@ struct HealthResponse {
 /// Собрать роутер: /health и /mcp через Streamable HTTP при любом состоянии индекса.
 pub fn router(config: Config, server: BslContextServer) -> Router {
     // Список разрешённых Host для /mcp (защита rmcp от DNS-rebinding). Клонируем
-    // до перемещения config в AppState.
-    let allowed_hosts = config.allowed_hosts.clone();
+    // до перемещения config в AppState; тот же список проверяем middleware'ом
+    // на ВСЕХ маршрутах (/health rmcp не прикрывает).
+    //
+    // Пустой список rmcp трактует как «разрешить ЛЮБОЙ Host» — подстраховываемся
+    // и здесь, не полагаясь только на загрузчик конфига: `router` публичный.
+    let mut allowed_hosts = config.allowed_hosts.clone();
+    if allowed_hosts.is_empty() {
+        allowed_hosts = Config::default().allowed_hosts;
+    }
+    let allowed_for_guard = Arc::new(allowed_hosts.clone());
     let index_stats = server.index_loaded().then(|| IndexStats {
         global_methods: server.index.global_methods.len(),
         global_properties: server.index.global_properties.len(),
@@ -86,7 +113,69 @@ pub fn router(config: Config, server: BslContextServer) -> Router {
     Router::new()
         .route("/health", get(health))
         .nest_service("/mcp", http_service)
+        // Host проверяем на всех маршрутах: rmcp валидирует только /mcp, а
+        // /health отдаёт локальные пути и легко читается через DNS-rebinding.
+        .layer(middleware::from_fn_with_state(
+            allowed_for_guard,
+            host_guard,
+        ))
+        .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BYTES))
         .with_state(state)
+}
+
+/// Проверка заголовка `Host` по списку `allowed_hosts` для всех маршрутов.
+///
+/// Отсутствующий Host пропускаем (HTTP/1.0 и не-браузерные клиенты); браузерный
+/// DNS-rebinding всегда шлёт Host, и именно его мы отклоняем.
+async fn host_guard(State(allowed): State<Arc<Vec<String>>>, req: Request, next: Next) -> Response {
+    if !host_header_allowed(req.headers(), &allowed) {
+        return (StatusCode::FORBIDDEN, "Host header is not allowed").into_response();
+    }
+    next.run(req).await
+}
+
+/// Пропускать ли запрос по заголовку `Host`.
+///
+/// Отсутствующий заголовок пропускаем (HTTP/1.0 и не-браузерные клиенты).
+/// Присутствующий, но нечитаемый (не-ASCII) — отклоняем: иначе allowlist
+/// обходится одним битым заголовком (аудит PR, fail-open).
+fn host_header_allowed(headers: &axum::http::HeaderMap, allowed: &[String]) -> bool {
+    match headers.get(axum::http::header::HOST) {
+        None => true,
+        Some(value) => value
+            .to_str()
+            .is_ok_and(|host| host_is_allowed(host, allowed)),
+    }
+}
+
+/// Разрешён ли `Host`-заголовок. Запись без порта разрешает любой порт хоста;
+/// поддержаны имена хостов, IPv4 и bracketed IPv6 (`[::1]:8007`).
+///
+/// Фильтр стоит на ВСЕХ маршрутах, включая `/health`: healthcheck по внешнему
+/// адресу тоже требует записи в `allowed_hosts` (см. README, «Сетевой деплой»).
+fn host_is_allowed(host_header: &str, allowed: &[String]) -> bool {
+    let header_lc = host_header.to_ascii_lowercase();
+    let bare = authority_host(&header_lc);
+    allowed.iter().any(|entry| {
+        let entry = entry.to_ascii_lowercase();
+        entry == header_lc || entry == bare
+    })
+}
+
+/// Хост из `Host`-заголовка без порта.
+///
+/// Порт — только цифры после последнего `:`. Прежний `split(':').next()` отрезал
+/// всё после ПЕРВОГО двоеточия, и `127.0.0.1:8007.evil.com` выглядел как
+/// разрешённый loopback `127.0.0.1`.
+fn authority_host(authority: &str) -> &str {
+    if let Some(rest) = authority.strip_prefix('[') {
+        // Bracketed IPv6: `[::1]:8007` или `[::1]`.
+        return rest.split(']').next().unwrap_or("");
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => host,
+        _ => authority,
+    }
 }
 
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
@@ -122,4 +211,57 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         default_validation_level: state.config.default_validation_level,
         symbol_sources,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::{header::HOST, HeaderMap, HeaderValue};
+
+    fn headers_with_host(value: &[u8]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(HOST, HeaderValue::from_bytes(value).unwrap());
+        headers
+    }
+
+    #[test]
+    fn host_guard_absent_host_is_allowed() {
+        assert!(host_header_allowed(
+            &HeaderMap::new(),
+            &["localhost".into()]
+        ));
+    }
+
+    #[test]
+    fn host_guard_allowed_host_passes() {
+        let allowed = vec!["127.0.0.1:8007".to_string(), "localhost".to_string()];
+        assert!(host_header_allowed(
+            &headers_with_host(b"localhost"),
+            &allowed
+        ));
+        assert!(host_header_allowed(
+            &headers_with_host(b"127.0.0.1:8007"),
+            &allowed
+        ));
+    }
+
+    #[test]
+    fn host_guard_foreign_host_is_rejected() {
+        let allowed = vec!["localhost".to_string()];
+        assert!(!host_header_allowed(
+            &headers_with_host(b"evil.example"),
+            &allowed
+        ));
+    }
+
+    #[test]
+    fn host_guard_non_ascii_host_is_rejected() {
+        let allowed = vec!["localhost".to_string()];
+        // 0x80 — допустимый байт HeaderValue, но не видимый ASCII: `to_str`
+        // вернёт Err, и запрос обязан быть отклонён, а не пропущен.
+        assert!(!host_header_allowed(
+            &headers_with_host(b"\x80host"),
+            &allowed
+        ));
+    }
 }

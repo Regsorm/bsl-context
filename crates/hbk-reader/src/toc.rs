@@ -44,7 +44,7 @@ const BOM: char = '\u{FEFF}';
 ///
 /// Токены — срезы исходного текста (`Cow`: собственный `String` только для
 /// строк с экранированием `""`, что редкость), а не новые `String` на каждый
-/// токен: на TOC платформы это ~300 тысяч аллокаций, и две трети времени
+/// токен: на TOC платформы это ~0,5 млн токенов, и две трети времени
 /// `parse_toc` уходило именно на них. Раньше текст ещё и полностью
 /// раскладывался в `Vec<char>` перед разбором, а запятые попадали в поток и
 /// выбрасывались финальным фильтром — теперь этого нет.
@@ -174,6 +174,11 @@ impl<'a> TokenStream<'a> {
         t
     }
 
+    /// Сколько токенов ещё не прочитано (для ограничения ёмкостей).
+    fn remaining(&self) -> usize {
+        self.tokens.len().saturating_sub(self.pos)
+    }
+
     fn expect(&mut self, expected: &str, ctx: &str) -> Result<()> {
         let got = self
             .next()
@@ -231,7 +236,12 @@ fn parse_chunks(content: &str) -> Result<Vec<Chunk>> {
     let mut s = TokenStream::new(tokens);
 
     s.expect("{", "TableOfContent: ожидался '{'")?;
-    let _root_count = s.parse_number("TableOfContent: ожидалось число chunkCount")?;
+    let chunk_count = s.parse_number("TableOfContent: ожидалось число chunkCount")?;
+    if chunk_count < 0 {
+        return Err(HbkError::TocParse(format!(
+            "TableOfContent: отрицательный chunkCount: {chunk_count}"
+        )));
+    }
 
     let mut chunks: Vec<Chunk> = Vec::new();
     while let Some(t) = s.peek() {
@@ -248,7 +258,14 @@ fn parse_chunk(s: &mut TokenStream<'_>) -> Result<Chunk> {
     let id = s.parse_number("Chunk: ожидался id")?;
     let parent_id = s.parse_number("Chunk: ожидался parentId")?;
     let child_count = s.parse_number("Chunk: ожидался childCount")?;
-    let mut child_ids = Vec::with_capacity(child_count.max(0) as usize);
+    if child_count < 0 {
+        return Err(HbkError::TocParse(format!(
+            "Chunk: отрицательный childCount: {child_count}"
+        )));
+    }
+    // Ёмкость — не больше, чем осталось токенов: childCount из входных
+    // данных не должен заказывать гигабайты памяти (амплификация).
+    let mut child_ids = Vec::with_capacity((child_count as usize).min(s.remaining()));
     for i in 0..child_count {
         child_ids.push(s.parse_number_at("Chunk: ожидался childId", (i + 1) as usize)?);
     }
@@ -316,28 +333,37 @@ fn parse_name_object(s: &mut TokenStream<'_>) -> Result<NameObject> {
 /// Распарсить TOC из распакованного PackBlock (UTF-8 текст).
 pub fn parse_toc(content: &str) -> Result<Toc> {
     let chunks = parse_chunks(content)?;
-    Ok(build_tree(chunks))
+    build_tree(chunks)
 }
 
-fn build_tree(chunks: Vec<Chunk>) -> Toc {
+/// Максимальная глубина дерева TOC. Реальные TOC платформы имеют глубину
+/// ≤ 7 (замер на 8.3.17–8.5.1); лимит защищает от крафтовых цепочек
+/// `parentId`, на которых рекурсивные `Drop`/`Clone` у `Page` переполняют стек.
+const MAX_TOC_DEPTH: u32 = 256;
+
+fn build_tree(chunks: Vec<Chunk>) -> Result<Toc> {
     // Шаг 1: собираем плоские структуры — сама страница, parent_id, порядок появления.
     // (id == 0 зарезервирован под виртуальный корень, реальные id у chunks обычно 1+.)
     let mut pages: HashMap<i32, Page> = HashMap::with_capacity(chunks.len() + 1);
     let mut parent_of: HashMap<i32, i32> = HashMap::with_capacity(chunks.len());
     let mut order: Vec<i32> = Vec::with_capacity(chunks.len());
+    // Высота поддерева (в рёбрах) для уже собранных узлов.
+    let mut height: HashMap<i32, u32> = HashMap::with_capacity(chunks.len());
 
     pages.insert(0, Page::new(DoubleLanguageString::new("TOC", "TOC"), ""));
 
     for chunk in chunks {
         let title = chunk_title(&chunk);
-        let html_path = chunk.properties.html_path.replace('"', "");
+        let html_path = chunk.properties.html_path.clone();
         let id = chunk.id;
         let parent_id = chunk.parent_id;
         if id == 0 {
             // защита от хитрых данных, где id == 0 (== виртуальный корень)
             continue;
         }
-        pages.insert(id, Page::new(title, html_path));
+        if pages.insert(id, Page::new(title, html_path)).is_some() {
+            return Err(HbkError::TocParse(format!("Chunk: повторный id {id}")));
+        }
         parent_of.insert(id, parent_id);
         order.push(id);
     }
@@ -345,26 +371,33 @@ fn build_tree(chunks: Vec<Chunk>) -> Toc {
     // Шаг 2: переносим страницы под родителей. Идём в обратном порядке, чтобы дочерние
     // страницы уже содержали своих внуков к моменту вставки в родителя.
     for id in order.iter().rev() {
-        let parent_id = parent_of.get(id).copied().unwrap_or(0);
+        let mut parent_id = parent_of.get(id).copied().unwrap_or(0);
         let Some(child) = pages.remove(id) else {
             continue;
         };
+        // Сирота — безопасно переподвешиваем под root (id=0).
+        if !pages.contains_key(&parent_id) {
+            parent_id = 0;
+        }
+        let child_height = height.get(id).copied().unwrap_or(0) + 1;
+        if child_height > MAX_TOC_DEPTH {
+            return Err(HbkError::TocParse(format!(
+                "глубина TOC превышает лимит {MAX_TOC_DEPTH} (id={id})"
+            )));
+        }
+        let h = height.entry(parent_id).or_insert(0);
+        *h = (*h).max(child_height);
         if let Some(parent) = pages.get_mut(&parent_id) {
             parent.children.insert(0, child);
-        } else {
-            // Сирота — безопасно переподвешиваем под root (id=0).
-            if let Some(root) = pages.get_mut(&0) {
-                root.children.insert(0, child);
-            }
         }
     }
 
     let root = pages
         .remove(&0)
         .unwrap_or_else(|| Page::new(DoubleLanguageString::new("TOC", "TOC"), ""));
-    Toc {
+    Ok(Toc {
         pages: root.children,
-    }
+    })
 }
 
 fn chunk_title(chunk: &Chunk) -> DoubleLanguageString {
@@ -377,7 +410,7 @@ fn chunk_title(chunk: &Chunk) -> DoubleLanguageString {
     let mut ru = String::new();
     let mut en = String::new();
     for n in names {
-        let name = strip_quotes(&n.name);
+        let name = n.name.clone();
         let lang = n.language_code.to_ascii_lowercase();
         match lang.as_str() {
             "ru" if ru.is_empty() => ru = name,
@@ -394,10 +427,6 @@ fn chunk_title(chunk: &Chunk) -> DoubleLanguageString {
         }
     }
     DoubleLanguageString::new(en, ru)
-}
-
-fn strip_quotes(s: &str) -> String {
-    s.replace('"', "")
 }
 
 // ============================================================================
@@ -506,5 +535,64 @@ mod tests {
         assert_eq!(root.children.len(), 2);
         assert_eq!(root.children[0].title.ru, "Первый");
         assert_eq!(root.children[1].title.ru, "Второй");
+    }
+
+    /// Кавычки внутри имён и путей — часть данных (после `""`-экранирования),
+    /// а не обрамление: парсер не должен их вырезать.
+    #[test]
+    fn parse_toc_preserves_inner_quotes() {
+        let content = r#"
+        {
+          1
+          {
+            1 0 0
+            { 0 0 { 0 0 {"ru" "Имя""с""кавычками"} {"en" "Name ""q"" here"} } "a""b.html" }
+          }
+        }"#;
+        let toc = parse_toc(content).expect("toc parse ok");
+        assert_eq!(toc.pages[0].title.ru, "Имя\"с\"кавычками");
+        assert_eq!(toc.pages[0].title.en, "Name \"q\" here");
+        assert_eq!(toc.pages[0].html_path, "a\"b.html");
+    }
+
+    #[test]
+    fn parse_toc_rejects_duplicate_id() {
+        let content = r#"
+        {
+          2
+          { 1 0 0 { 0 0 { 0 0 {"ru" "Первый"} } "a.html" } }
+          { 1 0 0 { 0 0 { 0 0 {"ru" "Второй"} } "b.html" } }
+        }"#;
+        let err = parse_toc(content).expect_err("дубликат id должен быть ошибкой");
+        assert!(matches!(err, HbkError::TocParse(_)));
+    }
+
+    #[test]
+    fn parse_toc_rejects_negative_child_count() {
+        let content = r#"
+        {
+          1
+          { 1 0 -3 { 0 0 { 0 0 {"ru" "Имя"} } "a.html" } }
+        }"#;
+        let err = parse_toc(content).expect_err("отрицательный childCount должен быть ошибкой");
+        assert!(matches!(err, HbkError::TocParse(_)));
+    }
+
+    /// Крафтовая цепочка `parentId` не должна приводить к переполнению стека
+    /// при рекурсивном `Drop` дерева: глубина ограничивается на парсинге.
+    #[test]
+    fn parse_toc_depth_limit() {
+        let n = MAX_TOC_DEPTH as usize + 1;
+        let mut content = String::from("{\n");
+        content.push_str(&format!("{n}\n"));
+        for id in 1..=n {
+            let parent = id - 1;
+            content.push_str(&format!(
+                "{{ {id} {parent} 0 {{ 0 0 {{ 0 0 {{\"ru\" \"P{id}\"}} }} \"p{id}.html\" }} }}\n"
+            ));
+        }
+        content.push('}');
+        let err = parse_toc(&content).expect_err("глубина выше лимита должна быть ошибкой");
+        assert!(matches!(err, HbkError::TocParse(_)));
     }
 }

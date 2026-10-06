@@ -71,7 +71,7 @@ pub fn validate_module_at_level(
     source: &str,
     level: u8,
 ) -> ExpressionValidation {
-    validate_module_at_level_inner(index, source, level, None, None, None, None, false)
+    validate_module_at_level_inner(index, source, level, None, None, None, None, false, false)
 }
 
 /// Общее тело `validate_module_at_level`/`validate_module_with_symbols`.
@@ -93,6 +93,11 @@ pub fn validate_module_at_level(
 /// модуля объекта-владельца; оба `None` при вызове без источника — поведение
 /// не отличается от прежнего `validate_module_at_level`.
 ///
+/// `owner_unknown` — модуль формы есть, источник имён настроен, но модуль
+/// владельца в нём не нашёлся: вызовы без префикса могут быть его методами,
+/// поэтому проверки глобальных вызовов молчат (контракт `owner_exports = None`
+/// — «не знаю»).
+///
 /// `symbols_degraded` — источник имён настроен, но недоступен (см.
 /// [`validate_module_degraded`]). Влияет только на уверенность находок
 /// `UndeclaredMethod`; при `symbols: Some(_)` не имеет смысла и передаётся
@@ -106,6 +111,7 @@ fn validate_module_at_level_inner(
     form_attributes: Option<&HashSet<String>>,
     symbols: Option<&dyn SymbolSource>,
     owner_exports: Option<&HashSet<String>>,
+    owner_unknown: bool,
     symbols_degraded: bool,
 ) -> ExpressionValidation {
     validate_module_at_level_inner_ext(
@@ -116,6 +122,7 @@ fn validate_module_at_level_inner(
         form_attributes,
         symbols,
         owner_exports,
+        owner_unknown,
         symbols_degraded,
         None,
     )
@@ -137,6 +144,7 @@ fn validate_module_at_level_inner_ext(
     form_attributes: Option<&HashSet<String>>,
     symbols: Option<&dyn SymbolSource>,
     owner_exports: Option<&HashSet<String>>,
+    owner_unknown: bool,
     symbols_degraded: bool,
     form_kind: Option<crate::module_context::FormKind>,
 ) -> ExpressionValidation {
@@ -229,6 +237,7 @@ fn validate_module_at_level_inner_ext(
         strict_unknown,
         symbols,
         owner_exports,
+        owner_unknown,
         symbols_degraded,
         module_context,
         &mut errors,
@@ -310,6 +319,7 @@ pub fn validate_module_with_profile(
         None,
         None,
         false,
+        false,
     );
 
     if profile == Profile::Strict {
@@ -337,9 +347,18 @@ pub fn validate_module_with_symbols(
     symbols: Option<&dyn SymbolSource>,
 ) -> ExpressionValidation {
     let effective_level = if profile == Profile::Strict { 1 } else { level };
-    let owner_exports = module_path
+    // Владелец формы есть, но его модуль не попал в источник имён: вызовы без
+    // префикса могут быть его методами, поэтому проверки глобальных вызовов
+    // молчат (контракт `owner_exports = None` — «не знаю», аудит PR).
+    let owner_lookup = module_path
         .zip(symbols)
-        .and_then(|(path, src)| src.owner_exports(path));
+        .map(|(path, src)| (path, src.owner_exports(path), src.owner_resolvable(path)));
+    let owner_unknown = owner_lookup
+        .as_ref()
+        .is_some_and(|(path, names, resolvable)| {
+            names.is_none() && *resolvable && crate::context_names::is_form_module(path)
+        });
+    let owner_exports = owner_lookup.and_then(|(_, names, _)| names);
     let mut result = validate_module_at_level_inner(
         index,
         source,
@@ -348,6 +367,7 @@ pub fn validate_module_with_symbols(
         form_attributes,
         symbols,
         owner_exports.as_ref(),
+        owner_unknown,
         false,
     );
 
@@ -379,9 +399,17 @@ pub fn validate_module_with_symbols_and_form_kind(
     form_kind: Option<crate::module_context::FormKind>,
 ) -> ExpressionValidation {
     let effective_level = if profile == Profile::Strict { 1 } else { level };
-    let owner_exports = module_path
+    // Владелец формы есть, но его модуль не попал в источник имён — см.
+    // `validate_module_with_symbols`.
+    let owner_lookup = module_path
         .zip(symbols)
-        .and_then(|(path, src)| src.owner_exports(path));
+        .map(|(path, src)| (path, src.owner_exports(path), src.owner_resolvable(path)));
+    let owner_unknown = owner_lookup
+        .as_ref()
+        .is_some_and(|(path, names, resolvable)| {
+            names.is_none() && *resolvable && crate::context_names::is_form_module(path)
+        });
+    let owner_exports = owner_lookup.and_then(|(_, names, _)| names);
     let mut result = validate_module_at_level_inner_ext(
         index,
         source,
@@ -390,6 +418,7 @@ pub fn validate_module_with_symbols_and_form_kind(
         form_attributes,
         symbols,
         owner_exports.as_ref(),
+        owner_unknown,
         false,
         form_kind,
     );
@@ -444,6 +473,7 @@ pub fn validate_module_degraded(
         form_attributes,
         None,
         None,
+        false,
         true,
     );
 
@@ -467,7 +497,10 @@ pub fn validate_module_degraded(
 /// сильное сходство → High, слабое → Low, далёкое → молча пропускаем.
 fn scan_directives(cleaned: &str, errors: &mut Vec<ExprError>) {
     for (row, line) in cleaned.lines().enumerate() {
-        let trimmed = line.trim_start();
+        // trim_start не снимает UTF-8 BOM (U+FEFF не whitespace): директива
+        // на первой строке BOM-модуля иначе не проверялась (и опечатка
+        // терялась вместе с BOM).
+        let trimmed = crate::directives::trim_start_bsl(line);
         let Some(rest) = trimmed.strip_prefix('&') else {
             continue;
         };
@@ -489,7 +522,9 @@ fn scan_directives(cleaned: &str, errors: &mut Vec<ExprError>) {
             continue;
         };
         let line_no = (row + 1) as u32;
-        let col = (line.len() - trimmed.len() + 1) as u32;
+        // Колонка — в СИМВОЛАХ (как pos_at), а не в байтах: BOM и кириллица
+        // в отступе иначе сдвигали её.
+        let col = (line[..line.len() - trimmed.len()].chars().count() + 1) as u32;
         errors.push(ExprError::new_with_confidence(
             line_no,
             col,
@@ -653,6 +688,18 @@ EndFunction
             self.owner.clone()
         }
 
+        /// Стенд умеет выводить владельца ровно для раскладки внешней обработки —
+        /// той же, что и реальные источники (см. `lite_index::owner_module_path`):
+        /// путь заканчивается на `Form.obj.bsl`. Для модуля формы конфигурации
+        /// (`.../Ext/Form/Module.bsl`) владелец не выводится, и молчание
+        /// `owner_unknown` на нём не включается.
+        fn owner_resolvable(&self, module_path: &str) -> bool {
+            module_path
+                .replace('\\', "/")
+                .to_lowercase()
+                .ends_with("/form.obj.bsl")
+        }
+
         fn describe(&self) -> String {
             "stub".to_string()
         }
@@ -714,6 +761,63 @@ EndFunction
             result.errors.is_empty(),
             "метод модуля объекта-владельца не должен давать находку: {:?}",
             result.errors
+        );
+    }
+
+    /// Владелец формы есть, но его модуль не попал в источник имён (`None` =
+    /// «не знаю»): вызов без префикса может быть его методом, поэтому находки
+    /// молчат — иначе законный `ОткрытьЗначения()` владельца превращался бы в
+    /// «опечатку» платформенного `ОткрытьЗначение` (аудит PR, M1).
+    #[test]
+    fn symbols_owner_unknown_is_silent() {
+        let index = PlatformIndex::new();
+        let source = StubSource {
+            global_export: false,
+            exists: false,
+            owner: None,
+        };
+        let result = validate_module_with_symbols(
+            &index,
+            module_with_unknown_call(),
+            1,
+            Profile::Full,
+            Some("external/Обр/Form/Ф/Form.obj.bsl"),
+            None,
+            Some(&source),
+        );
+        assert!(
+            result.errors.is_empty(),
+            "«не знаю» о владельце не должно давать находку: {:?}",
+            result.errors
+        );
+    }
+
+    /// Обратный случай: источник владельца вывести НЕ умеет — раскладка модуля
+    /// формы КОНФИГУРАЦИИ (`owner_module_path` её не разбирает). Тогда `None` из
+    /// `owner_exports` означает «спросить не умеем», а не «владельца нет», и
+    /// молчание выключать нельзя: иначе в модулях форм перестают находиться
+    /// настоящие опечатки (`Сообщит` вместо `Сообщить`) и вызовы несуществующих
+    /// процедур — замер на реальной выгрузке давал на этом 2 находки на модуль.
+    #[test]
+    fn symbols_owner_not_resolvable_keeps_finding() {
+        let index = PlatformIndex::new();
+        let source = StubSource {
+            global_export: false,
+            exists: false,
+            owner: None,
+        };
+        let result = validate_module_with_symbols(
+            &index,
+            module_with_unknown_call(),
+            1,
+            Profile::Full,
+            Some("base/Catalogs/Х/Forms/ФормаЭлемента/Ext/Form/Module.bsl"),
+            None,
+            Some(&source),
+        );
+        assert!(
+            !result.errors.is_empty(),
+            "раскладка владельца не разбирается — находка обязана остаться"
         );
     }
 
@@ -832,6 +936,7 @@ EndFunction
                 return_type: String::new(),
                 signatures: vec![Signature {
                     name: String::new(),
+                    syntax: String::new(),
                     description: String::new(),
                     parameters: (0..params)
                         .map(|i| Parameter {
@@ -842,6 +947,7 @@ EndFunction
                         })
                         .collect(),
                 }],
+                note: None,
             }
         }
 
@@ -855,6 +961,7 @@ EndFunction
             properties: Vec::new(),
             constructors: Vec::new(),
             enum_values: Vec::new(),
+            note: None,
         });
         // Глобальная функция того же имени — с ДВУМЯ параметрами.
         index
@@ -907,6 +1014,7 @@ EndFunction
                 return_type: String::new(),
                 signatures: vec![Signature {
                     name: String::new(),
+                    syntax: String::new(),
                     description: String::new(),
                     parameters: (0..params)
                         .map(|i| Parameter {
@@ -917,6 +1025,7 @@ EndFunction
                         })
                         .collect(),
                 }],
+                note: None,
             }
         }
 
@@ -930,6 +1039,7 @@ EndFunction
             properties: Vec::new(),
             constructors: Vec::new(),
             enum_values: Vec::new(),
+            note: None,
         });
         // Глобальная функция того же имени — с ШЕСТЬЮ параметрами.
         index

@@ -6,7 +6,8 @@
 //! Публичный API: [`HbkContent::read`] — основной вход.
 //!
 //! Порт логики из апстрима `alkoleft/mcp-bsl-platform-context` (Kotlin).
-//! Эталон в [`upstream/src/main/kotlin/.../infrastructure/hbk/`].
+//! Эталон — апстримный каталог `upstream/src/main/kotlin/.../infrastructure/hbk/`
+//! (вне репозитория, см. `.gitignore`).
 
 pub mod container;
 pub mod content;

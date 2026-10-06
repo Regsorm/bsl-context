@@ -144,6 +144,7 @@ mod tests {
             name_ru: name_ru.to_string(),
             name_en: String::new(),
             description: String::new(),
+            note: None,
         }
     }
 
