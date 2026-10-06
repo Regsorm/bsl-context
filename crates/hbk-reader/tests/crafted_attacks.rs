@@ -337,9 +337,10 @@ fn directory_path_is_io_error_not_not_found() {
 }
 
 /// Гонка «файл удаляют и создают заново, пока его читают»: результат всегда
-/// либо валидный контейнер, либо классифицированная ошибка ввода-вывода
-/// (на Windows открытие файла в момент пересоздания штатно даёт NotFound или
-/// AccessDenied — sharing violation). Паники и зависаний быть не должно.
+/// либо валидный контейнер, либо классифицированная ошибка (на Windows открытие
+/// файла в момент пересоздания штатно даёт NotFound или AccessDenied — sharing
+/// violation; на Linux `fs::write` виден читателю между усечением и
+/// дописыванием, и это честный `BadFormat`). Паники и зависаний быть не должно.
 #[test]
 fn race_delete_and_recreate_does_not_panic() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -358,7 +359,15 @@ fn race_delete_and_recreate_does_not_panic() {
     for _ in 0..200 {
         match HbkContainer::read(&path) {
             Ok(_) => {}
-            Err(HbkError::NotFound(_)) | Err(HbkError::Io(_)) => {}
+            // Любой ЧИСТЫЙ отказ здесь допустим: файла нет (NotFound), открыть
+            // нельзя из-за sharing violation (Io), файл пойман частично
+            // записанным (BadFormat — усечённый или пустой контейнер),
+            // повреждённый TOC. Недопустимы только паника, зависание и рост
+            // памяти; сужение списка до Io/NotFound роняло прогон на Linux.
+            Err(HbkError::NotFound(_))
+            | Err(HbkError::Io(_))
+            | Err(HbkError::BadFormat(_))
+            | Err(HbkError::TocParse(_)) => {}
             Err(e) => panic!("недопустимая ошибка в гонке: {e}"),
         }
     }

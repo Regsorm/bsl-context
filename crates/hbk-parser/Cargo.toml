@@ -6,7 +6,7 @@ license.workspace = true
 description = "Парсеры html-страниц синтакс-помощника по типам (Method/Property/Object/Constructor/Enum/EnumValue)"
 
 [dependencies]
-hbk-reader = { path = "../hbk-reader", version = "0.21.5" }
+hbk-reader = { path = "../hbk-reader", version = "0.22.0" }
 scraper = { workspace = true }
 ego-tree = { workspace = true }
 encoding_rs = { workspace = true }
