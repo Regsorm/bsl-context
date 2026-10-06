@@ -168,11 +168,13 @@ impl SymbolSourceConfig {
                 if self.db_path.is_some()
                     || self.root.is_some()
                     || self.url.is_some()
+                    || self.repo.is_some()
                     || self.code_index_repo.is_some()
                 {
                     tracing::warn!(
-                        "symbol_source.kind = \"none\": поля db_path/root/url/code_index_repo \
-                         заданы, но не используются — укажите kind источника"
+                        "symbol_source.kind = \"none\": поля \
+                         db_path/root/url/repo/code_index_repo заданы, но не используются — \
+                         укажите kind источника"
                     );
                 }
                 Ok(())
@@ -359,20 +361,11 @@ impl Config {
                     anyhow::bail!("повторяющийся repo в [[symbol_sources]]: \"{name}\"");
                 }
                 // kind = "none" в списке — явно отключённый источник (алиас
-                // остаётся виден в symbol_sources_status). Недописанным конфигом
-                // считаем только запись с полями источника: их молча
-                // игнорировать нельзя.
+                // остаётся виден в symbol_sources_status). Поля источника при
+                // этом НЕ валят старт (аудит PR): конфиг с закомментированным
+                // kind иначе не поднимался бы вовсе, а причина видна в журнале —
+                // `validate()` ниже предупреждает про каждое заданное поле.
                 if entry.kind == "none" {
-                    if entry.db_path.is_some()
-                        || entry.root.is_some()
-                        || entry.url.is_some()
-                        || entry.code_index_repo.is_some()
-                    {
-                        anyhow::bail!(
-                            "секция [[symbol_sources]] repo = \"{name}\": kind = \"none\", \
-                             но заданы поля источника — укажите kind или уберите поля"
-                        );
-                    }
                     tracing::warn!(
                         source = %name,
                         "источник [[symbol_sources]] отключён (kind = \"none\")"
@@ -385,18 +378,10 @@ impl Config {
         }
         if self.symbol_source.kind == "none" {
             // Одиночная секция с полями источника — тот же недописанный
-            // конфиг, что и в списке `[[symbol_sources]]`: молча игнорировать
-            // нельзя (аудит PR: предупреждение `validate()` сюда не доходило).
-            if self.symbol_source.db_path.is_some()
-                || self.symbol_source.root.is_some()
-                || self.symbol_source.url.is_some()
-                || self.symbol_source.code_index_repo.is_some()
-            {
-                anyhow::bail!(
-                    "[symbol_source]: kind = \"none\", но заданы поля источника — \
-                     укажите kind или уберите поля"
-                );
-            }
+            // конфиг, что и в списке `[[symbol_sources]]`: источник просто
+            // отключён, а `validate()` предупреждает про каждое заданное поле
+            // (раньше здесь был отказ старта — аудит PR).
+            self.symbol_source.validate()?;
             return Ok(Vec::new());
         }
         self.symbol_source.validate()?;
@@ -597,23 +582,39 @@ mod tests {
     }
 
     #[test]
-    fn list_entry_with_kind_none_and_fields_is_error() {
-        // kind = "none" с полями источника — недописанный конфиг.
+    fn list_entry_with_kind_none_and_fields_is_disabled_not_fatal() {
+        // kind = "none" с полями источника — источник отключён, поля
+        // игнорируются, но старт из-за этого не валится: конфиг с
+        // закомментированным kind раньше просто не поднимался (аудит PR).
         let cfg: Config = toml::from_str(
             "[[symbol_sources]]\nrepo = \"ut\"\nkind = \"none\"\ndb_path = \"ut.db\"\n",
         )
         .unwrap();
-        assert!(cfg.resolved_symbol_sources().is_err());
+        let resolved = cfg.resolved_symbol_sources().unwrap();
+        assert_eq!(
+            resolved.len(),
+            1,
+            "алиас остаётся видимым в symbol_sources_status"
+        );
+        assert_eq!(resolved[0].0, "ut");
     }
 
     #[test]
-    fn single_section_kind_none_with_fields_is_error() {
-        // Та же недописанная секция, но одиночная: раньше поля молча
-        // игнорировались, а источник считался отключённым (аудит PR).
+    fn single_section_kind_none_with_fields_is_disabled_not_fatal() {
+        // Та же недописанная секция, но одиночная: поля игнорируются,
+        // источника нет, старт продолжается (раньше — отказ старта).
         let cfg: Config =
             toml::from_str("[symbol_source]\nkind = \"none\"\ndb_path = \"ut.db\"\n").unwrap();
-        let err = cfg.resolved_symbol_sources().unwrap_err().to_string();
-        assert!(err.contains("kind = \"none\""), "{err}");
+        assert!(cfg.resolved_symbol_sources().unwrap().is_empty());
+    }
+
+    #[test]
+    fn single_section_kind_none_with_only_repo_is_disabled_not_fatal() {
+        // `repo` тоже адресует источник: секция с одним `repo` и без `kind`
+        // не должна ни валить старт, ни давать источник (асимметрия из аудита).
+        let cfg: Config =
+            toml::from_str("[symbol_source]\nkind = \"none\"\nrepo = \"ut\"\n").unwrap();
+        assert!(cfg.resolved_symbol_sources().unwrap().is_empty());
     }
 
     #[test]

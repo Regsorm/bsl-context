@@ -150,17 +150,32 @@ fn host_header_allowed(headers: &axum::http::HeaderMap, allowed: &[String]) -> b
 
 /// Разрешён ли `Host`-заголовок. Запись без порта разрешает любой порт хоста;
 /// поддержаны имена хостов, IPv4 и bracketed IPv6 (`[::1]:8007`).
+///
+/// Фильтр стоит на ВСЕХ маршрутах, включая `/health`: healthcheck по внешнему
+/// адресу тоже требует записи в `allowed_hosts` (см. README, «Сетевой деплой»).
 fn host_is_allowed(host_header: &str, allowed: &[String]) -> bool {
     let header_lc = host_header.to_ascii_lowercase();
-    let bare = if let Some(rest) = header_lc.strip_prefix('[') {
-        rest.split(']').next().unwrap_or("")
-    } else {
-        header_lc.split(':').next().unwrap_or("")
-    };
+    let bare = authority_host(&header_lc);
     allowed.iter().any(|entry| {
         let entry = entry.to_ascii_lowercase();
         entry == header_lc || entry == bare
     })
+}
+
+/// Хост из `Host`-заголовка без порта.
+///
+/// Порт — только цифры после последнего `:`. Прежний `split(':').next()` отрезал
+/// всё после ПЕРВОГО двоеточия, и `127.0.0.1:8007.evil.com` выглядел как
+/// разрешённый loopback `127.0.0.1`.
+fn authority_host(authority: &str) -> &str {
+    if let Some(rest) = authority.strip_prefix('[') {
+        // Bracketed IPv6: `[::1]:8007` или `[::1]`.
+        return rest.split(']').next().unwrap_or("");
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => host,
+        _ => authority,
+    }
 }
 
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {

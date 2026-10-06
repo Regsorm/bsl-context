@@ -83,7 +83,7 @@ async fn main() -> anyhow::Result<()> {
     // Только для сетевого режима: у службы один bind и один общий холодный старт.
     // В stdio процессов ровно столько, сколько сеансов у клиента, — файл-замок
     // запретил бы второй сеанс, ничего не защищая.
-    let _pid_lock = if cli.transport == Transport::Http {
+    let pid_lock = if cli.transport == Transport::Http {
         match pid_lock::PidLock::acquire(&cfg.log_dir) {
             Ok(lock) => Some(lock),
             Err(e) => {
@@ -197,27 +197,44 @@ async fn main() -> anyhow::Result<()> {
                 let _ = signal_rx.await;
                 tokio::time::sleep(SHUTDOWN_GRACE).await;
             };
-            tokio::select! {
+            let exit_code = tokio::select! {
                 result = &mut serve => {
                     if let Err(e) = result {
                         error!(error = %e, "server stopped with error");
-                        return Err(e.into());
+                        1
+                    } else {
+                        info!("graceful shutdown complete");
+                        0
                     }
-                    info!("graceful shutdown complete");
                 }
                 _ = grace => {
                     tracing::warn!(
                         "graceful shutdown не завершился за {} с — завершаю процесс",
                         SHUTDOWN_GRACE.as_secs()
                     );
+                    0
                 }
-            }
+            };
+            shutdown_now(pid_lock, exit_code)
         }
         Transport::Stdio => {
             serve_stdio(server).await?;
+            shutdown_now(pid_lock, 0)
         }
     }
-    Ok(())
+}
+
+/// Завершить процесс, сняв PID-замок, минуя drop tokio-рантайма.
+///
+/// Обычный `return` из `main` не годится: `#[tokio::main]` затем роняет
+/// рантайм, а его drop ждёт задачи `spawn_blocking` НЕОГРАНИЧЕННО — пересборка
+/// индекса идёт минутами, и процесс висел бы после «graceful shutdown
+/// complete». Всё это время PID-файл был бы уже снят (`PidLock::drop` случается
+/// раньше drop'а рантайма), открывая окно второму экземпляру (аудит PR).
+/// Освобождаем замок явно и выходим из процесса.
+fn shutdown_now(lock: Option<pid_lock::PidLock>, code: i32) -> ! {
+    drop(lock);
+    std::process::exit(code)
 }
 
 /// Адрес HTTP-сервера из конфига: имя хоста или IP (включая IPv6).
@@ -427,9 +444,42 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
 
+    // Windows: Ctrl+Break и закрытие консоли. Без своих обработчиков эти события
+    // обрабатывает обработчик по умолчанию и просто убивает процесс
+    // (`STATUS_CONTROL_C_EXIT` = 0xC000013A): graceful-путь недостижим вовсе, а
+    // PID-файл остаётся — `TerminateProcess` минует `Drop`, и следующий старт
+    // видит «живой» замок от мёртвого процесса. `Ctrl+C` ловится выше;
+    // `Ctrl+Break` — стандартный способ послать сигнал отдельной группе процессов
+    // (`GenerateConsoleCtrlEvent`), им же останавливают службу руками.
+    #[cfg(windows)]
+    let console_events = async {
+        use tokio::signal::windows;
+        let (mut brk, mut close) = match (windows::ctrl_break(), windows::ctrl_close()) {
+            (Ok(brk), Ok(close)) => (brk, close),
+            (brk, close) => {
+                if let Err(e) = brk {
+                    error!(error = %e, "failed to install Ctrl+Break handler");
+                }
+                if let Err(e) = close {
+                    error!(error = %e, "failed to install console-close handler");
+                }
+                std::future::pending::<()>().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = brk.recv() => {},
+            _ = close.recv() => {},
+        }
+    };
+
+    #[cfg(not(windows))]
+    let console_events = std::future::pending::<()>();
+
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
+        _ = console_events => {},
     }
 
     info!("shutdown signal received");

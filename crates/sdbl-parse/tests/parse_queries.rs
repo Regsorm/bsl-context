@@ -453,6 +453,51 @@ fn star_select_is_flagged() {
 }
 
 #[test]
+fn qualified_star_select_is_flagged() {
+    let query = single("ВЫБРАТЬ Т.* ИЗ РегистрНакопления.ТоварыНаСкладах КАК Т");
+    assert!(query.select.as_ref().unwrap().has_star);
+}
+
+#[test]
+fn star_after_top_is_a_select_star() {
+    // `ПЕРВЫЕ 10 *` — тот же джокер: раньше его тоже нельзя было терять.
+    let query = single("ВЫБРАТЬ ПЕРВЫЕ 10 * ИЗ РегистрНакопления.ТоварыНаСкладах КАК Т");
+    assert!(query.select.as_ref().unwrap().has_star);
+}
+
+#[test]
+fn star_inside_function_is_not_a_select_star() {
+    // `КОЛИЧЕСТВО(*)` — не «состав полей неизвестен»: правило о физической
+    // таблице регистра обязано работать (аудит PR: звёздочка в скобках глушила
+    // его на `ВЫБРАТЬ КОЛИЧЕСТВО(*)`).
+    let query = single("ВЫБРАТЬ КОЛИЧЕСТВО(*) КАК К ИЗ РегистрНакопления.ТоварыНаСкладах КАК Т");
+    assert!(!query.select.as_ref().unwrap().has_star);
+}
+
+#[test]
+fn multiplication_is_not_a_select_star() {
+    let query = single("ВЫБРАТЬ Т.Количество * 2 КАК К ИЗ РегистрНакопления.ТоварыНаСкладах КАК Т");
+    assert!(!query.select.as_ref().unwrap().has_star);
+}
+
+#[test]
+fn external_data_source_path_is_parsed_as_unknown_source() {
+    // Составной путь внешнего источника данных подмножество не разбирает — но
+    // ронять из-за него разбор ВСЕГО запроса нельзя: остальные правила по этому
+    // тексту обязаны работать (аудит PR).
+    let query = single(
+        "ВЫБРАТЬ Т.Поле КАК Поле ИЗ ВнешнийИсточникДанных.МойИсточник.Таблица.МояТаблица КАК Т",
+    );
+    assert_eq!(query.sources.len(), 1);
+    assert!(
+        matches!(query.sources[0].table, Table::Unknown(_)),
+        "ожидался Unknown: {:?}",
+        query.sources[0]
+    );
+    assert_eq!(query.sources[0].alias.as_ref().unwrap().name, "Т");
+}
+
+#[test]
 fn subquery_in_condition_is_flagged() {
     let query = single(
         "ВЫБРАТЬ 1 ИЗ Справочник.Товары КАК А \

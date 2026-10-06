@@ -416,25 +416,36 @@ impl Parser {
         }
 
         let table = if is_meta_kind(&parts[0]) && parts.len() >= 2 {
-            // `MetaTable` хранит ровно три сегмента: четвёртый молча терять
-            // нельзя — лучше Err, правила промолчат (контракт «непонятое
-            // молчит»), чем дерево с потерянным именем.
+            // Составной путь (`ВнешнийИсточникДанных.<Ист>.Таблица.<Табл>` или
+            // куб с измерениями) в подмножество не входит — но `Err` здесь
+            // стоил бы молчания ВСЕХ правил по этому тексту, а не только по
+            // этому источнику. Отдаём `Unknown`: потребитель обязан такой
+            // источник пропускать (см. `Table::Unknown`).
             if parts.len() > 3 {
-                return self.err("у имени таблицы больше трёх сегментов");
+                if self.at_punct('(') {
+                    // Скобки съедаем, чтобы не сбить разбор остального запроса.
+                    self.parse_call_params()?;
+                }
+                Table::Unknown(Named {
+                    name: parts.last().cloned().unwrap_or_default(),
+                    offset,
+                })
+            } else {
+                // `MetaTable` хранит ровно три сегмента.
+                let mut meta = MetaTable {
+                    kind: parts[0].clone(),
+                    name: parts[1].clone(),
+                    sub_table: parts.get(2).cloned(),
+                    params: Vec::new(),
+                    has_parens: false,
+                    offset,
+                };
+                if self.at_punct('(') {
+                    meta.has_parens = true;
+                    meta.params = self.parse_call_params()?;
+                }
+                Table::Meta(meta)
             }
-            let mut meta = MetaTable {
-                kind: parts[0].clone(),
-                name: parts[1].clone(),
-                sub_table: parts.get(2).cloned(),
-                params: Vec::new(),
-                has_parens: false,
-                offset,
-            };
-            if self.at_punct('(') {
-                meta.has_parens = true;
-                meta.params = self.parse_call_params()?;
-            }
-            Table::Meta(meta)
         } else {
             // Скобки после имени, не являющегося метаданными, — это уже не
             // таблица, а что-то, чего подмножество не знает.
@@ -693,9 +704,24 @@ impl Parser {
                     condition.has_top_level_or = true;
                 }
             }
-            if token.is_punct('*') {
-                // `ВЫБРАТЬ *` — состав используемых полей неизвестен.
-                condition.has_star = true;
+            if token.is_punct('*') && depth == 0 {
+                // Джокер состава полей (`ВЫБРАТЬ *`, `ВЫБРАТЬ Т.*`,
+                // `ВЫБРАТЬ ПЕРВЫЕ 10 *`), а не умножение и не аргумент
+                // `КОЛИЧЕСТВО(*)`. Признак — справа нет операнда: у умножения он
+                // есть всегда (`Т.А * 2`, `Т.А * -1`), у вызова — скобка, у
+                // джокера — запятая, ключевое слово или конец условия. Иначе
+                // `ВЫБРАТЬ КОЛИЧЕСТВО(*)` глушило правило о физической таблице
+                // регистра — состав полей «неизвестен», хотя он известен.
+                let next_is_operand = self.tokens.get(self.pos + 1).is_some_and(|t| {
+                    matches!(t.kind, Kind::Ident | Kind::Number | Kind::Str | Kind::Param)
+                        || t.is_punct('.')
+                        || t.is_punct('(')
+                        || t.is_punct('+')
+                        || t.is_punct('-')
+                });
+                if !next_is_operand {
+                    condition.has_star = true;
+                }
             }
             let next_is_dot = self
                 .tokens
