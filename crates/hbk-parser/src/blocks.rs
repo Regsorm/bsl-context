@@ -3,10 +3,11 @@
 //! Каждая функция — порт одного `BlockHandler` из `BlockHandler.kt`.
 //! На вход — html-фрагмент главы, на выход — структурированное значение.
 
-use scraper::{Html, Selector};
+use ego_tree::NodeRef;
+use scraper::{Html, Node, Selector};
 use std::sync::OnceLock;
 
-use crate::html::{collapse_whitespace, extract_text, to_markdown};
+use crate::html::{collapse_whitespace, extract_text, serialize_node, to_markdown};
 use crate::models::{MethodParameterInfo, RelatedObject, ValueInfo};
 
 /// Селекторы блоков — статические. `Selector::parse` компилирует CSS-строку при
@@ -14,12 +15,25 @@ use crate::models::{MethodParameterInfo, RelatedObject, ValueInfo};
 /// тысяч раз за сборку). Компиляция не зависит от содержимого страницы.
 fn heading_selector() -> &'static Selector {
     static SEL: OnceLock<Selector> = OnceLock::new();
-    SEL.get_or_init(|| Selector::parse("p.V8SH_heading").expect("V8SH_heading selector"))
+    // 8.3.17 отдаёт заголовок как `div`, остальные версии — как `p`.
+    SEL.get_or_init(|| {
+        Selector::parse("p.V8SH_heading, div.V8SH_heading").expect("V8SH_heading selector")
+    })
 }
 
 fn title_selector() -> &'static Selector {
     static SEL: OnceLock<Selector> = OnceLock::new();
-    SEL.get_or_init(|| Selector::parse("p.V8SH_title").expect("V8SH_title selector"))
+    SEL.get_or_init(|| {
+        Selector::parse("p.V8SH_title, div.V8SH_title").expect("V8SH_title selector")
+    })
+}
+
+fn page_title_selector() -> &'static Selector {
+    static SEL: OnceLock<Selector> = OnceLock::new();
+    SEL.get_or_init(|| {
+        Selector::parse("h1.V8SH_pagetitle, p.V8SH_pagetitle, div.V8SH_pagetitle")
+            .expect("V8SH_pagetitle selector")
+    })
 }
 
 fn anchor_selector() -> &'static Selector {
@@ -40,17 +54,19 @@ fn split_dual_name(text: &str) -> (String, String) {
             if close > open {
                 let ru = text[..open].trim().to_string();
                 let en = text[open + 1..close].trim().to_string();
-                if !en.is_empty() && !en.contains(' ') || (en.contains(' ') && en.is_ascii()) {
-                    // Если содержимое скобок похоже на английское имя (только латиница/пробелы) —
-                    // считаем парой ru/en. Иначе — оставляем всё имя как ru.
-                    // Подчёркивание — законная часть английского имени
-                    // (`Windows_x86`, `Version8_2`); без него такие значения
-                    // оставались с синонимом в скобках прямо в `name_ru`.
-                    if en.chars().all(|c| {
-                        c.is_ascii_alphanumeric() || c.is_ascii_whitespace() || c == '.' || c == '_'
-                    }) {
-                        return (ru, en);
-                    }
+                // Английское имя — только латиница/цифры/пробелы/`._-:`
+                // (`HTTP-service module`, `MetadataObject: HTTPService`).
+                // Кириллица или угловые скобки означают, что в скобках не
+                // синоним, а псевдо-имя открытой коллекции
+                // (`<Имя картинки> (<Icon name>)`) — оставляем как есть.
+                if !en.is_empty()
+                    && en.chars().all(|c| {
+                        c.is_ascii_alphanumeric()
+                            || c.is_ascii_whitespace()
+                            || matches!(c, '.' | '_' | '-' | ':')
+                    })
+                {
+                    return (ru, en);
                 }
             }
         }
@@ -65,21 +81,18 @@ fn split_dual_name(text: &str) -> (String, String) {
 pub fn parse_head_name(html: &str) -> (String, String) {
     let doc = Html::parse_fragment(html);
 
-    let raw = doc
-        .select(heading_selector())
-        .next()
-        .map(|el| el.text().collect::<String>())
-        .or_else(|| {
-            doc.select(title_selector())
-                .next()
-                .map(|el| el.text().collect::<String>())
-        })
+    // Первый НЕПУСТОЙ заголовок: heading → title → pagetitle. Важно не
+    // `or_else`: заголовок может существовать, но быть пустым.
+    let raw = [heading_selector(), title_selector(), page_title_selector()]
+        .iter()
+        .filter_map(|sel| doc.select(sel).next())
+        .map(|el| collapse_whitespace(el.text().collect::<String>().trim()))
+        .find(|s| !s.is_empty())
         .unwrap_or_default();
-    let normalized = collapse_whitespace(raw.trim());
-    if normalized.is_empty() {
+    if raw.is_empty() {
         return (String::new(), String::new());
     }
-    split_dual_name(&normalized)
+    split_dual_name(&raw)
 }
 
 /// Описание (`Описание:`) — html → Markdown.
@@ -91,15 +104,40 @@ pub fn parse_description(body_html: &str) -> String {
 ///
 /// Порт `ExampleBlockHandler.kt`: только текстовый контент + переносы по `<br>`.
 pub fn parse_example(body_html: &str) -> String {
-    // Заменим <br>/<BR> на \n и вытащим текст.
-    let normalized = body_html
-        .replace("<br>", "\n")
-        .replace("<br/>", "\n")
-        .replace("<br />", "\n")
-        .replace("<BR>", "\n")
-        .replace("<BR/>", "\n");
+    // Любые формы `<br>` (`<BR />`, `<br class=…>`) — перевод строки.
+    let normalized = br_to_newline(body_html);
     let text = extract_text_keep_breaks(&normalized);
     text.trim().replace('\u{00a0}', " ")
+}
+
+/// Заменить `<br>` в любом регистре и с любыми атрибутами на `\n`.
+fn br_to_newline(html: &str) -> String {
+    let bytes = html.as_bytes();
+    let lower = html.to_ascii_lowercase();
+    let mut out = String::with_capacity(html.len());
+    let mut i = 0;
+    while i < html.len() {
+        if lower[i..].starts_with("<br") {
+            let after = i + 3;
+            let is_tag = bytes
+                .get(after)
+                .is_some_and(|b| matches!(b, b' ' | b'/' | b'>'));
+            if is_tag {
+                if let Some(rel) = html[i..].find('>') {
+                    out.push('\n');
+                    i += rel + 1;
+                    continue;
+                }
+            }
+        }
+        let ch = html[i..]
+            .chars()
+            .next()
+            .expect("byte index is a char boundary");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
 }
 
 /// Извлечь текст из html, сохраняя \n.
@@ -123,7 +161,9 @@ pub fn parse_related_objects(body_html: &str) -> Vec<RelatedObject> {
     let mut out = Vec::new();
     for a in doc.select(anchor_selector()) {
         let text_raw: String = a.text().collect();
-        let text = collapse_whitespace(text_raw.trim().replace(" ,", ",").as_str());
+        // Свернуть пробелы ДО замены « ,»: NBSP перед запятой сворачивается
+        // collapse_whitespace только здесь.
+        let text = collapse_whitespace(text_raw.trim()).replace(" ,", ",");
         let href = a.value().attr("href").unwrap_or("").to_string();
         if !text.is_empty() {
             out.push(RelatedObject { name: text, href });
@@ -144,40 +184,39 @@ pub fn parse_readonly(body_html: &str) -> bool {
     extract_text(body_html).starts_with("Только чтение")
 }
 
-/// «Возвращаемое значение:» / «Описание:» свойства — извлекает тип + описание.
+/// «Возвращаемое значение:» / «Описание:» свойства / параметр — тип + описание.
 ///
-/// Структура текста (порт `ValueInfoBlockHandler.kt`):
-/// - блок начинается с «Тип:»
-/// - дальше идёт имя типа, затем точка
-/// - после точки начинается описание (произвольный html → Markdown)
+/// Структура текста (порт `ValueInfoBlockHandler.kt`): «Тип:» → имя типа (может
+/// состоять из нескольких `v8help`-ссылок и содержать точки внутри имён, как
+/// `ХранилищеНастроекМенеджер.<Имя хранилища>`) → завершающая точка ВНЕ ссылок →
+/// описание.
 ///
-/// Возвращает `None` если блок пустой или нет «Тип:».
+/// Если маркера «Тип:» нет, но текст главы непуст — возвращаем описание с пустым
+/// `type_name`: так устроены тысячи страниц свойств, и терять их текст нельзя.
 pub fn parse_value_info(body_html: &str) -> Option<ValueInfo> {
-    // Стратегия: получаем чистый markdown всего тела, потом пытаемся выделить
-    // префикс «Тип: <тип>.» и остаток превратить в описание.
     let md = to_markdown(body_html);
-    // Найти начало «Тип:»
-    let after_marker = md.strip_prefix("Тип:").or_else(|| {
-        // иногда «Тип:» идёт после whitespace или с дефисом
-        md.find("Тип:").map(|idx| &md[idx + "Тип:".len()..])
-    });
-    let rest = after_marker?;
+    if md.trim().is_empty() {
+        return None;
+    }
+
+    let Some(rest) = md
+        .strip_prefix("Тип:")
+        .or_else(|| md.find("Тип:").map(|idx| &md[idx + "Тип:".len()..]))
+    else {
+        // Главы без «Тип:» — целиком описание.
+        return Some(ValueInfo {
+            type_name: String::new(),
+            description: md.trim().to_string(),
+        });
+    };
     let rest = rest.trim_start();
     if rest.is_empty() {
         return None;
     }
 
-    // Попытка взять имя типа до первой «.» (в hbk описание начинается после точки).
-    let (type_name, description) = match rest.find('.') {
-        Some(idx) => {
-            let name = rest[..idx].trim().to_string();
-            let desc = rest[idx + 1..].trim().to_string();
-            (name, desc)
-        }
-        None => (rest.trim().to_string(), String::new()),
-    };
-
-    if type_name.is_empty() {
+    let (type_raw, description) = split_type_and_description(rest);
+    let type_name = clean_markdown_inline(type_raw);
+    if type_name.is_empty() && description.is_empty() {
         return None;
     }
     Some(ValueInfo {
@@ -186,39 +225,89 @@ pub fn parse_value_info(body_html: &str) -> Option<ValueInfo> {
     })
 }
 
-/// Параметры метода (`Параметры:`).
+/// Отделить тип от описания: тип кончается первой точкой ВНЕ backtick-спанов.
+/// Точки внутри спанов принадлежат именам типов (`БизнесПроцессМенеджер.<Имя>`),
+/// первая же точка внутри такого имени не должна резать тип (аудит: 199 страниц).
+fn split_type_and_description(rest: &str) -> (&str, String) {
+    let mut in_code = false;
+    for (idx, ch) in rest.char_indices() {
+        match ch {
+            '`' => in_code = !in_code,
+            '.' if !in_code => {
+                let after = &rest[idx + ch.len_utf8()..];
+                if after.is_empty() || after.starts_with(char::is_whitespace) {
+                    return (&rest[..idx], after.trim().to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    (rest, String::new())
+}
+
+/// Убрать markdown-разметку типа: обрамляющие `*`/`` ` `` и пробелы после
+/// запятых (`A, B` → `A,B`, как в контракте апстрима).
+fn clean_markdown_inline(raw: &str) -> String {
+    raw.trim()
+        .trim_matches(|c: char| c == '*' || c == '`' || c.is_whitespace())
+        .replace('`', "")
+        .replace(", ", ",")
+        .trim()
+        .to_string()
+}
+
+/// Параметры метода/конструктора (`Параметры:`).
 ///
-/// Каждый параметр представлен в html как `<div class="V8SH_rubric"><p>...</p></div>`
-/// (имя в формате `<имя> (необязательный)`), затем абзацы с типом и описанием.
+/// Каждый параметр представлен в html как `<div class="V8SH_rubric">…</div>`
+/// (внутри — имя вида `<имя> (необязательный)`), а тип и описание лежат
+/// СЛЕДОМ за `div` до следующего `rubric`:
+/// `Тип: <a …>Строка</a>. <br>Имя панели.`
+///
 /// Порт `ParametersBlockHandler.kt`.
-///
-/// Минимальная реализация: ищем все `div.V8SH_rubric`, для каждого вытаскиваем
-/// имя/optional, затем собираем «следующий sibling-блок» как тип+описание до
-/// следующего rubric.
 pub fn parse_parameters(body_html: &str) -> Vec<MethodParameterInfo> {
-    // Аппроксимация (детальный порт со всем стейт-машинами оставлен на Phase 3):
-    // для каждого rubric извлекаем имя и optional, тип/описание берём из текста
-    // до следующего rubric (в простом случае).
     let doc = Html::parse_fragment(body_html);
+    let rubrics: Vec<_> = doc.select(rubric_selector()).collect();
 
     let mut params = Vec::new();
-    for rubric in doc.select(rubric_selector()) {
+    for rubric in rubrics {
         let raw: String = rubric.text().collect();
         let text = collapse_whitespace(raw.trim());
         if text.is_empty() {
             continue;
         }
         let (name, is_optional) = parse_parameter_header(&text);
-        // Тип/описание — пока пустые, расширим в следующих итерациях Phase 2,
-        // когда сделаем sibling-обход для DOM (детальный аналог Kotlin state-machine).
+
+        // Собираем html всех sibling-узлов до следующего rubric.
+        let mut chunk = String::new();
+        let mut node = rubric.next_sibling();
+        while let Some(n) = node {
+            if is_rubric_node(n) {
+                break;
+            }
+            if let Some(html) = serialize_node(n) {
+                chunk.push_str(&html);
+            }
+            node = n.next_sibling();
+        }
+
+        let (type_name, description) = match parse_value_info(&chunk) {
+            Some(info) => (info.type_name, info.description),
+            None => (String::new(), String::new()),
+        };
         params.push(MethodParameterInfo {
             name,
-            type_name: String::new(),
+            type_name,
             is_optional,
-            description: String::new(),
+            description,
         });
     }
     params
+}
+
+/// Узел — `<div class="V8SH_rubric">` (начало следующего параметра).
+fn is_rubric_node(node: NodeRef<Node>) -> bool {
+    matches!(node.value(), Node::Element(el)
+        if el.attr("class").is_some_and(|c| c.split_whitespace().any(|t| t == "V8SH_rubric")))
 }
 
 /// Разобрать заголовок параметра: `<имя> (необязательный)` → (имя, true).
@@ -243,9 +332,18 @@ pub fn parse_syntax(body_html: &str) -> String {
     extract_text(body_html)
 }
 
+/// `Some(text)`, только если текст непустой: пустая глава — не значение.
+pub fn non_empty(text: String) -> Option<String> {
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::split_dual_name;
+    use super::*;
 
     #[test]
     fn dual_name_with_underscore_is_split() {
@@ -260,11 +358,82 @@ mod tests {
     }
 
     #[test]
+    fn dual_name_with_dash_and_colon_is_split() {
+        assert_eq!(
+            split_dual_name("Модуль HTTP-сервиса (HTTP-service module)"),
+            (
+                "Модуль HTTP-сервиса".to_string(),
+                "HTTP-service module".to_string()
+            )
+        );
+        assert_eq!(
+            split_dual_name("ОбъектМетаданных: HTTPСервис (MetadataObject: HTTPService)"),
+            (
+                "ОбъектМетаданных: HTTPСервис".to_string(),
+                "MetadataObject: HTTPService".to_string()
+            )
+        );
+    }
+
+    #[test]
     fn pseudo_value_in_angle_brackets_stays_whole() {
         // `<Имя картинки> (<Icon name>)` — не пара имён, а описание открытой
         // коллекции; оставляем целиком, чтобы признак `<` сохранился.
         let (ru, en) = split_dual_name("<Имя картинки> (<Icon name>)");
         assert!(ru.starts_with('<'));
         assert!(en.is_empty());
+    }
+
+    #[test]
+    fn value_info_cleans_markdown_and_keeps_composite_type() {
+        let html = r#"Тип: <a href="v8help://x">СтандартноеХранилищеНастроекМенеджер</a>, <a href="v8help://y">ХранилищеНастроекМенеджер.<Имя хранилища></a>. Описание далее."#;
+        let info = parse_value_info(html).expect("value info");
+        assert_eq!(
+            info.type_name,
+            "СтандартноеХранилищеНастроекМенеджер,ХранилищеНастроекМенеджер.<Имя хранилища>"
+        );
+        assert_eq!(info.description, "Описание далее.");
+    }
+
+    #[test]
+    fn value_info_without_type_keeps_description() {
+        let info = parse_value_info("Только описательный текст без типа.").expect("value info");
+        assert!(info.type_name.is_empty());
+        assert_eq!(info.description, "Только описательный текст без типа.");
+        assert!(parse_value_info("").is_none());
+    }
+
+    #[test]
+    fn value_info_with_bold_marker_is_clean() {
+        let info = parse_value_info("<b>Тип:</b> Строка. Описание.").expect("value info");
+        assert_eq!(info.type_name, "Строка");
+        assert_eq!(info.description, "Описание.");
+    }
+
+    #[test]
+    fn parameters_get_type_and_description() {
+        let html = r#"<div class="V8SH_rubric"><p>&lt;Имя&gt; (необязательный)</p></div>Тип: <a href="v8help://x">Строка</a>. <br>Имя панели."#;
+        let params = parse_parameters(html);
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].name, "Имя");
+        assert!(params[0].is_optional);
+        assert_eq!(params[0].type_name, "Строка");
+        assert!(
+            params[0].description.contains("Имя панели"),
+            "{:?}",
+            params[0].description
+        );
+    }
+
+    #[test]
+    fn example_accepts_br_variants() {
+        assert_eq!(parse_example("a<BR />b<br class=\"x\">c"), "a\nb\nc");
+    }
+
+    #[test]
+    fn related_object_nbsp_before_comma_is_collapsed() {
+        let objs = parse_related_objects("<a href=\"h\">См.\u{a0}, ещё</a>");
+        assert_eq!(objs.len(), 1);
+        assert_eq!(objs[0].name, "См., ещё");
     }
 }

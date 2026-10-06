@@ -99,7 +99,10 @@ impl SymbolSource for LiteSource {
 
     fn owner_exports(&self, module_path: &str) -> Option<HashSet<String>> {
         match self.index.lock().unwrap().owner_exports(module_path) {
-            Ok(names) => Some(names.into_iter().collect()),
+            Ok(Some(names)) => Some(names.into_iter().collect()),
+            // «Не знаю»: владельца нет или его модуля нет в индексе — молчание,
+            // а не пустой набор (пустой дал бы ложную находку на вызове метода).
+            Ok(None) => None,
             Err(e) => {
                 tracing::warn!(error = %e, module_path, "lite-index: ошибка owner_exports");
                 None
@@ -202,8 +205,10 @@ struct DbSnapshot {
     /// (zstd), признак — `<Global>true</Global>`. Отдельного флага у
     /// `code-index` нет, но исходный XML он хранит.
     global_exports: HashSet<String>,
-    /// Экспортные переменные модулей приложения (нижний регистр).
-    global_vars: HashSet<String>,
+    /// Экспортные переменные модулей приложения (нижний регистр). `None` —
+    /// сбор не удался (нет таблицы/колонки, ошибка чтения): правило о переменных
+    /// модуля приложения обязано молчать, а не считать, что переменных нет.
+    global_vars: Option<HashSet<String>>,
     /// Объекты конфигурации по `meta_type` (таблица `metadata_objects`), в
     /// исходном регистре. `None` — таблицы нет: это не BSL-индекс, либо старая
     /// версия без неё. НИКАКОГО вывода имён из путей модулей — у объекта может
@@ -403,19 +408,24 @@ impl CodeIndexDbSource {
     /// базе (`file_contents`, zstd) — тем же путём, что и XML общих модулей для
     /// `collect_global_exports`. Разбор строк — общий с `lite-index`, чтобы
     /// правило чтения `Перем Имя Экспорт;` жило в одном месте.
-    /// Ошибка не фатальна: источник продолжит работать, просто без этих имён.
-    fn collect_global_vars(conn: &Connection) -> HashSet<String> {
-        Self::try_collect_global_vars(conn).unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "code-index база: не удалось собрать переменные модуля приложения");
-            HashSet::new()
-        })
+    /// Ошибка сбора — `None` («не знаю»), а не пустой набор: пустой набор
+    /// включил бы правило общего модуля и дал ложные `UnknownCommonModule`.
+    fn collect_global_vars(conn: &Connection) -> Option<HashSet<String>> {
+        match Self::try_collect_global_vars(conn) {
+            Ok(vars) => Some(vars),
+            Err(e) => {
+                tracing::warn!(error = %e, "code-index база: не удалось собрать переменные модуля приложения");
+                None
+            }
+        }
     }
 
     fn try_collect_global_vars(conn: &Connection) -> Result<HashSet<String>> {
         let mut stmt = conn.prepare(
             "SELECT f.path, fc.content_blob FROM files f \
              JOIN file_contents fc ON fc.file_id = f.id \
-             WHERE f.path LIKE '%ApplicationModule.bsl' OR f.path LIKE '%SessionModule.bsl'",
+             WHERE f.path LIKE '%ApplicationModule.bsl' OR f.path LIKE '%SessionModule.bsl' \
+                OR f.path LIKE '%ExternalConnectionModule.bsl'",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
@@ -620,7 +630,7 @@ impl SymbolSource for CodeIndexDbSource {
 
     fn global_variables(&self) -> Option<HashSet<String>> {
         self.refresh_if_stale();
-        Some(self.snapshot.lock().unwrap().global_vars.clone())
+        self.snapshot.lock().unwrap().global_vars.clone()
     }
 
     fn describe(&self) -> String {
@@ -743,7 +753,12 @@ impl CodeIndexMcpSource {
             .set("Content-Type", "application/json")
             .set("Accept", "application/json, text/event-stream")
             .send_json(body)
-            .with_context(|| format!("code-index mcp: initialize к {} не прошёл", self.url))?;
+            .with_context(|| {
+                format!(
+                    "code-index mcp: initialize к {} не прошёл",
+                    redact_url(&self.url)
+                )
+            })?;
 
         if let Some(session_id) = resp.header("Mcp-Session-Id") {
             *self.session_id.lock().unwrap() = Some(session_id.to_string());
@@ -785,22 +800,29 @@ impl CodeIndexMcpSource {
                 "arguments": {"repo": self.repo}
             }
         });
-        let resp = self
-            .post(body)
-            .with_context(|| format!("code-index mcp: get_stats к {} не прошёл", self.url))?;
+        let resp = self.post(body).with_context(|| {
+            format!(
+                "code-index mcp: get_stats к {} не прошёл",
+                redact_url(&self.url)
+            )
+        })?;
         let text = resp.into_string().context("code-index mcp: тело ответа")?;
         let value = parse_sse_json(&text)
             .ok_or_else(|| anyhow::anyhow!("code-index mcp: пустой/неразбираемый SSE-ответ"))?;
         match repo_check_from_get_stats(&value, &self.repo) {
             RepoCheck::Known => Ok(()),
             RepoCheck::Unknown(message) => {
-                anyhow::bail!("code-index по адресу {}: {}", self.url, message)
+                anyhow::bail!(
+                    "code-index по адресу {}: {}",
+                    redact_url(&self.url),
+                    message
+                )
             }
             // Форма ответа может смениться в новой версии code-index — это чужой продукт.
             // Не распознали — не блокируем старт, просто не проверяем.
             RepoCheck::Unrecognized => {
                 tracing::warn!(
-                    url = %self.url,
+                    url = %redact_url(&self.url),
                     repo = %self.repo,
                     "code-index mcp: ответ get_stats не распознан, проверка репозитория пропущена"
                 );
@@ -850,7 +872,7 @@ impl CodeIndexMcpSource {
                     unreachable!();
                 };
                 tracing::info!(
-                    url = %self.url,
+                    url = %redact_url(&self.url),
                     repo = %self.repo,
                     error = %transport,
                     "code-index mcp: обрыв соединения, повторяю запрос по новому"
@@ -867,7 +889,7 @@ impl CodeIndexMcpSource {
                 };
                 let reason = resp.into_string().unwrap_or_default();
                 tracing::info!(
-                    url = %self.url,
+                    url = %redact_url(&self.url),
                     repo = %self.repo,
                     code,
                     reason = reason.trim(),
@@ -1170,7 +1192,10 @@ impl SymbolSource for CodeIndexMcpSource {
         self.search(name_lower).into_iter().any(|f| {
             f.name_lower == name_lower
                 && f.args.contains(") Экспорт")
-                && f.file_path.contains("/CommonModules/")
+                // Путь может быть как с ведущим сегментом (`base/CommonModules/…`),
+                // так и от корня репозитория (`CommonModules/…`).
+                && (f.file_path.contains("/CommonModules/")
+                    || f.file_path.starts_with("CommonModules/"))
                 && common_module_xml_path(&f.file_path)
                     .is_some_and(|xml_path| self.module_is_global(&xml_path))
         })
@@ -1295,8 +1320,28 @@ impl SymbolSource for CodeIndexMcpSource {
     }
 
     fn describe(&self) -> String {
-        format!("code-index mcp: {} repo={}", self.url, self.repo)
+        format!(
+            "code-index mcp: {} repo={}",
+            redact_url(&self.url),
+            self.repo
+        )
     }
+}
+
+/// URL для журнала и сообщений об ошибках — без учётных данных и query:
+/// `http://user:pass@host/mcp?token=…` → `http://host/mcp`. Секреты из
+/// конфигурации не должны попадать в логи и ответы MCP-клиентам.
+pub fn redact_url(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let (scheme, rest) = url.split_at(scheme_end + 3);
+    let rest = rest.split(['?', '#']).next().unwrap_or(rest);
+    let host_and_path = match rest.find('@') {
+        Some(at) => &rest[at + 1..],
+        None => rest,
+    };
+    format!("{scheme}{host_and_path}")
 }
 
 /// Разобрать SSE-ответ MCP-сервера: строки `data: {...}`, первая бывает

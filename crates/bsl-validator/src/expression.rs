@@ -802,15 +802,18 @@ pub(crate) fn check_new_expressions(
     for n in news {
         if index.find_type(&n.type_name).is_none() {
             let (line, col) = pos_at(src, n.byte);
-            let all_types: Vec<String> = index.types.values().map(|t| t.name_ru.clone()).collect();
+            // Сортировка — детерминированный порядок кандидатов при равном
+            // сходстве (обход HashMap случаен; подсказка плавала между запусками).
+            let mut all_types: Vec<String> =
+                index.types.values().map(|t| t.name_ru.clone()).collect();
+            all_types.sort();
             let suggestion = closest_str(&n.type_name, &all_types);
             errors.push(ExprError::new(
                 line,
                 col,
                 ExprErrorKind::UnknownNewType,
                 format!(
-                    "Тип '{}' не найден в платформенном контексте (Новый '{}').{}",
-                    n.type_name,
+                    "Тип '{}' не найден в платформенном контексте.{}",
                     n.type_name,
                     suggestion
                         .as_ref()
@@ -1072,7 +1075,13 @@ fn closest_str(target: &str, candidates: &[String]) -> Option<String> {
         // имя отвергнет — подсказка сломала бы рабочий код (issue #18).
         .filter(|c| !crate::homoglyphs::is_mixed_alphabet(c))
         .map(|c| (similarity(&target_l, &c.to_lowercase()), c.clone()))
-        .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+        // Тай-брейк по имени: при равном сходстве порядок кандидатов не должен
+        // влиять на подсказку (недетерминизм ловился запуском).
+        .max_by(|a, b| {
+            a.0.partial_cmp(&b.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.1.cmp(&a.1))
+        })
         .filter(|(s, _)| *s > 0.5)
         .map(|(_, c)| c)
 }
@@ -1248,6 +1257,7 @@ mod tests {
             return_type: "Строка".into(),
             signatures: vec![Signature {
                 name: "Основная".into(),
+                syntax: String::new(),
                 description: String::new(),
                 parameters: vec![
                     Parameter {

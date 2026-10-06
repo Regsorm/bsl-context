@@ -11,6 +11,8 @@
 //! `&НаКлентее`) попадает в `ERROR`-узел без выделенного имени. Промах по
 //! whitelist → fuzzy к нему → `ExprErrorKind::UnknownDirective`.
 
+use crate::expression::lev;
+
 /// Плоский whitelist всех известных имён директив BSL — компиляции
 /// (`НаКлиенте`, `НаСервере`, `НаСервереБезКонтекста`, `НаКлиентеНаСервере`,
 /// `НаКлиентеНаСервереБезКонтекста` и их English-варианты) и расширений
@@ -50,6 +52,14 @@ const EXTENSION_DIRECTIVES: &[&str] = &[
     "changeandvalidate",
 ];
 
+/// `str::trim_start` не снимает UTF-8 BOM (U+FEFF не whitespace): строка
+/// `\u{FEFF}&Вместо(…)` иначе не распознаётся как директива расширения, и
+/// модуль расширения попадает под strict-проверку с массовыми ложными
+/// ошибками. Та же функция нужна в `module::scan_directives`.
+pub(crate) fn trim_start_bsl(line: &str) -> &str {
+    line.trim_start_matches(|c: char| c.is_whitespace() || c == '\u{FEFF}')
+}
+
 /// Текст принадлежит модулю расширения конфигурации?
 ///
 /// Признак — хотя бы одна директива подключения (`&Перед`, `&После`, `&Вместо`,
@@ -63,7 +73,7 @@ const EXTENSION_DIRECTIVES: &[&str] = &[
 /// признаком не является.
 pub fn is_extension_module(cleaned: &str) -> bool {
     cleaned.lines().any(|line| {
-        let Some(rest) = line.trim_start().strip_prefix('&') else {
+        let Some(rest) = trim_start_bsl(line).strip_prefix('&') else {
             return false;
         };
         let name: String = rest
@@ -87,8 +97,9 @@ pub fn is_known_directive(name: &str) -> bool {
 }
 
 /// Ближайшая по Левенштейну известная директива к `target` (регистронезависимо).
-/// Возвращает `(suggestion, distance)` для всех попаданий; вызывающий сам
-/// решает по порогу, эмиттить ли ошибку.
+/// Возвращает одно лучшее попадание `(suggestion, distance)`; вызывающий сам
+/// решает по порогу, эмиттить ли ошибку. При равном расстоянии побеждает
+/// первый по порядку списка — детерминированно.
 pub fn closest_directive_with_distance(target: &str) -> Option<(String, usize)> {
     let target_lc = target.to_lowercase();
     let mut best: Option<(String, usize)> = None;
@@ -100,31 +111,6 @@ pub fn closest_directive_with_distance(target: &str) -> Option<(String, usize)> 
         }
     }
     best
-}
-
-/// Локальная копия расстояния Левенштейна, чтобы не тянуть зависимость
-/// от приватного `expression::lev`. Идентичная реализация.
-fn lev(a: &str, b: &str) -> usize {
-    let av: Vec<char> = a.chars().collect();
-    let bv: Vec<char> = b.chars().collect();
-    let (n, m) = (av.len(), bv.len());
-    if n == 0 {
-        return m;
-    }
-    if m == 0 {
-        return n;
-    }
-    let mut prev: Vec<usize> = (0..=m).collect();
-    let mut curr: Vec<usize> = vec![0; m + 1];
-    for i in 1..=n {
-        curr[0] = i;
-        for j in 1..=m {
-            let cost = if av[i - 1] == bv[j - 1] { 0 } else { 1 };
-            curr[j] = (curr[j - 1] + 1).min(prev[j] + 1).min(prev[j - 1] + cost);
-        }
-        std::mem::swap(&mut prev, &mut curr);
-    }
-    prev[m]
 }
 
 #[cfg(test)]

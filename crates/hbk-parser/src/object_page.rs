@@ -2,14 +2,15 @@
 //! constructors — эти дочерние коллекции собираются на уровне visitor (Phase 3).
 //!
 //! Главы: «Описание:», «Пример:», «См. также:», «Примечание:». Игнорируем
-//! «Свойства:», «Методы:», «События:», «Конструкторы:» — они есть как
-//! заголовки на странице-родителе, но реальные данные лежат в дочерних
-//! страницах TOC, которые визитор обходит отдельно.
+//! «Свойства:», «Методы:», «Конструкторы:» — их данные лежат в дочерних
+//! страницах TOC, которые визитор обходит отдельно. «События:» визитором НЕ
+//! собираются, а «Элементы коллекции:»/«Параметры формы:» в модели `ObjectInfo`
+//! не представлены — эти главы сознательно пропускаются.
 //!
 //! Порт `ObjectPageParser.kt`.
 
 use crate::blocks::{
-    parse_description, parse_example, parse_head_name, parse_note, parse_related_objects,
+    non_empty, parse_description, parse_example, parse_head_name, parse_note, parse_related_objects,
 };
 use crate::html::split_chapters;
 use crate::models::ObjectInfo;
@@ -28,17 +29,22 @@ pub fn parse_object_page(html: &str) -> ObjectInfo {
     for ch in chapters.iter().skip(1) {
         match ch.title.as_str() {
             "Описание:" => description = parse_description(&ch.body_html),
-            "Пример:" => example = Some(parse_example(&ch.body_html)),
+            "Пример:" => example = non_empty(parse_example(&ch.body_html)),
             "См. также:" => related = parse_related_objects(&ch.body_html),
-            "Примечание:" => note = Some(parse_note(&ch.body_html)),
+            "Примечание:" => note = non_empty(parse_note(&ch.body_html)),
             // Игнорируемые главы (как в апстриме):
             "Свойства:"
             | "Методы:"
             | "События:"
             | "Конструкторы:"
             | "Доступность:"
-            | "Использование в версии:" => {}
-            _ => {}
+            | "Использование в версии:"
+            | "Использование в интерфейсе:" => {}
+            _ => {
+                if !ch.title.is_empty() {
+                    tracing::warn!(chapter = ch.title, "неизвестная глава страницы типа");
+                }
+            }
         }
     }
 

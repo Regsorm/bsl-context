@@ -28,7 +28,7 @@ use crate::symbols::SymbolSource;
 /// Менеджер объектов конфигурации в коде → (коллекция каталога выгрузки,
 /// префикс типа-менеджера ОБЪЕКТА в справке платформы).
 ///
-/// Только русские имена: конфигурации, с которыми работает сервер, русские.
+/// Только русские имена: сервер работает с русской платформой (`shcntx_ru`).
 /// Таблица сверена с живым индексом; в частности, три плана в `meta_type`
 /// остаются во множественном числе — соответствие держит symbol-source.
 ///
@@ -153,11 +153,21 @@ pub(crate) fn check_config_objects(
 
         // ── (б) Менеджер объектов конфигурации: `Справочники.Имя` ──
         if let Some(collection) = collection_for_manager(&dot.head) {
+            // Мусор восстановления дерева — не имя объекта.
+            if !is_identifier_like(&dot.member) {
+                continue;
+            }
             // Член после менеджера — не обязательно имя объекта: у самого
             // менеджера есть методы (`ПланыОбмена.ГлавныйУзел()`,
             // `Справочники.ТипВсеСсылки()`). Замер на УТ: без этого условия
             // 967 ложных находок, все — методы менеджеров.
             if manager_type_has_member(index, &dot.head, &dot.member) {
+                continue;
+            }
+            // Тип-менеджер не разрешился из справки (пустой/неполный индекс) —
+            // отличить метод менеджера от имени объекта нечем: молчим, иначе
+            // легитимные `Справочники.ТипВсеСсылки()` становятся находками.
+            if manager_type_for(index, &dot.head).is_none() {
                 continue;
             }
             let member_lower = dot.member.to_lowercase();
@@ -217,6 +227,12 @@ pub(crate) fn check_config_objects(
             continue;
         }
         if symbols.object_exists("CommonModules", &head_lower) == Some(false) {
+            // Голова — правдоподобная опечатка глобального свойства: находку
+            // уже дало правило голов (`UnknownGlobalProperty`), вторая на той
+            // же строке — шум (дубль `Справочник.Метод()` из двух правил).
+            if closest_global_property(index, &dot.head).is_some() {
+                continue;
+            }
             emit(
                 errors,
                 src,
@@ -451,10 +467,7 @@ fn locally_bound_names(facts: &AstFacts) -> HashSet<String> {
 /// без их снятия `find_type` не находит тип, гейт молча не срабатывает и все
 /// методы менеджеров возвращаются ложными находками.
 fn manager_type_has_member(index: &PlatformIndex, head: &str, member: &str) -> bool {
-    let Some(property) = index.find_global_property(head) else {
-        return false;
-    };
-    let Some(manager_type) = index.find_type(property.type_name.trim_matches('`')) else {
+    let Some(manager_type) = manager_type_for(index, head) else {
         return false;
     };
     let member_lower = member.to_lowercase();
@@ -463,6 +476,15 @@ fn manager_type_has_member(index: &PlatformIndex, head: &str, member: &str) -> b
     }) || manager_type.properties.iter().any(|p| {
         p.name_ru.to_lowercase() == member_lower || p.name_en.to_lowercase() == member_lower
     })
+}
+
+/// Тип-менеджер глобального свойства из справки: `Справочники` →
+/// `СправочникиМенеджер`. `None` — справка не знает ни свойство, ни тип
+/// (пустой/неполный индекс): проверки, опирающиеся на состав менеджера,
+/// обязаны в этом случае молчать.
+fn manager_type_for<'a>(index: &'a PlatformIndex, head: &str) -> Option<&'a Type> {
+    let property = index.find_global_property(head)?;
+    index.find_type(property.type_name.trim_matches('`'))
 }
 
 /// Похоже на идентификатор BSL: начинается с буквы или подчёркивания.
@@ -506,11 +528,19 @@ fn manager_collection_with_prefix(head: &str) -> Option<(&'static str, &'static 
 /// с гипотетическим `СправочникМенеджерЧтоТо`).
 fn manager_object_type<'a>(index: &'a PlatformIndex, prefix: &str) -> Option<&'a Type> {
     let needle = format!("{}.", prefix.to_lowercase());
-    index
-        .types
-        .iter()
-        .find(|(key, _)| key.starts_with(&needle))
-        .map(|(_, ty)| ty)
+    // Обход HashMap недетерминирован: при нескольких шаблонных типах выбор
+    // «первого» плавал между запусками. Ровно один — берём; больше — молчим
+    // (fail-open: неверный тип дал бы ложную находку).
+    let mut found: Option<&Type> = None;
+    for (key, ty) in &index.types {
+        if key.starts_with(&needle) {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(ty);
+        }
+    }
+    found
 }
 
 /// Есть ли у типа член (метод или свойство) с таким именем (регистронезависимо,
@@ -617,9 +647,16 @@ fn suggestion_for(symbols: &dyn SymbolSource, collection: &str, name: &str) -> O
     let mut best: Option<(String, usize)> = None;
     for candidate in &names {
         let distance = lev(&name_lower, &candidate.to_lowercase());
-        match &best {
-            Some((_, best_distance)) if distance >= *best_distance => {}
-            _ => best = Some((candidate.clone(), distance)),
+        let better = match &best {
+            // Тай-брейк по имени: обход HashSet недетерминирован, а подсказка
+            // обязана совпадать между запусками при равном расстоянии.
+            Some((best_name, best_distance)) => {
+                distance < *best_distance || (distance == *best_distance && candidate < best_name)
+            }
+            None => true,
+        };
+        if better {
+            best = Some((candidate.clone(), distance));
         }
     }
     let (candidate, distance) = best?;

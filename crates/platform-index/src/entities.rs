@@ -1,7 +1,9 @@
 //! Доменные сущности business-слоя.
 //!
-//! Главное отличие от апстрима — поля `signature` у методов, `constructors` у типов
-//! и `enum_values` у типов-перечислений заполняются полностью, без потерь.
+//! Это УЗКАЯ проекция `hbk_parser::*Info`: переносятся имена, описания, типы,
+//! параметры и синтаксис. `note`/`example`/`related_objects` и описание
+//! возвращаемого значения пока остаются в промежуточных Info и в домен не
+//! попадают — при расширении домена обязателен подъём `cache::FORMAT_VERSION`.
 
 use serde::{Deserialize, Serialize};
 
@@ -20,6 +22,8 @@ pub struct Method {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Signature {
     pub name: String,
+    /// Авторитетный текст вызова из справки (`Найти(<Значение>, …)`).
+    pub syntax: String,
     pub description: String,
     pub parameters: Vec<Parameter>,
 }
@@ -47,6 +51,8 @@ pub struct Property {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Constructor {
     pub name: String,
+    /// Текст синтаксиса со страницы (`Новый Тип(<Параметр>)`), если он есть.
+    pub syntax: String,
     pub description: String,
     pub parameters: Vec<Parameter>,
 }

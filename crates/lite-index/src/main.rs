@@ -83,13 +83,17 @@ fn run_build(args: impl Iterator<Item = String>) -> Result<()> {
             return Err(e);
         }
     };
-    std::fs::rename(&tmp, &db).with_context(|| {
-        format!(
-            "не удалось переместить {} → {}",
-            tmp.display(),
-            db.display()
-        )
-    })?;
+    if let Err(e) = std::fs::rename(&tmp, &db) {
+        // Полный, но ненужный временный файл — мусор рядом с базой.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| {
+            format!(
+                "не удалось переместить {} → {}",
+                tmp.display(),
+                db.display()
+            )
+        });
+    }
 
     println!("модулей: {}", stats.modules);
     println!("методов: {}", stats.methods);
@@ -116,8 +120,14 @@ fn run_stats(args: impl Iterator<Item = String>) -> Result<()> {
     }
     let db = db.context("укажите --db <файл.db>")?;
 
-    let conn = rusqlite::Connection::open(&db)
-        .with_context(|| format!("не удалось открыть индекс {}", db.display()))?;
+    // Только чтение: `Connection::open` создал бы пустой файл на опечатке и
+    // вернул «no such table: meta» вместо понятного «индекса нет».
+    if !db.exists() {
+        bail!("индекс не найден: {}", db.display());
+    }
+    let conn =
+        rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("не удалось открыть индекс {}", db.display()))?;
 
     let mut stmt = conn.prepare("SELECT key, value FROM meta ORDER BY key")?;
     let rows = stmt.query_map([], |row| {

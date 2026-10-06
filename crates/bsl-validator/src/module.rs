@@ -467,7 +467,10 @@ pub fn validate_module_degraded(
 /// сильное сходство → High, слабое → Low, далёкое → молча пропускаем.
 fn scan_directives(cleaned: &str, errors: &mut Vec<ExprError>) {
     for (row, line) in cleaned.lines().enumerate() {
-        let trimmed = line.trim_start();
+        // trim_start не снимает UTF-8 BOM (U+FEFF не whitespace): директива
+        // на первой строке BOM-модуля иначе не проверялась (и опечатка
+        // терялась вместе с BOM).
+        let trimmed = crate::directives::trim_start_bsl(line);
         let Some(rest) = trimmed.strip_prefix('&') else {
             continue;
         };
@@ -489,7 +492,9 @@ fn scan_directives(cleaned: &str, errors: &mut Vec<ExprError>) {
             continue;
         };
         let line_no = (row + 1) as u32;
-        let col = (line.len() - trimmed.len() + 1) as u32;
+        // Колонка — в СИМВОЛАХ (как pos_at), а не в байтах: BOM и кириллица
+        // в отступе иначе сдвигали её.
+        let col = (line[..line.len() - trimmed.len()].chars().count() + 1) as u32;
         errors.push(ExprError::new_with_confidence(
             line_no,
             col,
@@ -832,6 +837,7 @@ EndFunction
                 return_type: String::new(),
                 signatures: vec![Signature {
                     name: String::new(),
+                    syntax: String::new(),
                     description: String::new(),
                     parameters: (0..params)
                         .map(|i| Parameter {
@@ -907,6 +913,7 @@ EndFunction
                 return_type: String::new(),
                 signatures: vec![Signature {
                     name: String::new(),
+                    syntax: String::new(),
                     description: String::new(),
                     parameters: (0..params)
                         .map(|i| Parameter {

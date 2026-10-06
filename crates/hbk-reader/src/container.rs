@@ -3,7 +3,7 @@
 //! Порт `HbkContainerReader.kt` (alkoleft/mcp-bsl-platform-context, исходно
 //! на основе bsl-context от 1c-syntax).
 //!
-//! Формат контейнера (little-endian, mmap/Vec<u8>):
+//! Формат контейнера (little-endian, mmap/`Vec<u8>`):
 //! - skip 16 байт (int*4 заголовок)
 //! - skip 2 байта (short)
 //! - payloadSize: long-string (8 ASCII hex + 1 разделитель) → размер `fileInfos`
@@ -30,17 +30,24 @@ const BYTES_BY_FILE_INFOS: usize = 12; // i32 * 3
 
 /// Распарсенный hbk-контейнер: исходные байты + таблица «имя → адрес тела».
 pub struct HbkContainer {
-    pub buffer: Vec<u8>,
-    pub entities: HashMap<String, u32>,
+    /// Сырые байты файла: по адресам из `entities` читаются тела сущностей.
+    buffer: Vec<u8>,
+    /// Таблица «имя entity → адрес тела» (чтение — [`Self::get_entity`]).
+    entities: HashMap<String, u32>,
 }
 
 impl HbkContainer {
     /// Прочитать hbk-файл с диска и распарсить таблицу entities.
     pub fn read(path: &Path) -> Result<Self> {
-        if !path.exists() {
-            return Err(HbkError::NotFound(path.to_path_buf()));
-        }
-        let mut file = File::open(path)?;
+        // Без предварительного `exists()`: между проверкой и открытием файл
+        // может исчезнуть (TOCTOU); отсутствие различаем по коду ошибки open.
+        let mut file = match File::open(path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(HbkError::NotFound(path.to_path_buf()));
+            }
+            Err(e) => return Err(e.into()),
+        };
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer)?;
         let entities = Self::parse_entities(&buffer)?;
@@ -60,21 +67,15 @@ impl HbkContainer {
         // Курсор на разрезе позиций — повторяет ByteBuffer.position() из Kotlin.
         let mut pos = 0usize;
 
-        skip(&mut pos, 16); // int*4 — заголовок контейнера
-        skip(&mut pos, 2); // short
+        skip(&mut pos, 16)?; // int*4 — заголовок контейнера
+        skip(&mut pos, 2)?; // short
 
         let payload_size = read_long_string(buffer, &mut pos)? as usize; // размер блока fileInfos
-        let block_size = read_long_string(buffer, &mut pos)? as usize; // шаг до конца блока
+        let _block_size = read_long_string(buffer, &mut pos)?; // шаг до конца блока; далее не нужен
 
-        skip(&mut pos, 11); // long + byte + short
+        skip(&mut pos, 11)?; // long + byte + short
 
-        let block_start = pos;
         let file_infos = read_slice(buffer, pos, payload_size)?;
-        let block_end = block_start
-            .checked_add(block_size)
-            .ok_or_else(|| HbkError::BadFormat("block_size overflow".into()))?;
-        pos = block_end;
-        let _ = pos; // дальше pos не нужен — entities читаем в file_infos и через body-адреса
 
         // file_infos: блок длины payload_size, состоит из записей по 12 байт (i32 * 3).
         // На больших размерах могут быть лишние байты — округляем вниз.
@@ -83,7 +84,7 @@ impl HbkContainer {
         for i in 0..count {
             let base = i * BYTES_BY_FILE_INFOS;
             let mut rdr = &file_infos[base..base + BYTES_BY_FILE_INFOS];
-            let header_address = rdr.read_i32::<LittleEndian>()? as usize;
+            let header_address = rdr.read_i32::<LittleEndian>()?;
             let body_address = rdr.read_i32::<LittleEndian>()? as i64; // может быть отрицательным как сырой i32
             let reserved = rdr.read_i32::<LittleEndian>()?;
             // В Kotlin: `if (reserved != Int.MAX_VALUE) throw`. Это `0x7FFFFFFF`.
@@ -93,6 +94,11 @@ impl HbkContainer {
                     i32::MAX
                 )));
             }
+            // Отрицательный адрес — битый формат: `as usize` дал бы usize::MAX
+            // и переполнение позиции при skip (в dev-профиле — паника).
+            let header_address = usize::try_from(header_address).map_err(|_| {
+                HbkError::BadFormat(format!("запись #{i}: headerAddress = {header_address}"))
+            })?;
             let name = read_file_name(buffer, header_address)?;
             // body_address хранится как i32, но указывает на смещение в файле — приводим к u32.
             entities.insert(name, body_address as u32);
@@ -102,9 +108,9 @@ impl HbkContainer {
 
     fn read_body(buffer: &[u8], body_address: usize) -> Result<Vec<u8>> {
         let mut pos = body_address;
-        skip(&mut pos, 2);
+        skip(&mut pos, 2)?;
         let payload_size = read_long_string(buffer, &mut pos)? as usize;
-        skip(&mut pos, 20); // long*2 + int*2 + short
+        skip(&mut pos, 20)?; // служебные поля заголовка тела (эмпирически 20 байт)
         let body = read_slice(buffer, pos, payload_size)?;
         Ok(body.to_vec())
     }
@@ -119,30 +125,33 @@ impl HbkContainer {
 /// - читаем `payloadSize - 24` байт UTF-16LE → имя
 fn read_file_name(buffer: &[u8], header_address: usize) -> Result<String> {
     let mut pos = header_address;
-    skip(&mut pos, 2);
+    skip(&mut pos, 2)?;
     let payload_size = read_long_string(buffer, &mut pos)? as usize;
-    skip(&mut pos, 40);
+    skip(&mut pos, 40)?;
 
     let str_len = payload_size
         .checked_sub(24)
         .ok_or_else(|| HbkError::BadFormat("name payloadSize < 24".into()))?;
     let raw = read_slice(buffer, pos, str_len)?;
-    decode_utf16le(raw)
+    Ok(decode_utf16le(raw))
 }
 
 /// Декодировать UTF-16LE-строку (имя файла в hbk-контейнере).
-fn decode_utf16le(raw: &[u8]) -> Result<String> {
-    if !raw.len().is_multiple_of(2) {
-        return Err(HbkError::BadFormat(format!(
-            "UTF-16LE буфер нечётной длины: {}",
-            raw.len()
-        )));
+///
+/// Декодирование lossy, как `new String(bytes, UTF_16LE)` в эталоне: битые
+/// пары и нечётный хвост дают U+FFFD, а не отказ всего разбора контейнера.
+fn decode_utf16le(raw: &[u8]) -> String {
+    let (chunks, tail) = raw.as_chunks::<2>();
+    let units: Vec<u16> = chunks
+        .iter()
+        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .collect();
+    let mut decoded = String::from_utf16_lossy(&units);
+    if !tail.is_empty() {
+        // Неполный последний символ: Java-декодер отдал бы U+FFFD.
+        decoded.push('\u{FFFD}');
     }
-    let mut units = Vec::with_capacity(raw.len() / 2);
-    for chunk in raw.as_chunks::<2>().0 {
-        units.push(u16::from_le_bytes([chunk[0], chunk[1]]));
-    }
-    String::from_utf16(&units).map_err(|e| HbkError::BadFormat(format!("UTF-16LE: {e}")))
+    decoded
 }
 
 /// Прочитать long-string: 8 байт ASCII hex (например "00000010") + 1 байт-разделитель.
@@ -153,17 +162,21 @@ fn read_long_string(buffer: &[u8], pos: &mut usize) -> Result<i32> {
     let raw = read_slice(buffer, *pos, 8)?;
     *pos += 8;
     // отдельный байт-разделитель (часто пробел или '\n')
-    skip(pos, 1);
+    skip(pos, 1)?;
+    // Без trim(): эталон (Long.parseLong(s, 16)) пробелы не принимает.
     let s =
         std::str::from_utf8(raw).map_err(|e| HbkError::BadFormat(format!("long-string: {e}")))?;
-    let v = i64::from_str_radix(s.trim(), 16)
+    let v = i64::from_str_radix(s, 16)
         .map_err(|e| HbkError::BadFormat(format!("long-string не hex '{s}': {e}")))?;
-    Ok(v as i32)
+    i32::try_from(v).map_err(|_| HbkError::BadFormat(format!("long-string вне i32: {s}")))
 }
 
 #[inline]
-fn skip(pos: &mut usize, n: usize) {
-    *pos += n;
+fn skip(pos: &mut usize, n: usize) -> Result<()> {
+    *pos = pos
+        .checked_add(n)
+        .ok_or_else(|| HbkError::BadFormat("position overflow".into()))?;
+    Ok(())
 }
 
 fn read_slice(buffer: &[u8], pos: usize, len: usize) -> Result<&[u8]> {
@@ -173,4 +186,43 @@ fn read_slice(buffer: &[u8], pos: usize, len: usize) -> Result<&[u8]> {
     buffer
         .get(pos..end)
         .ok_or_else(|| HbkError::BadFormat(format!("read {len} bytes at {pos}: out of bounds")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Минимальный контейнер: заголовок 16+2, два long-string (payloadSize,
+    /// blockSize), 11 служебных байт и блок fileInfos.
+    fn container_with(file_infos: &[u8]) -> Vec<u8> {
+        let mut buf = vec![0u8; 16 + 2];
+        buf.extend_from_slice(b"0000000C "); // payloadSize = 12
+        buf.extend_from_slice(b"0000000C "); // blockSize = 12
+        buf.extend_from_slice(&[0u8; 11]);
+        buf.extend_from_slice(file_infos);
+        buf
+    }
+
+    /// Отрицательный headerAddress раньше приводил к `as usize` = usize::MAX
+    /// и переполнению позиции (паника в dev-профиле) — теперь BadFormat.
+    #[test]
+    fn negative_header_address_is_bad_format() {
+        let mut infos = Vec::new();
+        infos.extend_from_slice(&(-1i32).to_le_bytes());
+        infos.extend_from_slice(&0i32.to_le_bytes());
+        infos.extend_from_slice(&i32::MAX.to_le_bytes());
+        let err = HbkContainer::parse_entities(&container_with(&infos))
+            .expect_err("отрицательный headerAddress должен быть ошибкой");
+        assert!(matches!(err, HbkError::BadFormat(_)), "{err}");
+    }
+
+    /// Декодирование имён lossy, как `new String(bytes, UTF_16LE)`: битые
+    /// пары и нечётный хвост не роняют разбор всего контейнера.
+    #[test]
+    fn utf16le_decoding_is_lossy() {
+        // lone high surrogate D800 + 'A' → U+FFFD + 'A'
+        assert_eq!(decode_utf16le(&[0x00, 0xD8, 0x41, 0x00]), "\u{FFFD}A");
+        // нечётная длина: хвостовой байт → U+FFFD
+        assert_eq!(decode_utf16le(&[0x41, 0x00, 0x7F]), "A\u{FFFD}");
+    }
 }

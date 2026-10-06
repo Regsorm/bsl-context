@@ -9,9 +9,9 @@
 //!
 //! Контракт кэша — оптимизация, а не источник правды:
 //!
-//! - **Годность проверяется отпечатком** hbk (путь + размер + время
-//!   изменения) и версией формата. Файл платформы обновился, сервер обновился —
-//!   кэш молча пересобирается из hbk.
+//! - **Годность** проверяется отпечатком hbk (путь, размер, время изменения,
+//!   проба содержимого), версией формата и версией сборки сервера: файл
+//!   платформы обновился, сервер обновился — кэш молча пересобирается.
 //! - **Любая ошибка чтения кэша — не ошибка запуска.** Битый, обрезанный или
 //!   чужой файл — предупреждение в журнал и обычная сборка из hbk. Без кэша
 //!   сервер работает ровно так же, как до его появления, только дольше стартует.
@@ -25,11 +25,11 @@
 //! Формат файла: строка JSON с заголовком (версия + отпечаток), затем одним
 //! значением — сам индекс. Заголовок отдельной строкой читается до разбора
 //! полезной нагрузки: устаревший кэш отбрасывается, не тратя время на разбор
-//! десятков мегабайт.
+//! многих мегабайт.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, UNIX_EPOCH};
 
@@ -48,7 +48,11 @@ pub const DEFAULT_CACHE_FILE_NAME: &str = "platform-index.cache";
 /// полей `Snapshot`, `Fingerprint` или `PlatformIndex`, — иначе старый файл был
 /// бы прочитан как новый и молча дал другой индекс. Отдельно от версии крейта:
 /// та меняется и на правках, к кэшу отношения не имеющих.
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
+
+/// Предел на строку заголовка кэша: файл без переводов строк иначе вычитал бы
+/// в память гигабайты (путь кэша приходит из конфига).
+const MAX_HEADER_BYTES: u64 = 64 * 1024;
 
 /// Откуда взят индекс.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,12 +80,20 @@ pub fn load_cached(hbk: &Path, cache_path: &Path) -> Result<(PlatformIndex, Load
     if let Some(fingerprint) = &fingerprint {
         match read_cache(cache_path, fingerprint) {
             Ok(Some(index)) => {
-                info!(
-                    cache = %cache_path.display(),
-                    elapsed_ms = started.elapsed().as_millis() as u64,
-                    "платформенный индекс загружен из кэша"
+                // Симметрично записи: если hbk заменён между снятием отпечатка
+                // и чтением, кэш уже неактуален — пересобираем.
+                if Fingerprint::of(hbk).ok().as_ref() == Some(fingerprint) {
+                    info!(
+                        cache = %cache_path.display(),
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "платформенный индекс загружен из кэша"
+                    );
+                    return Ok((index, LoadSource::Cache));
+                }
+                warn!(
+                    hbk = %hbk.display(),
+                    "файл платформы изменился между снятием отпечатка и чтением кэша — собираю заново"
                 );
-                return Ok((index, LoadSource::Cache));
             }
             Ok(None) => {}
             Err(e) => {
@@ -157,17 +169,28 @@ fn read_cache(cache_path: &Path, fingerprint: &Fingerprint) -> Result<Option<Pla
 
     let mut reader = BufReader::new(file);
     let mut header_line = String::new();
-    if reader
+    let read = reader
+        .by_ref()
+        .take(MAX_HEADER_BYTES)
         .read_line(&mut header_line)
-        .context("чтение заголовка кэша")?
-        == 0
-    {
+        .context("чтение заголовка кэша")?;
+    if read == 0 {
         return Err(anyhow::anyhow!("файл кэша пуст"));
+    }
+    if !header_line.ends_with('\n') {
+        return Err(anyhow::anyhow!(
+            "заголовок кэша превышает {MAX_HEADER_BYTES} байт или оборван"
+        ));
     }
 
     let header: Header = serde_json::from_str(&header_line).context("разбор заголовка кэша")?;
 
     if header.version != FORMAT_VERSION {
+        return Ok(None);
+    }
+    if header.server_version != env!("CARGO_PKG_VERSION") {
+        // Кэш собран другим бинарём: поля индекса могли измениться без смены
+        // версии формата (правки парсера/маппера) — пересобираем.
         return Ok(None);
     }
     if header.fingerprint != *fingerprint {
@@ -210,6 +233,8 @@ fn write_cache(
         }
     }
 
+    cleanup_stale_tmps(cache_path);
+
     let tmp = tmp_path(cache_path);
     let written = write_cache_tmp(&tmp, fingerprint, index);
     let bytes = match written {
@@ -221,7 +246,7 @@ fn write_cache(
     };
 
     if let Err(e) = fs::rename(&tmp, cache_path) {
-        // Полный, но ненужный файл на 10 МБ в каталоге логов — мусор.
+        // Полный, но ненужный временный файл в каталоге логов — мусор.
         let _ = fs::remove_file(&tmp);
         return Err(anyhow::Error::new(e)).with_context(|| {
             format!(
@@ -242,6 +267,7 @@ fn write_cache_tmp(tmp: &Path, fingerprint: &Fingerprint, index: &PlatformIndex)
 
     let header = Header {
         version: FORMAT_VERSION,
+        server_version: env!("CARGO_PKG_VERSION").to_string(),
         fingerprint: fingerprint.clone(),
     };
     serde_json::to_writer(&mut writer, &header).context("запись заголовка кэша")?;
@@ -249,39 +275,78 @@ fn write_cache_tmp(tmp: &Path, fingerprint: &Fingerprint, index: &PlatformIndex)
     serde_json::to_writer(&mut writer, &SnapshotRef::of(index))
         .context("запись платформенного индекса в кэш")?;
     writer.flush().context("сброс буфера кэша")?;
-    let bytes = writer
-        .into_inner()
-        .context("закрытие файла кэша")?
-        .metadata()
-        .context("размер файла кэша")?
-        .len();
+    let file = writer.into_inner().context("закрытие файла кэша")?;
+    // fsync до rename: переименованный файл не должен оказаться пустым или
+    // частичным при потере питания.
+    file.sync_all().context("fsync временного файла кэша")?;
+    let bytes = file.metadata().context("размер файла кэша")?.len();
     Ok(bytes)
+}
+
+/// Best-effort уборка временных файлов, оставшихся от аварийно убитых
+/// процессов (свои ошибки убирает `write_cache`). Удаляем только файлы
+/// старше часа — временный файл живого писателя трогать нельзя.
+fn cleanup_stale_tmps(cache_path: &Path) {
+    use std::time::{Duration, SystemTime};
+    let Some(dir) = cache_path.parent().filter(|d| !d.as_os_str().is_empty()) else {
+        return;
+    };
+    let Some(base) = cache_path.file_name().and_then(|s| s.to_str()) else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if !name.starts_with(base) || !name.ends_with(".tmp") {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|m| now.duration_since(m).ok())
+            .is_some_and(|age| age > Duration::from_secs(3600));
+        if stale {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Путь временного файла рядом с кэшем: переименование обязано быть атомарным,
 /// а это гарантируется только в пределах одной файловой системы.
 ///
-/// В имени — PID процесса: у двух экземпляров с общим `platform_cache_path`, но
-/// разными `log_dir` (PID-lock их не разводит) временные файлы не совпадут.
+/// В имени — PID и счётчик: временные файлы не совпадут ни у двух процессов
+/// (разные PID), ни у двух потоков одного процесса (разный счётчик).
 fn tmp_path(cache_path: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_TMP: AtomicU64 = AtomicU64::new(1);
+    let n = NEXT_TMP.fetch_add(1, Ordering::Relaxed);
     let mut name = cache_path.as_os_str().to_owned();
-    name.push(format!(".{}.tmp", std::process::id()));
+    name.push(format!(".{}.{}.tmp", std::process::id(), n));
     PathBuf::from(name)
 }
 
-/// Заголовок файла кэша: версия формата + отпечаток hbk.
+/// Заголовок файла кэша: версия формата + версия сборки + отпечаток hbk.
 #[derive(Debug, Serialize, Deserialize)]
 struct Header {
     version: u32,
+    /// Версия сборки, записавшей кэш: правки парсера/маппера меняют содержимое
+    /// индекса без смены структуры — такой кэш обязан быть отброшен.
+    server_version: String,
     fingerprint: Fingerprint,
 }
 
-/// Отпечаток hbk-файла: путь + размер + время изменения.
+/// Отпечаток hbk-файла: путь + размер + время изменения + проба содержимого.
 ///
-/// Хэш содержимого здесь нарочно не считается: 40 МБ на каждом старте — та
-/// самая цена, которую кэш и убирает. Размер и время изменения даёт файловая
-/// система бесплатно, а совпадение обоих у РАЗНЫХ файлов платформы
-/// практически исключено (обновление платформы меняет и то и другое).
+/// Полный хэш 40 МБ на каждом старте — та самая цена, которую кэш и убирает.
+/// Поэтому считаем хэш только первых и последних 4 КиБ: подмена файла той же
+/// длины с сохранённым mtime иначе осталась бы незамеченной.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Fingerprint {
     /// Канонический путь; при недоступности канонизации — как передали.
@@ -289,6 +354,7 @@ struct Fingerprint {
     len: u64,
     mtime_secs: i64,
     mtime_nanos: u32,
+    head_tail_hash: u64,
 }
 
 impl Fingerprint {
@@ -304,8 +370,34 @@ impl Fingerprint {
             len: meta.len(),
             mtime_secs: mtime.map(|d| d.as_secs() as i64).unwrap_or(0),
             mtime_nanos: mtime.map(|d| d.subsec_nanos()).unwrap_or(0),
+            head_tail_hash: content_probe(&hbk_path)?,
         })
     }
+}
+
+/// Хэш содержимого первых и последних 4 КиБ (≈8 КиБ чтения — дёшево).
+fn content_probe(path: &Path) -> Result<u64> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    use std::io::{Read, Seek, SeekFrom};
+
+    const CHUNK: usize = 4096;
+    let mut file = File::open(path).with_context(|| format!("открытие {}", path.display()))?;
+    let mut head = vec![0u8; CHUNK];
+    let n = file.read(&mut head)?;
+    head.truncate(n);
+
+    let mut hasher = DefaultHasher::new();
+    head.hash(&mut hasher);
+    let len = file.metadata().context("размер hbk")?.len();
+    if len > (2 * CHUNK) as u64 {
+        file.seek(SeekFrom::Start(len - CHUNK as u64))?;
+        let mut tail = vec![0u8; CHUNK];
+        let n = file.read(&mut tail)?;
+        tail.truncate(n);
+        tail.hash(&mut hasher);
+    }
+    Ok(hasher.finish())
 }
 
 /// Индекс в кэше (десериализация).
@@ -393,6 +485,7 @@ mod tests {
             return_type: "Число".to_string(),
             signatures: vec![Signature {
                 name: "Основная".to_string(),
+                syntax: "Сообщить(Текст)".to_string(),
                 description: "Описание варианта".to_string(),
                 parameters: vec![Parameter {
                     name: "Текст".to_string(),
@@ -420,6 +513,7 @@ mod tests {
                 return_type: String::new(),
                 signatures: vec![Signature {
                     name: "Основная".to_string(),
+                    syntax: String::new(),
                     description: String::new(),
                     parameters: vec![Parameter {
                         name: "Значение".to_string(),
@@ -438,6 +532,7 @@ mod tests {
             }],
             constructors: vec![Constructor {
                 name: "Массив".to_string(),
+                syntax: "Новый Массив(Фиксированный)".to_string(),
                 description: "Пустой массив".to_string(),
                 parameters: vec![Parameter {
                     name: "Фиксированный".to_string(),
@@ -583,11 +678,31 @@ mod tests {
         let fp = Fingerprint::of(&hbk).unwrap();
         let header = serde_json::json!({
             "version": FORMAT_VERSION + 1,
+            "server_version": env!("CARGO_PKG_VERSION"),
             "fingerprint": serde_json::to_value(&fp).unwrap(),
         });
         fs::write(&cache, format!("{header}\n{{}}\n")).expect("запись кэша");
 
         assert!(read_cache(&cache, &fp).expect("чтение").is_none());
+    }
+
+    #[test]
+    fn foreign_server_version_discarded() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let hbk = fake_hbk(dir.path());
+        let cache = dir.path().join(DEFAULT_CACHE_FILE_NAME);
+        let fp = Fingerprint::of(&hbk).unwrap();
+        let header = serde_json::json!({
+            "version": FORMAT_VERSION,
+            "server_version": "0.0.0-other-build",
+            "fingerprint": serde_json::to_value(&fp).unwrap(),
+        });
+        fs::write(&cache, format!("{header}\n{{}}\n")).expect("запись кэша");
+
+        assert!(
+            read_cache(&cache, &fp).expect("чтение").is_none(),
+            "кэш чужой сборки обязан быть отброшен"
+        );
     }
 
     #[test]

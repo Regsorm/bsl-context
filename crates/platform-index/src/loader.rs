@@ -8,8 +8,8 @@
 //! Все типы (обычные и перечисления) складываются в одну `HashMap` по `name_ru`.
 //!
 //! Разбор страниц перечислений и типов распараллелен (rayon): это основная
-//! цена сборки — замер на 8.3.27 даёт ~2,3 с из ~3,5 с на одном потоке и
-//! ~0,5 с на двенадцати. Чтение страницы из zip требует `&mut HbkContent`,
+//! цена сборки — на hbk 8.3.20 замер дал ~3,4–5,1 с на одном потоке и
+//! ~1,1–1,2 с на двенадцати. Чтение страницы из zip требует `&mut HbkContent`,
 //! поэтому контент живёт под `Mutex`, а блокировка берётся на время ОДНОЙ
 //! страницы и снимается до разбора html (см. [`LockedSource`]) — иначе потоки
 //! выстроились бы в очередь на весь проход и распараллеливание не дало бы
@@ -41,10 +41,12 @@ struct LockedSource<'a, 'b>(&'a Mutex<&'b mut HbkContent>);
 
 impl HtmlSource for LockedSource<'_, '_> {
     fn read_html(&mut self, html_path: &str) -> Option<String> {
+        // Отравленную блокировку игнорируем: причину паники потока уже видели
+        // выше, а отказ здесь лишь замаскировал бы её исходной ошибкой.
         let mut guard = self
             .0
             .lock()
-            .expect("блокировка HbkContent отравлена паникой потока");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.read_html(html_path)
     }
 }
@@ -105,6 +107,7 @@ pub fn build_index(content: &mut HbkContent) -> Result<PlatformIndex> {
     for root in &roots.enums {
         drill_down(root, &mut enum_pages);
     }
+    dedup_pages(&mut enum_pages);
     // `collect` у rayon сохраняет порядок исходной последовательности, поэтому
     // вставка ниже идёт в порядке TOC независимо от планировщика.
     let enum_infos: Vec<Option<EnumInfo>> = enum_pages
@@ -127,6 +130,12 @@ pub fn build_index(content: &mut HbkContent) -> Result<PlatformIndex> {
     for root in &roots.types {
         drill_down(root, &mut type_pages);
     }
+    dedup_pages(&mut type_pages);
+    // «Таблицы запросов» (`/tables/...`) — справочник ПОЛЕЙ таблиц языка
+    // запросов («<Имя ресурса>», «ВедущаяЗадача», …), а не типы платформы:
+    // в индекс такие страницы не берём, иначе search/get_member наполняются
+    // мусорными «типами» без членов.
+    type_pages.retain(|p| !p.html_path.contains("/tables/"));
     let type_infos: Vec<Option<ObjectInfo>> = type_pages
         .par_iter()
         .map(|page| visit_type_page(&mut LockedSource(&content), page))
@@ -149,4 +158,12 @@ pub fn build_index(content: &mut HbkContent) -> Result<PlatformIndex> {
         "PlatformIndex собран"
     );
     Ok(index)
+}
+
+/// Убрать повторяющиеся `html_path` (TOC иногда ссылается на страницу дважды),
+/// сохранив порядок первого появления: иначе страница читается и парсится
+/// повторно.
+fn dedup_pages(pages: &mut Vec<&hbk_reader::Page>) {
+    let mut seen = std::collections::HashSet::new();
+    pages.retain(|p| seen.insert(p.html_path.as_str()));
 }

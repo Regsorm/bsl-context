@@ -80,6 +80,12 @@ fn is_catalog_page(page: &Page) -> bool {
 pub fn drill_down<'a>(base: &'a Page, out: &mut Vec<&'a Page>) {
     for child in &base.children {
         if child.html_path.is_empty() {
+            // Узел-группировка без собственной страницы («Таблицы запросов»
+            // с 59 листьями): под ним лежат настоящие страницы — идём внутрь,
+            // иначе теряются целые типы.
+            if !child.children.is_empty() {
+                drill_down(child, out);
+            }
             continue;
         }
         if is_catalog_page(child) {
@@ -132,7 +138,12 @@ fn try_read_html(content: &mut HbkContent, html_path: &str) -> Option<String> {
     }
     match content.get_entry_text(html_path) {
         Ok(text) => Some(text),
-        Err(hbk_reader::HbkError::HtmlEntryNotFound(_)) => None,
+        Err(hbk_reader::HbkError::HtmlEntryNotFound(_)) => {
+            // Штатно это каталог без html, но бывает и битый путь TOC: debug —
+            // чтобы такие потери были видны при отладке, не засоряя журнал.
+            tracing::debug!(page = html_path, "страница не найдена в FileStorage");
+            None
+        }
         Err(e) => {
             tracing::warn!(
                 error = %e,
@@ -144,20 +155,55 @@ fn try_read_html(content: &mut HbkContent, html_path: &str) -> Option<String> {
     }
 }
 
-/// Распарсить страницу системного перечисления + значения из её детей `/properties/`.
+/// Распарсить страницу системного перечисления + значения из потомков `/properties/`.
 pub fn visit_enum_page<H: HtmlSource>(content: &mut H, page: &Page) -> Option<EnumInfo> {
     let html = content.read_html(&page.html_path)?;
     let mut info = parse_enum_page(&html);
 
-    for child in &page.children {
-        if !child.html_path.contains("/properties/") {
+    // Значения — все потомки с `/properties/`: у части перечислений они лежат
+    // под пустым узлом-группировкой «Свойства» (5 перечислений, 28 значений
+    // в 8.3.27 — раньше терялись).
+    let mut value_pages = Vec::new();
+    collect_property_descendants(page, &mut value_pages);
+    let mut seen_html = std::collections::HashSet::new();
+    for child in value_pages {
+        if !seen_html.insert(child.html_path.as_str()) {
             continue;
         }
         if let Some(child_html) = content.read_html(&child.html_path) {
             info.values.push(parse_enum_value_page(&child_html));
         }
     }
+    if info.values.is_empty() {
+        tracing::warn!(
+            page = %page.html_path,
+            name = %page.title.ru,
+            "у страницы-перечисления не найдено ни одного значения"
+        );
+    }
     Some(info)
+}
+
+/// Все потомки с `/properties/` в пути — включая проход через узлы-группировки
+/// без собственной html-страницы.
+fn collect_property_descendants<'a>(page: &'a Page, out: &mut Vec<&'a Page>) {
+    for child in &page.children {
+        if child.html_path.contains("/properties/") {
+            out.push(child);
+        }
+        if child.html_path.is_empty() || child.html_path.contains("/properties/") {
+            collect_property_descendants(child, out);
+        }
+    }
+}
+
+/// Отображаемое имя узла TOC: русское, при пустом — английское.
+fn page_label(page: &Page) -> &str {
+    if !page.title.ru.is_empty() {
+        page.title.ru.as_str()
+    } else {
+        page.title.en.as_str()
+    }
 }
 
 /// Распарсить страницу типа (объекта) + properties/methods/constructors из дочерних разделов.
@@ -171,11 +217,7 @@ pub fn visit_type_page<H: HtmlSource>(content: &mut H, page: &Page) -> Option<Ob
     let mut info = parse_object_page(&html);
 
     for sub in &page.children {
-        let label = if !sub.title.ru.is_empty() {
-            sub.title.ru.as_str()
-        } else {
-            sub.title.en.as_str()
-        };
+        let label = page_label(sub);
         match label {
             "Свойства" => info.properties = visit_properties_page(content, sub),
             "Методы" => info.methods = visit_methods_page(content, sub),
@@ -193,7 +235,7 @@ pub fn visit_properties_page<H: HtmlSource>(content: &mut H, page: &Page) -> Vec
         if !child.html_path.contains("/properties/") {
             continue;
         }
-        if child.title.ru.starts_with('<') {
+        if child.title.ru.starts_with('<') || child.title.en.starts_with('<') {
             // Апстрим фильтрует псевдо-имена в угловых скобках (например, `<Свойство>`).
             continue;
         }
@@ -236,18 +278,45 @@ pub fn visit_constructors_page<H: HtmlSource>(
     out
 }
 
-/// Глобальные методы: дочерние страницы у `Global context` с путём `/methods/`.
-/// Каждая такая страница — это раздел-каталог с настоящими методами внутри.
+/// Глобальные методы: разделы-каталоги `Global context` с путём `/methods/`
+/// (реальные методы — в их детях), а также прямые дети-методы.
 pub fn collect_global_methods<H: HtmlSource>(content: &mut H, global: &Page) -> Vec<MethodInfo> {
     let mut out = Vec::new();
     for child in &global.children {
-        if !child.html_path.contains("/methods/") {
+        if child.html_path.is_empty() {
             continue;
         }
-        // Это раздел («Функции работы со строками» и т.п.); реальные методы — в его детях.
-        out.extend(visit_methods_page(content, child));
+        if child.html_path.contains("/methods/") {
+            // Это раздел («Функции работы со строками» и т.п.); реальные методы — в его детях.
+            out.extend(visit_methods_page(content, child));
+            continue;
+        }
+        if page_label(child) == "Свойства" {
+            continue; // раздел свойств глобального контекста — не методы
+        }
+        // 8.5.1: некоторые методы — прямые дети Global context, и путь TOC
+        // указывает на страницу без сегмента `/methods/`, тогда как entry в
+        // архиве лежит в `/methods/`. Пробуем оба варианта.
+        let mut html = content.read_html(&child.html_path);
+        if html.is_none() {
+            html = content.read_html(&insert_methods_segment(&child.html_path));
+        }
+        if let Some(html) = html {
+            let info = parse_method_page(&html);
+            if !info.signatures.is_empty() {
+                out.push(info);
+            }
+        }
     }
     out
+}
+
+/// `/objects/Global context/Name.html` → `/objects/Global context/methods/Name.html`.
+fn insert_methods_segment(html_path: &str) -> String {
+    match html_path.rsplit_once('/') {
+        Some((dir, file)) => format!("{dir}/methods/{file}"),
+        None => html_path.to_string(),
+    }
 }
 
 /// Глобальные свойства: подстраница «Свойства» у `Global context`, в её детях — реальные свойства.
@@ -256,12 +325,7 @@ pub fn collect_global_properties<H: HtmlSource>(
     global: &Page,
 ) -> Vec<PropertyInfo> {
     for child in &global.children {
-        let label = if !child.title.ru.is_empty() {
-            child.title.ru.as_str()
-        } else {
-            child.title.en.as_str()
-        };
-        if label == "Свойства" {
+        if page_label(child) == "Свойства" {
             return visit_properties_page(content, child);
         }
     }

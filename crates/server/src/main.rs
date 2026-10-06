@@ -4,12 +4,20 @@
 //! Дальнейшие фазы добавляют hbk-парсер, индекс, MCP-tools.
 
 use clap::{Parser, ValueEnum};
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use tracing::{error, info};
 
+use anyhow::Context as _;
+use std::future::IntoFuture as _;
+
 use bsl_context_server::sources::build_symbol_source;
 use bsl_context_server::{config, http, mcp_server, pid_lock};
+
+/// Предел ожидания graceful shutdown: после сигнала даём in-flight запросам
+/// столько секунд, затем выходим принудительно (иначе долгий rebuild,
+/// держащий source-лок, не давал бы остановиться).
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Транспорт MCP.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -102,20 +110,28 @@ async fn main() -> anyhow::Result<()> {
     // Источники имён конфигураций (по одному на конфигурацию, у каждого свой способ
     // доступа). Ошибка создания конкретного источника не валит сервер: предупреждение
     // в лог, валидация по этой конфигурации пойдёт без знания её имён.
-    let source_slots: Vec<_> = cfg
-        .resolved_symbol_sources()?
-        .into_iter()
-        .map(|(name, sc)| {
-            let built = build_symbol_source(&sc);
-            if let Err(msg) = &built {
-                // Причину надо и в журнал, и в слот: инструмент
-                // symbol_sources_status отдаёт её вызывающему, не заставляя
-                // читать логи сервера.
-                error!(source = %name, error = %msg, "источник имён конфигурации не подключён");
-            }
-            (name, sc, built)
-        })
-        .collect();
+    //
+    // Сборка идёт в spawn_blocking: code_index_mcp делает синхронный сетевой I/O
+    // (initialize), и недоступный code-index иначе заблокировал бы tokio-воркер
+    // на timeout_ms ещё до подъёма транспорта и /health.
+    let resolved_sources = cfg.resolved_symbol_sources()?;
+    let source_slots = tokio::task::spawn_blocking(move || {
+        resolved_sources
+            .into_iter()
+            .map(|(name, sc)| {
+                let built = build_symbol_source(&sc);
+                if let Err(msg) = &built {
+                    // Причину надо и в журнал, и в слот: инструмент
+                    // symbol_sources_status отдаёт её вызывающему, не заставляя
+                    // читать логи сервера.
+                    error!(source = %name, error = %msg, "источник имён конфигурации не подключён");
+                }
+                (name, sc, built)
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("задача сборки источников имён упала: {e}"))?;
     info!(
         sources = ?source_slots.iter().map(|(n, _, _)| n.as_str()).collect::<Vec<_>>(),
         "конфигурации, доступные параметру repo"
@@ -156,26 +172,63 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.transport {
         Transport::Http => {
-            let addr: SocketAddr = format!("{}:{}", cfg.host, cfg.port).parse()?;
+            // Учитываем и имена хостов, и IPv6-литералы: формат "host:port"
+            // парсился только для IPv4, и `localhost`/`::1` (оба есть в дефолтных
+            // allowed_hosts) роняли старт «invalid socket address syntax».
+            let addr = http_addr(&cfg)?;
             let app = http::router(cfg.clone(), server);
 
-            let listener = tokio::net::TcpListener::bind(addr).await?;
+            let listener = tokio::net::TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("не удалось забиндиться на {addr}"))?;
             info!(%addr, "listening");
 
-            if let Err(e) = axum::serve(listener, app)
-                .with_graceful_shutdown(shutdown_signal())
-                .await
-            {
-                error!(error = %e, "server stopped with error");
-                return Err(e.into());
+            // Graceful shutdown с пределом по времени: in-flight запрос может
+            // ждать source-лок, который держит долгий rebuild.
+            let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
+            let serve = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    shutdown_signal().await;
+                    let _ = signal_tx.send(());
+                })
+                .into_future();
+            tokio::pin!(serve);
+            let grace = async {
+                let _ = signal_rx.await;
+                tokio::time::sleep(SHUTDOWN_GRACE).await;
+            };
+            tokio::select! {
+                result = &mut serve => {
+                    if let Err(e) = result {
+                        error!(error = %e, "server stopped with error");
+                        return Err(e.into());
+                    }
+                    info!("graceful shutdown complete");
+                }
+                _ = grace => {
+                    tracing::warn!(
+                        "graceful shutdown не завершился за {} с — завершаю процесс",
+                        SHUTDOWN_GRACE.as_secs()
+                    );
+                }
             }
-            info!("graceful shutdown complete");
         }
         Transport::Stdio => {
             serve_stdio(server).await?;
         }
     }
     Ok(())
+}
+
+/// Адрес HTTP-сервера из конфига: имя хоста или IP (включая IPv6).
+///
+/// Ошибка разрешения — фатальная: бессмысленно грузить индекс, если сервер
+/// всё равно не сможет забиндиться.
+fn http_addr(cfg: &config::Config) -> anyhow::Result<SocketAddr> {
+    (cfg.host.as_str(), cfg.port)
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("host='{}' не разрешился ни в один адрес", cfg.host))
 }
 
 async fn load_platform_index(
@@ -191,13 +244,32 @@ async fn load_platform_index(
             Some(hbk) => {
                 info!(?hbk, "загрузка платформенного индекса");
                 let cache_path = cfg.platform_cache_path_effective();
-                let (index, loaded_from) = tokio::task::spawn_blocking(move || match cache_path {
-                    Some(cache_path) => platform_index::load_cached(&hbk, &cache_path),
-                    None => platform_index::load_from_hbk(&hbk)
-                        .map(|index| (index, platform_index::LoadSource::Hbk)),
+                let hbk_for_load = hbk.clone();
+                let (loaded, hbk) = tokio::task::spawn_blocking(move || {
+                    let result = match cache_path {
+                        Some(cache_path) => platform_index::load_cached(&hbk_for_load, &cache_path),
+                        None => platform_index::load_from_hbk(&hbk_for_load)
+                            .map(|index| (index, platform_index::LoadSource::Hbk)),
+                    };
+                    (result, hbk_for_load)
                 })
                 .await
-                .map_err(|e| anyhow::anyhow!("задача загрузки индекса упала: {e}"))??;
+                .map_err(|e| anyhow::anyhow!("задача загрузки индекса упала: {e}"))?;
+                let (index, loaded_from) = match loaded {
+                    Ok(loaded) => loaded,
+                    // Битый или частично скопированный hbk — проблема данных, а не
+                    // повод не стартовать: политика сервера (см. ниже) — служебные
+                    // инструменты и /health работают, справочные отвечают отказом.
+                    Err(e) => {
+                        let reason = format!("не удалось прочитать '{}': {e}", hbk.display());
+                        tracing::warn!(
+                            error = %e,
+                            hbk = ?hbk,
+                            "платформенный индекс не собран — сервер стартует без него"
+                        );
+                        return Ok(Err(reason));
+                    }
+                };
                 info!(
                     loaded_from = ?loaded_from,
                     types = index.types.len(),
@@ -332,14 +404,23 @@ async fn shutdown_signal() {
     let ctrl_c = async {
         if let Err(e) = tokio::signal::ctrl_c().await {
             error!(error = %e, "failed to install Ctrl+C handler");
+            // Ошибка установки обработчика НЕ должна выглядеть как сигнал:
+            // иначе select! немедленно запустит graceful shutdown на старте.
+            std::future::pending::<()>().await;
         }
     };
 
     #[cfg(unix)]
     let terminate = async {
         use tokio::signal::unix::{signal, SignalKind};
-        if let Ok(mut s) = signal(SignalKind::terminate()) {
-            s.recv().await;
+        match signal(SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(e) => {
+                error!(error = %e, "failed to install SIGTERM handler");
+                std::future::pending::<()>().await;
+            }
         }
     };
 

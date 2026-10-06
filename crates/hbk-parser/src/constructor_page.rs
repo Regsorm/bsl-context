@@ -4,12 +4,11 @@
 //! «Примечание:».
 //!
 //! Порт `ConstructorPageParser.kt`. Имя конструктора берётся из «головы»
-//! страницы (NameBlockHandler) — у апстрима в `getResult` берётся только
-//! `nameRu` (`first` из пары), но это не всегда совпадает с привычным
-//! «Создать-стиль» именованием. Сохраняем `nameRu` как имя.
+//! страницы (NameBlockHandler); английская форма титула (`p.V8SH_title`
+//! «Тип (TypeEn)») сохраняется в `name_en`.
 
 use crate::blocks::{
-    parse_description, parse_example, parse_head_name, parse_note, parse_parameters,
+    non_empty, parse_description, parse_example, parse_head_name, parse_note, parse_parameters,
     parse_related_objects, parse_syntax,
 };
 use crate::html::split_chapters;
@@ -19,7 +18,7 @@ pub fn parse_constructor_page(html: &str) -> ConstructorInfo {
     let chapters = split_chapters(html);
 
     let head_html = chapters.first().map(|c| c.body_html.as_str()).unwrap_or("");
-    let (name_ru, _name_en) = parse_head_name(head_html);
+    let (name_ru, name_en) = parse_head_name(head_html);
 
     let mut syntax = String::new();
     let mut parameters = Vec::new();
@@ -33,17 +32,27 @@ pub fn parse_constructor_page(html: &str) -> ConstructorInfo {
             "Синтаксис:" => syntax = parse_syntax(&ch.body_html),
             "Параметры:" => parameters = parse_parameters(&ch.body_html),
             "Описание:" => description = parse_description(&ch.body_html),
-            "Пример:" => example = Some(parse_example(&ch.body_html)),
+            "Пример:" => example = non_empty(parse_example(&ch.body_html)),
             "См. также:" => related = parse_related_objects(&ch.body_html),
-            "Примечание:" => note = Some(parse_note(&ch.body_html)),
+            "Примечание:" => note = non_empty(parse_note(&ch.body_html)),
             "Доступность:" | "Использование в версии:" | "Использование в интерфейсе:" =>
-                {}
-            _ => {}
+            {
+                // Известные главы, ничего не дающие правилам.
+            }
+            _ => {
+                if !ch.title.is_empty() {
+                    tracing::warn!(
+                        chapter = ch.title,
+                        "неизвестная глава страницы конструктора"
+                    );
+                }
+            }
         }
     }
 
     ConstructorInfo {
         name: name_ru,
+        name_en,
         syntax,
         parameters,
         description,

@@ -1,6 +1,11 @@
 //! Маппинг `*Info` → доменные сущности.
 //!
-//! Главное отличие от апстрима ([`upstream/.../persistent/storage/Mapper.kt`]):
+//! Проекция узкая: переносятся имена, описания, типы, параметры и синтаксис;
+//! `note`/`example`/`related_objects` и описание возвращаемого значения в домен
+//! пока не попадают (см. `entities`).
+//!
+//! Отношения к апстриму (`upstream/.../persistent/storage/Mapper.kt`, вне
+//! репозитория):
 //! - `MethodInfo → Method` сохраняет полный `signatures` (апстрим теряет: `signature = emptyList()`).
 //! - `ObjectInfo → Type` переносит реальные `constructors` (апстрим всегда `emptyList()`).
 //! - `EnumInfo → Type` переносит `enum_values` (у апстрима этого пути нет — `EnumInfo` теряется).
@@ -39,6 +44,7 @@ pub fn property_from(info: &PropertyInfo) -> Property {
 pub fn signature_from(info: &MethodSignatureInfo) -> Signature {
     Signature {
         name: info.name.clone(),
+        syntax: info.syntax.clone(),
         description: info.description.clone(),
         parameters: info.parameters.iter().map(parameter_from).collect(),
     }
@@ -56,6 +62,7 @@ pub fn parameter_from(info: &MethodParameterInfo) -> Parameter {
 pub fn constructor_from(info: &ConstructorInfo) -> Constructor {
     Constructor {
         name: info.name.clone(),
+        syntax: info.syntax.clone(),
         description: info.description.clone(),
         parameters: info.parameters.iter().map(parameter_from).collect(),
     }

@@ -3,14 +3,26 @@
 
 use std::sync::Arc;
 
-use axum::{extract::State, response::Json, routing::get, Router};
+use axum::{
+    extract::{Request, State},
+    http::StatusCode,
+    middleware::{self, Next},
+    response::{IntoResponse, Json, Response},
+    routing::get,
+    Router,
+};
 use rmcp::transport::streamable_http_server::{
     session::never::NeverSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
 use serde::Serialize;
+use tower_http::limit::RequestBodyLimitLayer;
 
 use crate::config::Config;
 use crate::mcp_server::BslContextServer;
+
+/// Предел размера тела запроса MCP-кадра. rmcp читает тело без границы
+/// (`body.collect()`), поэтому без явного лимита один клиент выедал бы память.
+const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -58,8 +70,16 @@ struct HealthResponse {
 /// Собрать роутер: /health и /mcp через Streamable HTTP при любом состоянии индекса.
 pub fn router(config: Config, server: BslContextServer) -> Router {
     // Список разрешённых Host для /mcp (защита rmcp от DNS-rebinding). Клонируем
-    // до перемещения config в AppState.
-    let allowed_hosts = config.allowed_hosts.clone();
+    // до перемещения config в AppState; тот же список проверяем middleware'ом
+    // на ВСЕХ маршрутах (/health rmcp не прикрывает).
+    //
+    // Пустой список rmcp трактует как «разрешить ЛЮБОЙ Host» — подстраховываемся
+    // и здесь, не полагаясь только на загрузчик конфига: `router` публичный.
+    let mut allowed_hosts = config.allowed_hosts.clone();
+    if allowed_hosts.is_empty() {
+        allowed_hosts = Config::default().allowed_hosts;
+    }
+    let allowed_for_guard = Arc::new(allowed_hosts.clone());
     let index_stats = server.index_loaded().then(|| IndexStats {
         global_methods: server.index.global_methods.len(),
         global_properties: server.index.global_properties.len(),
@@ -86,7 +106,45 @@ pub fn router(config: Config, server: BslContextServer) -> Router {
     Router::new()
         .route("/health", get(health))
         .nest_service("/mcp", http_service)
+        // Host проверяем на всех маршрутах: rmcp валидирует только /mcp, а
+        // /health отдаёт локальные пути и легко читается через DNS-rebinding.
+        .layer(middleware::from_fn_with_state(
+            allowed_for_guard,
+            host_guard,
+        ))
+        .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BYTES))
         .with_state(state)
+}
+
+/// Проверка заголовка `Host` по списку `allowed_hosts` для всех маршрутов.
+///
+/// Отсутствующий Host пропускаем (HTTP/1.0 и не-браузерные клиенты); браузерный
+/// DNS-rebinding всегда шлёт Host, и именно его мы отклоняем.
+async fn host_guard(State(allowed): State<Arc<Vec<String>>>, req: Request, next: Next) -> Response {
+    let allowed_ok = req
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .is_none_or(|host| host_is_allowed(host, &allowed));
+    if !allowed_ok {
+        return (StatusCode::FORBIDDEN, "Host header is not allowed").into_response();
+    }
+    next.run(req).await
+}
+
+/// Разрешён ли `Host`-заголовок. Запись без порта разрешает любой порт хоста;
+/// поддержаны имена хостов, IPv4 и bracketed IPv6 (`[::1]:8007`).
+fn host_is_allowed(host_header: &str, allowed: &[String]) -> bool {
+    let header_lc = host_header.to_ascii_lowercase();
+    let bare = if let Some(rest) = header_lc.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else {
+        header_lc.split(':').next().unwrap_or("")
+    };
+    allowed.iter().any(|entry| {
+        let entry = entry.to_ascii_lowercase();
+        entry == header_lc || entry == bare
+    })
 }
 
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {

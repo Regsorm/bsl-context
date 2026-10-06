@@ -18,7 +18,7 @@
 //!
 //! Имя разрешается в член контекста только тогда, когда оно нигде не связано
 //! локально. Наивная проверка давала 412 находок высокой уверенности, из них
-//! настоящих — единицы; остальное отсекают четыре условия:
+//! настоящих — единицы; остальное отсекают условия:
 //!
 //! 1. **Параметр процедуры** (`Процедура Обработчик(Знач Результат, Параметры)`).
 //!    Параметр — локальное имя, оно перекрывает член контекста; присваивание ему
@@ -31,6 +31,10 @@
 //! 4. **Свойство, доступное для записи** (`Заголовок`, `Модифицированность`).
 //!    Присваивание ему компилируется и работает — это штатный способ управлять
 //!    формой, а не ошибка (5294 места на УТ).
+//! 5. **Объявление `Перем`** — само создаёт локальное имя и перекрывает
+//!    контекст (сверено с bsl-analyzer: declared binding законен).
+//! 6. **Переменная цикла** (`Для Каждого Параметры Из …`) — связывает имя так
+//!    же, как параметр.
 //!
 //! Метод формы имя тоже НЕ занимает: реквизит формы можно назвать как метод, и
 //! платформа разводит данные и вызов (`Закрыть = Ложь;` и `Закрыть();` в соседних
@@ -148,10 +152,10 @@ fn form_property_type(index: &PlatformIndex, name_lower: &str) -> Option<String>
 /// `Элементы`, `Команды`, …). Проверяется первым — член формы приоритетнее
 /// глобального свойства с тем же именем.
 ///
-/// Оба правила молчат, если имя связано локально: это параметр процедуры либо
-/// объявленная в ней (или в модуле) переменная `Перем`. Правило B, кроме того,
-/// не применяется в процедурах «БезКонтекста» и в обычных формах — подробности
-/// в описании модуля.
+/// Оба правила молчат, если имя связано локально: параметр процедуры,
+/// переменная `Перем` (включая само объявление) либо переменная цикла.
+/// Правило B, кроме того, не применяется в процедурах «БезКонтекста» и в
+/// обычных формах — подробности в описании модуля.
 ///
 /// `form_attributes` — имена реквизитов формы (нижний регистр), если вызывающий
 /// их знает. Реквизит перекрывает имя контекста, поэтому такие имена из проверки
@@ -182,27 +186,30 @@ pub(crate) fn check_shadowed_context_names(
         let name_lower = fact.name.to_lowercase();
         let scope = scope_of(facts, fact.byte);
 
-        // Присваивание имени, связанному локально (параметр или `Перем`), —
-        // законно: локальное имя перекрывает член контекста. Само объявление
-        // `Перем` при этом проверяется: оно и есть попытка занять чужое имя.
-        if !fact.declaration && is_bound_locally(facts, scope, &module_vars, &name_lower) {
+        // Локально связанное имя законно: параметр, `Перем` (само объявление
+        // тоже создаёт локальное имя и перекрывает контекст — сверено с
+        // bsl-analyzer), переменная цикла.
+        if is_bound_locally(facts, scope, &module_vars, &name_lower) {
             continue;
         }
 
         // Реквизит формы тоже перекрывает имя контекста — и свойство, и метод
         // (в УТ есть формы с реквизитами `Метаданные`, `БезопасноеХранилище`,
-        // `Закрыть`). Знаем состав реквизитов — имя из него законно.
-        if form_attributes.is_some_and(|attrs| attrs.contains(&name_lower)) {
+        // `Закрыть`). Знаем состав реквизитов — имя из него законно. В
+        // процедуре «БезКонтекста» реквизитов формы не существует — там
+        // реквизит ничего не перекрывает.
+        let in_no_context = scope.is_some_and(|s| s.no_context);
+        if !in_no_context && form_attributes.is_some_and(|attrs| attrs.contains(&name_lower)) {
             continue;
         }
 
-        if managed_form && !scope.is_some_and(|s| s.no_context) {
+        if managed_form && !in_no_context {
             if let Some(form_type) = index.find_type(FORM_TYPE) {
-                if form_type
-                    .properties
-                    .iter()
-                    .any(|p| p.readonly && p.name_ru.to_lowercase() == name_lower)
-                {
+                if form_type.properties.iter().any(|p| {
+                    p.readonly
+                        && (p.name_ru.to_lowercase() == name_lower
+                            || (!p.name_en.is_empty() && p.name_en.to_lowercase() == name_lower))
+                }) {
                     emit(
                         errors,
                         src,
@@ -222,8 +229,7 @@ pub(crate) fn check_shadowed_context_names(
         // состав реквизитов передан (имена из него отсеяны выше) либо если
         // процедура помечена «БезКонтекста»: реквизитов формы там нет, а
         // глобальный контекст есть.
-        let global_visible =
-            !form_module || form_attributes.is_some() || scope.is_some_and(|s| s.no_context);
+        let global_visible = !form_module || form_attributes.is_some() || in_no_context;
         if global_visible
             && index
                 .find_global_property(&fact.name)
@@ -255,6 +261,12 @@ fn is_bound_locally(
     if module_vars.iter().any(|n| n.to_lowercase() == name_lower) {
         return true;
     }
+    // Переменная цикла (`Для Каждого X Из …`, `Для X = …`) тоже связывает
+    // имя; в facts у неё нет позиции, поэтому проверяем по имени (как в
+    // config_objects::locally_bound_names).
+    if facts.loop_vars.contains(name_lower) {
+        return true;
+    }
     let Some(scope) = scope else {
         return false;
     };
@@ -274,19 +286,11 @@ fn is_bound_locally(
 /// совпадения имён отсечены выше.
 fn emit(errors: &mut Vec<ExprError>, src: &str, fact: &AssignFact, member_kind: &str) {
     let (line, col) = pos_at(src, fact.byte);
-    let message = if fact.declaration {
-        format!(
-            "Имя '{}' занято {}. Объявление 'Перем {}' конфликтует с контекстом модуля: имя \
-             разрешается в член контекста, а не в локальную переменную. Переименуйте переменную.",
-            fact.name, member_kind, fact.name
-        )
-    } else {
-        format!(
-            "Имя '{}' занято {}: локальная переменная не создастся, присваивание упадёт в \
-             рантайме («Поле объекта недоступно для записи»). Переименуйте переменную.",
-            fact.name, member_kind
-        )
-    };
+    let message = format!(
+        "Имя '{}' занято {}: локальная переменная не создастся, присваивание упадёт в \
+         рантайме («Поле объекта недоступно для записи»). Переименуйте переменную.",
+        fact.name, member_kind
+    );
     errors.push(ExprError::new_with_confidence(
         line,
         col,
@@ -550,18 +554,32 @@ mod tests {
     }
 
     #[test]
-    fn var_declaration_of_context_name_is_reported_once() {
-        // Объявление `Перем` — сама попытка занять чужое имя: находка на нём.
-        // Присваивание ниже уже связано этим объявлением и второй находки не даёт.
+    fn var_declaration_of_context_name_is_silent() {
+        // `Перем` сам создаёт локальное имя и перекрывает контекст
+        // (сверено с bsl-analyzer: declared binding — законно), поэтому
+        // ни объявление, ни присваивание после него находок не дают.
         let errors = shadowed(
             "&НаСервере\nПроцедура Т()\nПерем Параметры;\nПараметры = Новый Структура;\nКонецПроцедуры\n",
             true,
         );
-        assert_eq!(errors.len(), 1, "{:?}", errors);
-        assert!(
-            errors[0].message.contains("Перем"),
-            "{:?}",
-            errors[0].message
+        assert!(errors.is_empty(), "{:?}", errors);
+    }
+
+    #[test]
+    fn loop_variable_frees_the_name() {
+        let errors = shadowed(
+            "&НаСервере\nПроцедура Т()\nДля Каждого Параметры Из Массив Цикл\nПараметры = Новый Структура;\nКонецЦикла;\nКонецПроцедуры\n",
+            true,
         );
+        assert!(errors.is_empty(), "{:?}", errors);
+    }
+
+    #[test]
+    fn form_property_name_matches_english_too() {
+        let errors = shadowed(
+            "&НаСервере\nПроцедура Т()\nParameters = Новый Структура;\nКонецПроцедуры\n",
+            true,
+        );
+        assert_eq!(errors.len(), 1, "{:?}", errors);
     }
 }

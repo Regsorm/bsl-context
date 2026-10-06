@@ -1,7 +1,9 @@
-//! BSL-валидатор.
+//! BSL-валидатор: проверки кода и платформенного контекста.
 //!
-//! Phase 5 — точечные проверки `validateEnum` и `validateMethodCall` без парсера.
-//! Phase 6 (отдельный модуль `expression`) — `validateExpression` через tree-sitter.
+//! Уровни: точечные `validate_enum`/`validate_method_call`; выражение
+//! (`validate_expression`) с разбором дерева; целый модуль (`validate_module*`)
+//! — объявления, директивы, теней контекста, правила запросов и выражения.
+//! Разбор BSL вынесен в крейт `bsl-parse`.
 
 pub mod blocks;
 pub mod check;
@@ -23,7 +25,7 @@ pub mod symbols;
 pub use bsl_parse::{module_declarations, module_declarations_split, normalize_for_parser};
 pub mod ast {
     //! Совместимость: разбор переехал в крейт `bsl-parse`.
-    pub use bsl_parse::normalize_for_parser;
+    pub use bsl_parse::{collect_facts, normalize_for_parser};
 }
 pub use check::{
     validate_enum, validate_method_call, EnumValidation, MethodCallValidation, SignatureBrief,
@@ -39,5 +41,5 @@ pub use module::{
     validate_module_with_profile, validate_module_with_symbols,
     validate_module_with_symbols_and_form_kind,
 };
-pub use scope::{extract_scope_map, extract_type_annotations, Scope, ScopeMap};
+pub use scope::{extract_scope_map, extract_type_annotations, Scope, ScopeMap, VarBinding};
 pub use symbols::{ObjectField, ObjectSchema, SymbolSource};

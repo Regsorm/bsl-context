@@ -1,14 +1,32 @@
 //! Markdown-форматтер для ответов MCP-tools.
 //!
-//! Порт `MarkdownFormatterService.kt`. Формат соблюдён 1:1 с апстримом, чтобы
-//! модель видела привычный layout.
+//! Порт `MarkdownFormatterService.kt` (вне репозитория). Отличия от старого
+//! вывода: типы рендерятся code-span'ами (в т.ч. каждый компонент составного
+//! типа), в блоке ```bsl``` печатается авторитетный синтаксис со страницы
+//! (если он есть), пустые значения не дают пустых code-span'ов.
 
 use std::fmt::Write;
 
 use crate::entities::{Constructor, Definition, EnumValue, Method, Property, Signature, Type};
 
+/// Тип (в т.ч. составной `A,B`) → markdown-code-span по каждому компоненту.
+fn render_type(type_name: &str) -> String {
+    type_name
+        .split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(|p| format!("`{p}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Однострочить текст для list-item/заголовка: переводы строк ломают разметку.
+fn inline_line(s: &str) -> String {
+    s.replace(['\r', '\n'], " ")
+}
+
 pub fn format_query_header(query: &str) -> String {
-    format!("# Результаты поиска: '{query}'\n\n")
+    format!("# Результаты поиска: '{}'\n\n", inline_line(query))
 }
 
 pub fn format_search_results(results: &[Definition]) -> String {
@@ -89,7 +107,11 @@ pub fn format_method(m: &Method) -> String {
     }
     out.push_str(&format_signatures(&m.signatures, &m.name_ru));
     if !m.return_type.is_empty() {
-        let _ = writeln!(out, "**Возвращаемый тип:** `{}`\n", m.return_type);
+        let _ = writeln!(
+            out,
+            "**Возвращаемый тип:** {}\n",
+            render_type(&m.return_type)
+        );
     }
     out
 }
@@ -100,7 +122,7 @@ pub fn format_property(p: &Property) -> String {
     if !p.description.is_empty() {
         let _ = writeln!(out, "{}\n", p.description);
     }
-    let _ = writeln!(out, "**Тип:** `{}`", p.type_name);
+    let _ = writeln!(out, "**Тип:** {}", render_type(&p.type_name));
     let _ = writeln!(
         out,
         "**Только для чтения:** {}\n",
@@ -112,10 +134,16 @@ pub fn format_property(p: &Property) -> String {
 pub fn format_constructors(constructors: &[Constructor], type_name: &str) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "Конструкторы объекта {type_name}");
+    if constructors.is_empty() {
+        out.push_str("❌ **Не найдено:** у типа нет конструкторов\n");
+        return out;
+    }
     for c in constructors {
-        let _ = writeln!(out, "## Конструктор: {} ({})", c.name, c.description);
+        let desc = inline_line(&c.description);
+        let _ = writeln!(out, "## Конструктор: {} ({})", c.name, desc);
         out.push_str(&format_signature_block(
             &c.parameters,
+            &c.syntax,
             &format!("Новый {type_name}"),
         ));
     }
@@ -140,13 +168,26 @@ pub fn format_enum_values(values: &[EnumValue], type_name: &str) -> String {
 fn format_signatures(signatures: &[Signature], method_name: &str) -> String {
     let mut out = String::new();
     for s in signatures {
-        let _ = writeln!(out, "## Сигнатура: {} ({})", s.name, s.description);
-        out.push_str(&format_signature_block(&s.parameters, method_name));
+        let _ = writeln!(
+            out,
+            "## Сигнатура: {} ({})",
+            s.name,
+            inline_line(&s.description)
+        );
+        out.push_str(&format_signature_block(
+            &s.parameters,
+            &s.syntax,
+            method_name,
+        ));
     }
     out
 }
 
-fn format_signature_block(parameters: &[crate::entities::Parameter], call_name: &str) -> String {
+fn format_signature_block(
+    parameters: &[crate::entities::Parameter],
+    syntax: &str,
+    call_name: &str,
+) -> String {
     let mut out = String::new();
     let inline = parameters
         .iter()
@@ -160,28 +201,33 @@ fn format_signature_block(parameters: &[crate::entities::Parameter], call_name: 
         })
         .collect::<Vec<_>>()
         .join(", ");
+    let call = if syntax.is_empty() {
+        format!("{call_name}({inline})")
+    } else {
+        // Авторитетный синтаксис со страницы — как есть; fence не должен
+        // закрыться раньше времени, поэтому тройные бэктики обезвреживаем.
+        syntax.replace("```", "'''")
+    };
     out.push_str("```bsl\n");
-    let _ = writeln!(out, "{call_name}({inline})");
+    let _ = writeln!(out, "{call}");
     out.push_str("```\n\n");
 
     if !parameters.is_empty() {
         out.push_str("### Параметры\n");
         for p in parameters {
-            let required_mark = if p.required {
-                "(обязательный)"
-            } else {
-                ""
-            };
-            let desc = if p.description.is_empty() {
-                ""
-            } else {
-                p.description.as_str()
-            };
-            let _ = writeln!(
-                out,
-                "- **{}** *({})* {} - {}",
-                p.name, p.type_name, required_mark, desc
-            );
+            let mut line = format!("- **{}**", p.name);
+            if !p.type_name.is_empty() {
+                line.push_str(&format!(" *({})*", p.type_name));
+            }
+            if p.required {
+                line.push_str(" (обязательный)");
+            }
+            if !p.description.is_empty() {
+                line.push_str(" - ");
+                line.push_str(&inline_line(&p.description));
+            }
+            line.push('\n');
+            out.push_str(&line);
         }
         out.push('\n');
     }
@@ -189,13 +235,17 @@ fn format_signature_block(parameters: &[crate::entities::Parameter], call_name: 
 }
 
 fn format_method_summary(m: &Method) -> String {
-    let return_type = if m.return_type.is_empty() {
-        String::new()
-    } else {
-        format!(": {}", m.return_type)
+    let return_type = match render_type(&m.return_type) {
+        t if t.is_empty() => String::new(),
+        t => format!(": {t}"),
     };
     if m.signatures.is_empty() {
-        format!("- {}(){} - {}\n", m.name_ru, return_type, m.description)
+        format!(
+            "- {}(){} - {}\n",
+            m.name_ru,
+            return_type,
+            inline_line(&m.description)
+        )
     } else {
         let mut out = String::new();
         for s in &m.signatures {
@@ -215,7 +265,10 @@ fn format_method_summary(m: &Method) -> String {
             let _ = writeln!(
                 out,
                 "- {}({}){} - {}",
-                m.name_ru, inline, return_type, s.description
+                m.name_ru,
+                inline,
+                return_type,
+                inline_line(&s.description)
             );
         }
         out
@@ -223,7 +276,17 @@ fn format_method_summary(m: &Method) -> String {
 }
 
 fn format_property_summary(p: &Property) -> String {
-    format!("- {}: {} - {}\n", p.name_ru, p.type_name, p.description)
+    let type_name = render_type(&p.type_name);
+    if type_name.is_empty() {
+        format!("- {} - {}\n", p.name_ru, inline_line(&p.description))
+    } else {
+        format!(
+            "- {}: {} - {}\n",
+            p.name_ru,
+            type_name,
+            inline_line(&p.description)
+        )
+    }
 }
 
 fn format_constructor_summary(c: &Constructor) -> String {
@@ -231,9 +294,14 @@ fn format_constructor_summary(c: &Constructor) -> String {
 }
 
 fn format_enum_value_summary(v: &EnumValue) -> String {
-    if v.description.is_empty() {
-        format!("- {} (`{}`)\n", v.name_ru, v.name_en)
+    let en = if v.name_en.is_empty() {
+        String::new()
     } else {
-        format!("- {} (`{}`) - {}\n", v.name_ru, v.name_en, v.description)
+        format!(" (`{}`)", v.name_en)
+    };
+    if v.description.is_empty() {
+        format!("- {}{}\n", v.name_ru, en)
+    } else {
+        format!("- {}{} - {}\n", v.name_ru, en, inline_line(&v.description))
     }
 }

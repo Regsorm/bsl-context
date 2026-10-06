@@ -4,9 +4,10 @@
 //! а не отдельная категория storage. Три коллекции в [`PlatformIndex`]:
 //! `global_methods`, `global_properties`, `types` (HashMap по `name_ru`).
 //!
-//! Главное отличие от апстрима — поля `signatures` методов, `constructors` типов
-//! и `enum_values` системных перечислений заполняются полностью. У апстрима
-//! ([`upstream/.../persistent/storage/Mapper.kt`]) они теряются.
+//! Главное отличие от апстрима — `signatures` методов (включая текст синтаксиса),
+//! `constructors` типов и `enum_values` системных перечислений заполняются.
+//! У апстрима (путь `upstream/.../persistent/storage/Mapper.kt`, вне
+//! репозитория) они теряются.
 
 pub mod cache;
 pub mod entities;
@@ -17,7 +18,7 @@ pub mod search;
 pub mod storage;
 pub mod visitor;
 
-pub use cache::{load_cached, LoadSource};
+pub use cache::{load_cached, LoadSource, DEFAULT_CACHE_FILE_NAME};
 pub use entities::{
     Constructor, Definition, EnumValue, Method, Parameter, Property, Signature, Type,
 };

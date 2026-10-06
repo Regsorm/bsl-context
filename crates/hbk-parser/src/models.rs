@@ -6,8 +6,7 @@
 //!
 //! Эти Info-типы — **только промежуточные** результаты парсера. В business-слое
 //! `platform-index` они мапятся в `Type / Method / Property / EnumValue /
-//! Constructor` уже без потерь (в апстриме маппинг терял `signature`,
-//! `constructors` и не сохранял `EnumInfo` вообще — мы это исправляем).
+//! Constructor`; какие поля доходят до индекса, смотри в `mapper`.
 
 use serde::Serialize;
 
@@ -77,6 +76,8 @@ pub struct ObjectInfo {
 #[derive(Debug, Clone, Serialize)]
 pub struct ConstructorInfo {
     pub name: String,
+    /// Английская форма имени конструктора (пустая, если её нет на странице).
+    pub name_en: String,
     pub syntax: String,
     pub parameters: Vec<MethodParameterInfo>,
     pub description: String,
@@ -97,6 +98,9 @@ pub struct EnumInfo {
     pub name_en: String,
     pub description: String,
     pub example: Option<String>,
+    /// «Примечание:» главы-родителя (в текущих данных платформы встречается
+    /// редко, но модель обязана вмещать его).
+    pub note: Option<String>,
     pub related_objects: Vec<RelatedObject>,
     /// Заполняется PagesVisitor-аналогом из дочерних страниц TOC в `/properties/`.
     /// Сам `EnumPageParser` его не заполняет.
@@ -109,6 +113,8 @@ pub struct EnumValueInfo {
     pub name_ru: String,
     pub name_en: String,
     pub description: String,
+    /// «Примечание:» страницы значения (52 страницы в 8.3.27 — раньше терялось).
+    pub note: Option<String>,
     pub related_objects: Vec<RelatedObject>,
 }
 

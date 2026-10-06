@@ -1,6 +1,16 @@
 // Сведения о продукте в Windows-исполняемом файле: видны в свойствах файла
 // проводником, позволяют узнать версию, не запуская сервер.
 fn main() {
+    // Явные rerun-директивы (они отключают дефолтный трекинг каталога пакета):
+    // build.rs и Cargo.toml (версия встраивается в exe) + env-переключатели
+    // инструментов winresource. Без них смена RC_PATH не инвалидировала кэш, и
+    // сборка залипала в «Fresh» без метаданных даже после починки окружения.
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rerun-if-env-changed=RC_PATH");
+    println!("cargo:rerun-if-env-changed=WINDRES");
+    println!("cargo:rerun-if-env-changed=AR");
+
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }

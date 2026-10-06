@@ -138,6 +138,8 @@ pub fn validate_type_method_call(
 
 /// Проверить значение системного перечисления.
 pub fn validate_enum(index: &PlatformIndex, type_name: &str, value_name: &str) -> EnumValidation {
+    let type_name = type_name.trim();
+    let value_name = value_name.trim();
     let Some(ty) = index.find_type(type_name) else {
         return EnumValidation {
             valid: false,
@@ -234,6 +236,7 @@ pub fn validate_method_call(
     method_name: &str,
     arg_count: usize,
 ) -> MethodCallValidation {
+    let method_name = method_name.trim();
     let Some(method) = index.find_global_method(method_name) else {
         return MethodCallValidation {
             valid: false,
@@ -276,8 +279,10 @@ pub fn validate_method_call(
             arg_count,
             signatures,
             message: format!(
-                "✅ Вызов '{}' с {} аргументами допустим.",
-                method.name_ru, arg_count
+                "✅ Вызов '{}' с {} {} допустим.",
+                method.name_ru,
+                arg_count,
+                argument_forms(arg_count).0
             ),
         }
     } else {
@@ -300,25 +305,54 @@ pub fn validate_method_call(
             arg_count,
             signatures,
             message: format!(
-                "❌ Метод '{}' не принимает {} аргументов. Допустимо: {}.",
-                method.name_ru, arg_count, allowed_ranges
+                "❌ Метод '{}' не принимает {} {}. Допустимо: {}.",
+                method.name_ru,
+                arg_count,
+                argument_forms(arg_count).1,
+                allowed_ranges
             ),
         }
     }
 }
 
+/// Потолок числа аргументов сигнатуры: защита от враждебного или повреждённого
+/// индекса с гигантскими диапазонами имён параметров.
+const MAX_SIGNATURE_ARGS: usize = 1024;
+
+/// Формы слова «аргумент»: `(творительный, винительный)` — «с 1 аргументом»,
+/// «не принимает 2 аргумента», «с 5 аргументами».
+fn argument_forms(n: usize) -> (&'static str, &'static str) {
+    let d = n % 10;
+    let dd = n % 100;
+    if d == 1 && dd != 11 {
+        ("аргументом", "аргумент")
+    } else if (2..=4).contains(&d) && !(12..=14).contains(&dd) {
+        ("аргументами", "аргумента")
+    } else {
+        ("аргументами", "аргументов")
+    }
+}
+
 fn brief_signature(method_name: &str, s: &Signature) -> SignatureBrief {
-    let min_args = s.parameters.iter().filter(|p| p.required).count();
+    // Обязательные параметры могут стоять ПОСЛЕ опциональных
+    // (`ПоказатьЗначение` и ещё 16 сигнатур на 8.3.27): минимум — позиция
+    // последнего обязательного, иначе принимался вызов без него.
+    let min_args = s
+        .parameters
+        .iter()
+        .rposition(|p| p.required)
+        .map_or(0, |i| i + 1);
     let mut max_args = s.parameters.len();
 
-    // Диапазонный параметр hbk вида `Значение1-Значение10` — это один слот в
-    // `parameters`, но синтаксически представляет несколько (до верхней цифры).
-    // Расширяем верхнюю границу на недостающие слоты (СтрШаблон и т.п.).
+    // Диапазонный параметр hbk вида `Значение1-Значение10` — один слот в
+    // `parameters`, но синтаксически несколько: добавляем недостающие
+    // (верх − низ), без переполнения и с потолком.
     for p in &s.parameters {
-        if let Some(upper) = parse_range_upper(&p.name) {
-            max_args += upper.saturating_sub(1);
+        if let Some((lower, upper)) = parse_range_bounds(&p.name) {
+            max_args = max_args.saturating_add(upper.saturating_sub(lower));
         }
     }
+    max_args = max_args.min(MAX_SIGNATURE_ARGS);
 
     // Семантически вариативные глобальные функции (`Макс`/`Мин`): hbk описывает
     // один параметр, а функция принимает неограниченное число. Признака в
@@ -361,13 +395,15 @@ fn is_variadic_global(method_name: &str) -> bool {
     )
 }
 
-/// Извлечь верхнюю границу диапазонного имени параметра вида
-/// `Значение1-Значение10` → `Some(10)`. Иначе `None`.
-fn parse_range_upper(param_name: &str) -> Option<usize> {
+/// Границы диапазонного имени параметра `Значение1-Значение10` → `(1, 10)`.
+/// Имя анкорировано целиком: подстрочные совпадения не должны завышать верх.
+fn parse_range_bounds(param_name: &str) -> Option<(usize, usize)> {
     static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| Regex::new(r"(\d+)\D*-\D*(\d+)").unwrap());
-    let caps = re.captures(param_name)?;
-    caps.get(2)?.as_str().parse::<usize>().ok()
+    let re = RE.get_or_init(|| Regex::new(r"^(\D*?)(\d+)\D+?(\d+)$").unwrap());
+    let caps = re.captures(param_name.trim())?;
+    let lower = caps.get(2)?.as_str().parse::<usize>().ok()?;
+    let upper = caps.get(3)?.as_str().parse::<usize>().ok()?;
+    (upper > lower).then_some((lower, upper))
 }
 
 fn top_similar(query: &str, values: &[platform_index::EnumValue], top: usize) -> Vec<SimilarValue> {
@@ -545,9 +581,9 @@ mod tests {
 
     #[test]
     fn parse_range_upper_works() {
-        assert_eq!(parse_range_upper("Значение1-Значение10"), Some(10));
-        assert_eq!(parse_range_upper("Шаблон"), None);
-        assert_eq!(parse_range_upper("Параметр2-Параметр7"), Some(7));
+        assert_eq!(parse_range_bounds("Значение1-Значение10"), Some((1, 10)));
+        assert_eq!(parse_range_bounds("Шаблон"), None);
+        assert_eq!(parse_range_bounds("Параметр2-Параметр7"), Some((2, 7)));
     }
 
     /// Issue #18: в справке платформы значение записано с ЛАТИНСКОЙ буквой
@@ -595,6 +631,7 @@ mod tests {
             return_type: String::new(),
             signatures: vec![Signature {
                 name: "Основная".into(),
+                syntax: String::new(),
                 description: String::new(),
                 parameters: vec![Parameter {
                     name: param.into(),
@@ -631,6 +668,7 @@ mod tests {
             return_type: "Строка".into(),
             signatures: vec![Signature {
                 name: "Основная".into(),
+                syntax: String::new(),
                 description: String::new(),
                 parameters: vec![
                     Parameter {
