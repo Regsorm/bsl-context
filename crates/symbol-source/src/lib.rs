@@ -110,6 +110,14 @@ impl SymbolSource for LiteSource {
         }
     }
 
+    /// Раскладка, для которой источник умеет вывести модуль-владельца, —
+    /// модуль обычной формы внешней обработки (см. `lite_index::owner_module_path`).
+    /// Для модулей форм конфигурации владелец не выводится, и `None` из
+    /// `owner_exports` означает «спросить не умеем», а не «владельца нет».
+    fn owner_resolvable(&self, module_path: &str) -> bool {
+        lite_index::owner_module_path(module_path).is_some()
+    }
+
     fn object_exists(&self, collection: &str, name_lower: &str) -> Option<bool> {
         let by_collection = self.objects_lower.as_ref()?;
         match by_collection.get(collection) {
@@ -601,6 +609,12 @@ impl SymbolSource for CodeIndexDbSource {
             out.insert(row.ok()?.to_lowercase());
         }
         Some(out)
+    }
+
+    /// См. `SymbolSource::owner_resolvable`: раскладка внешней обработки —
+    /// единственная, для которой путь владельца выводится из пути формы.
+    fn owner_resolvable(&self, module_path: &str) -> bool {
+        lite_index::owner_module_path(module_path).is_some()
     }
 
     fn object_exists(&self, collection: &str, name_lower: &str) -> Option<bool> {
@@ -1250,6 +1264,13 @@ impl SymbolSource for CodeIndexMcpSource {
                 None
             }
         }
+    }
+
+    /// См. `SymbolSource::owner_resolvable`. Наличия владельца в соседнем
+    /// code-index здесь не требуется: важно лишь, что раскладка пути позволяет
+    /// его вывести.
+    fn owner_resolvable(&self, module_path: &str) -> bool {
+        lite_index::owner_module_path(module_path).is_some()
     }
 
     fn object_exists(&self, collection: &str, name_lower: &str) -> Option<bool> {
@@ -2489,6 +2510,17 @@ data: {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabili
             source.owner_exports("external/Обр/Form/Ф/Form.obj.bsl"),
             Some(HashSet::new())
         );
+
+        // `owner_resolvable` различает «владельца нет в базе» и «раскладка не
+        // разбирается»: во втором случае валидатор молчать не должен.
+        assert!(
+            source.owner_resolvable("external/Обр/Form/Ф/Form.obj.bsl"),
+            "раскладка внешней обработки — владелец выводится из пути"
+        );
+        assert!(
+            !source.owner_resolvable("base/Catalogs/Х/Forms/ФормаЭлемента/Ext/Form/Module.bsl"),
+            "раскладка формы конфигурации — владелец не выводится, молчание включать нельзя"
+        );
     }
 
     // ── LiteSource ────────────────────────────────────────────────────────
@@ -2612,6 +2644,18 @@ data: {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabili
             names.contains("сведенияовнешнейобработке"),
             "экспорты владельца не найдены, получено {} имён",
             names.len()
+        );
+        assert!(
+            src.owner_resolvable(
+                "external/Выгрузка накладных в Docsinbox/Form/НоваяФорма/Form.obj.bsl"
+            ),
+            "раскладка внешней обработки — владелец выводится из пути"
+        );
+        assert!(
+            !src.owner_resolvable(
+                "base/Catalogs/Номенклатура/Forms/ФормаЭлемента/Ext/Form/Module.bsl"
+            ),
+            "раскладка формы конфигурации — владелец не выводится"
         );
     }
 

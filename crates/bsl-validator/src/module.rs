@@ -352,11 +352,13 @@ pub fn validate_module_with_symbols(
     // молчат (контракт `owner_exports = None` — «не знаю», аудит PR).
     let owner_lookup = module_path
         .zip(symbols)
-        .map(|(path, src)| (path, src.owner_exports(path)));
+        .map(|(path, src)| (path, src.owner_exports(path), src.owner_resolvable(path)));
     let owner_unknown = owner_lookup
         .as_ref()
-        .is_some_and(|(path, names)| names.is_none() && crate::context_names::is_form_module(path));
-    let owner_exports = owner_lookup.and_then(|(_, names)| names);
+        .is_some_and(|(path, names, resolvable)| {
+            names.is_none() && *resolvable && crate::context_names::is_form_module(path)
+        });
+    let owner_exports = owner_lookup.and_then(|(_, names, _)| names);
     let mut result = validate_module_at_level_inner(
         index,
         source,
@@ -401,11 +403,13 @@ pub fn validate_module_with_symbols_and_form_kind(
     // `validate_module_with_symbols`.
     let owner_lookup = module_path
         .zip(symbols)
-        .map(|(path, src)| (path, src.owner_exports(path)));
+        .map(|(path, src)| (path, src.owner_exports(path), src.owner_resolvable(path)));
     let owner_unknown = owner_lookup
         .as_ref()
-        .is_some_and(|(path, names)| names.is_none() && crate::context_names::is_form_module(path));
-    let owner_exports = owner_lookup.and_then(|(_, names)| names);
+        .is_some_and(|(path, names, resolvable)| {
+            names.is_none() && *resolvable && crate::context_names::is_form_module(path)
+        });
+    let owner_exports = owner_lookup.and_then(|(_, names, _)| names);
     let mut result = validate_module_at_level_inner_ext(
         index,
         source,
@@ -684,6 +688,18 @@ EndFunction
             self.owner.clone()
         }
 
+        /// Стенд умеет выводить владельца ровно для раскладки внешней обработки —
+        /// той же, что и реальные источники (см. `lite_index::owner_module_path`):
+        /// путь заканчивается на `Form.obj.bsl`. Для модуля формы конфигурации
+        /// (`.../Ext/Form/Module.bsl`) владелец не выводится, и молчание
+        /// `owner_unknown` на нём не включается.
+        fn owner_resolvable(&self, module_path: &str) -> bool {
+            module_path
+                .replace('\\', "/")
+                .to_lowercase()
+                .ends_with("/form.obj.bsl")
+        }
+
         fn describe(&self) -> String {
             "stub".to_string()
         }
@@ -773,6 +789,35 @@ EndFunction
             result.errors.is_empty(),
             "«не знаю» о владельце не должно давать находку: {:?}",
             result.errors
+        );
+    }
+
+    /// Обратный случай: источник владельца вывести НЕ умеет — раскладка модуля
+    /// формы КОНФИГУРАЦИИ (`owner_module_path` её не разбирает). Тогда `None` из
+    /// `owner_exports` означает «спросить не умеем», а не «владельца нет», и
+    /// молчание выключать нельзя: иначе в модулях форм перестают находиться
+    /// настоящие опечатки (`Сообщит` вместо `Сообщить`) и вызовы несуществующих
+    /// процедур — замер на реальной выгрузке давал на этом 2 находки на модуль.
+    #[test]
+    fn symbols_owner_not_resolvable_keeps_finding() {
+        let index = PlatformIndex::new();
+        let source = StubSource {
+            global_export: false,
+            exists: false,
+            owner: None,
+        };
+        let result = validate_module_with_symbols(
+            &index,
+            module_with_unknown_call(),
+            1,
+            Profile::Full,
+            Some("base/Catalogs/Х/Forms/ФормаЭлемента/Ext/Form/Module.bsl"),
+            None,
+            Some(&source),
+        );
+        assert!(
+            !result.errors.is_empty(),
+            "раскладка владельца не разбирается — находка обязана остаться"
         );
     }
 
