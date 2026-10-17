@@ -63,17 +63,17 @@ parsed as BSL and returned `valid: true` without a single check.
 
 | Finding kind | confidence | Meaning |
 |--------------|-----------|---------|
-| `unknown_enum_value` | high | System enumeration value does not exist. Open collections (`ЦветаСтиля`, `БиблиотекаКартинок` — the configuration adds its own values) are not checked |
-| `wrong_argument_count` | high | Global function argument count outside its overloads |
-| `unknown_type_member` | low | Platform type has no such method/property |
+| `unknown_enum_value` | high / low | Enumeration value does not exist: system ones are checked against the help, application ones (`Перечисления.Name.Value`) against the composition from an external name source. Open collections (`ЦветаСтиля`, `БиблиотекаКартинок` — the configuration adds its own values) are not checked. A source with a suspiciously empty index lowers confidence to low |
+| `wrong_argument_count` | high | Argument count outside the overloads — of a global function or of a constructor (`Новый TypeX(…)`). For constructors only EXCESS arguments are reported: variable-arity constructors (`Массив`, `Структура`, `Фиксированный*`) are excluded by an explicit list |
+| `unknown_type_member` | low | Platform type has no such method/property — nor has a metadata object description (`Метаданные.Справочники.Name.НетТакогоЧлена123`) |
 | `unknown_new_type` | low | `Новый TypeX` constructor unknown to the platform |
 | `unknown_global_method` | high / low | Unknown global call similar to a platform method (fuzzy: strong match → high, weak → low) |
 | `undeclared_method` | high | Call is not declared in the submitted module and unknown to the platform (whole-module check only; suppressed in extension modules) |
 | `unknown_directive` | high / low | Directive name (`&НаСервере`, `&Перед`, …) not in the whitelist |
 | `shadowed_context_name` | high | Variable name is taken by a read-only context property: the assignment fails at runtime. The form-member rule needs `module_path` |
-| `unknown_common_module` | high | `ModuleName.Method(...)` — no common module with that name exists in the configuration. Requires an external name source |
-| `unknown_metadata_object` | high | `Справочники.Name`, `Документы.Name`, … — no object with that name exists in the collection. Requires an external name source |
-| `unknown_global_property` | high / low | The head of an `Name.Member` access is neither declared in the module nor a global context property, yet it is spelled close to a real one: `Справочник.Номенклатура` instead of `Справочники.Номенклатура` (the query language names a table in the singular, the code names the manager in the plural). A head that resembles nothing is passed over silently — otherwise every common-module call would be flagged. Needs no external name source |
+| `unknown_common_module` | high / low | `ModuleName.Method(...)` — no common module with that name exists in the configuration. Requires an external name source; a source with a suspiciously empty index lowers confidence to low |
+| `unknown_metadata_object` | high / low | `Справочники.Name`, `Документы.Name`, and also `Метаданные.<Collection>.<Object>` — no object with that name exists in the collection (nor the collection itself in `Метаданные`). Requires an external name source; a source with a suspiciously empty index lowers confidence to low |
+| `unknown_global_property` | high / low | The head of an `Name.Member` access is neither declared in the module nor a global context property, yet it is spelled close to a real one: `Справочник.Номенклатура` instead of `Справочники.Номенклатура` (the query language names a table in the singular, the code names the manager in the plural). A head that resembles nothing is passed over silently — otherwise every common-module call would be flagged. In an object or record-set module the owner's composition is checked as well: `НетТакойТЧ1.Итог(...)` yields low, and without a name source the rule stays silent. The external name source is needed only for that second check |
 | `unknown_manager_method` | high / low | `Справочники.Name.Method(...)` — the object manager has no such method, and the name is close to a real help method (a typo like `НайтиПоРеквизитам` → `НайтиПоРеквизиту`). A method declared in the manager module is left alone. Requires an external name source |
 | `reserved_procedure_name` | high | The procedure name is a language keyword (`Выполнить`) or a name the platform rejects (`Найти`). The module does not compile: "Ожидается имя процедуры" |
 | `duplicate_declaration` | high | A procedure or function with this name is already declared in the module |
@@ -342,6 +342,24 @@ url = "http://10.0.0.5:8011/mcp"
 code_index_repo = "zup-prod"   # optional: only when code-index names that repository differently
 ```
 
+`root` is the configuration dump root; the server refuses to read modules outside it.
+For modules that live elsewhere — an unpacked external data processor, a separate build
+directory, a foreign repository — list additional roots:
+
+```toml
+[[symbol_sources]]
+repo = "ut"
+kind = "code_index_db"
+root = 'C:\Repo1C'
+extra_roots = ['C:\ExternalProcessors', 'D:\OtherRepos\buh']
+```
+
+`validate_module` with the `path` argument walks the roots in order — `root` first, then
+`extra_roots` — and `module_path` is computed relative to the root the file was found in:
+the dump layout is preserved there, so module-kind detection (object module, form, common
+module) keeps working. After symlinks are resolved the file must still stay inside one of
+the roots.
+
 `validate_module` and `rebuild_symbol_index` then take a `repo` argument — that alias.
 **It is required whenever at least one configuration is configured**, even a single one:
 a call must be unambiguous. An unknown alias is refused with the list of available ones.
@@ -448,7 +466,7 @@ same.
 | `validate_method_call` | Validate a global function's argument count |
 | `validate_module` | Validate BSL code (whole module or fragment) against the platform |
 | `rebuild_symbol_index` | Rebuild the own name index (`kind = "lite"`); paths come from the config |
-| `symbol_sources_status` | State of every configured name source: connected, healthy, last connection error |
+| `symbol_sources_status` | State of every configured name source: connected, healthy, how many objects and names it knows (`stats`), when its database file last changed (`snapshot`), whether the composition is suspiciously empty (`thin`), last connection error |
 | `reconnect_symbol_source` | Retry the connection to one source without restarting the server |
 | `reload_config` | Re-read `config.toml` and swap the symbol source map without restarting the server. Only `[[symbol_sources]]` applies: platform, port and the tool whitelist take effect after a restart |
 | `reserved_names` | Context-occupied names from the platform help: `global_readonly`/`form_readonly` (assignment fails at runtime), `global_writable`/`form_writable` (no variable is created — the session or the form is silently changed) |
