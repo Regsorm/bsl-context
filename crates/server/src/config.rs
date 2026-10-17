@@ -87,8 +87,26 @@ pub struct Config {
     /// секцией `[symbol_source]`: указаны обе — ошибка на старте.
     pub symbol_sources: Vec<SymbolSourceConfig>,
 
+    /// Дополнения к платформенному контексту (`[platform_overlay]`): методы и
+    /// члены типов, которых нет в справке, но которые платформа исполняет
+    /// (issue #40). Накладываются ПОСЛЕ загрузки индекса — из кэша или из hbk, —
+    /// поэтому переживают пересборку кэша и обновление сервера.
+    pub platform_overlay: PlatformOverlayConfig,
+
     /// Белый список инструментов. Пустой (по умолчанию) — доступны все.
     pub tools: ToolsConfig,
+}
+
+/// Секция `[platform_overlay]`: файл дополнений к справке.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PlatformOverlayConfig {
+    /// Путь к файлу дополнений (TOML). Не задан — дополнений нет.
+    ///
+    /// Формат файла описан в `crate::platform_overlay`. Ошибка чтения или
+    /// разбора — отказ старта: молча работать без заявленных дополнений нельзя.
+    /// Путь разрешается относительно каталога config.toml.
+    pub file: Option<PathBuf>,
 }
 
 /// Конфигурация внешнего источника имён (крейт `symbol-source`).
@@ -275,6 +293,7 @@ impl Default for Config {
             platform_cache_path: None,
             symbol_source: SymbolSourceConfig::default(),
             symbol_sources: Vec::new(),
+            platform_overlay: PlatformOverlayConfig::default(),
             tools: ToolsConfig::default(),
         }
     }
@@ -347,6 +366,11 @@ impl Config {
         for source in &mut self.symbol_sources {
             source.resolve_paths(base);
         }
+        self.platform_overlay.file = self
+            .platform_overlay
+            .file
+            .take()
+            .map(|p| resolve_relative(base, p));
     }
 
     /// Именованные источники имён: либо одна секция `[symbol_source]`, либо

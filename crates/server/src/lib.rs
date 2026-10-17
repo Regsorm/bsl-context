@@ -13,4 +13,5 @@ pub mod http;
 pub mod mcp_server;
 pub mod module_source;
 pub mod pid_lock;
+pub mod platform_overlay;
 pub mod sources;

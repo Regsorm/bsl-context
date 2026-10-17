@@ -129,6 +129,28 @@ pub enum Definition {
     Type(Type),
 }
 
+/// Член ТИПА, которым индекс дополняют поверх справки (issue #40, дополнение
+/// автора): часть устаревших методов платформа исполняет, хотя страницы в
+/// справке уже нет.
+///
+/// Отдельный вид, а не [`Definition`]: тот описывает найденную сущность и
+/// включает тип целиком, а здесь важно ровно одно — чем дополнить конкретный тип.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TypeMember {
+    Method(Method),
+    Property(Property),
+}
+
+impl TypeMember {
+    /// Имя члена — по нему ищется одноимённый член в типе.
+    pub fn name_ru(&self) -> &str {
+        match self {
+            TypeMember::Method(m) => &m.name_ru,
+            TypeMember::Property(p) => &p.name_ru,
+        }
+    }
+}
+
 impl Definition {
     pub fn name_ru(&self) -> &str {
         match self {

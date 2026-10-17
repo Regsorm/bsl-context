@@ -189,14 +189,37 @@ fn read_cache(cache_path: &Path, fingerprint: &Fingerprint) -> Result<Option<Pla
     let header: Header = serde_json::from_str(&header_line).context("разбор заголовка кэша")?;
 
     if header.version != FORMAT_VERSION {
+        // Молчать нельзя: по времени изменения файла отказ выглядит как «патч
+        // кэша не применился», хотя причина — версия формата (issue #40,
+        // дополнение автора: ручная правка кэша пропадала без единого слова).
+        warn!(
+            cache = %cache_path.display(),
+            expected = FORMAT_VERSION,
+            found = header.version,
+            "кэш платформенного индекса собран другим форматом — собираю индекс из hbk"
+        );
         return Ok(None);
     }
     if header.server_version != env!("CARGO_PKG_VERSION") {
         // Кэш собран другим бинарём: поля индекса могли измениться без смены
-        // версии формата (правки парсера/маппера) — пересобираем.
+        // версии формата (правки парсера/маппера) — пересобираем. Причина
+        // пишется в журнал: после обновления сервера это единственное
+        // объяснение, почему кэш пересобран.
+        warn!(
+            cache = %cache_path.display(),
+            cached = %header.server_version,
+            current = env!("CARGO_PKG_VERSION"),
+            "кэш платформенного индекса собран другой версией сервера — собираю индекс из hbk"
+        );
         return Ok(None);
     }
     if header.fingerprint != *fingerprint {
+        // Штатный случай (файл платформы обновился) — и всё же с сообщением:
+        // иначе ручная правка кэша выглядит потерявшейся без объяснения.
+        info!(
+            cache = %cache_path.display(),
+            "кэш относится к другому файлу платформы — собираю индекс из hbk"
+        );
         return Ok(None);
     }
 

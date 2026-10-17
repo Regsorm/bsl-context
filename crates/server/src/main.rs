@@ -12,7 +12,7 @@ use anyhow::Context as _;
 use std::future::IntoFuture as _;
 
 use bsl_context_server::sources::build_symbol_source;
-use bsl_context_server::{config, http, mcp_server, pid_lock};
+use bsl_context_server::{config, http, mcp_server, pid_lock, platform_overlay};
 
 /// Предел ожидания graceful shutdown: после сигнала даём in-flight запросам
 /// столько секунд, затем выходим принудительно (иначе долгий rebuild,
@@ -295,6 +295,34 @@ async fn load_platform_index(
                     global_properties = index.global_properties.len(),
                     "PlatformIndex загружен"
                 );
+                // Дополнения к справке (issue #40): накладываются ПОСЛЕ загрузки —
+                // из кэша или из hbk, — поэтому переживают и пересборку кэша, и
+                // обновление сервера. Ошибка в файле — отказ старта: молча
+                // работать без заявленных дополнений нельзя.
+                let index = match cfg.platform_overlay.file.as_deref() {
+                    Some(path) => {
+                        let overlay = platform_overlay::load(path)?;
+                        let mut index = index;
+                        let report = platform_overlay::apply(&mut index, &overlay);
+                        if report.is_empty() && report.problems.is_empty() {
+                            tracing::warn!(
+                                file = %path.display(),
+                                "файл дополнений к справке пуст — в нём нет ни одного метода и ни одного члена типа"
+                            );
+                        } else {
+                            info!(
+                                file = %path.display(),
+                                summary = %report.summary(),
+                                "дополнения к справке применены"
+                            );
+                        }
+                        for problem in &report.problems {
+                            tracing::warn!(problem = %problem, "дополнение к справке не применено");
+                        }
+                        index
+                    }
+                    None => index,
+                };
                 Ok(Ok(index))
             }
             None => {

@@ -252,6 +252,10 @@ fn cold_changes(
             "platform_cache_path",
             prev.platform_cache_path != fresh.platform_cache_path,
         ),
+        (
+            "platform_overlay",
+            prev.platform_overlay != fresh.platform_overlay,
+        ),
         ("allowed_hosts", prev.allowed_hosts != fresh.allowed_hosts),
         ("tools.enabled", prev.tools.enabled != fresh.tools.enabled),
         (

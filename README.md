@@ -246,6 +246,57 @@ Page parsing is parallelised (rayon), so even the first start takes about a seco
 rather than several — measured on 8.3.27 (Ryzen 5 3600): built from `hbk` in ~1.3 s,
 loaded from cache in ~0.09 s, start to `listening` in ~0.35 s.
 
+The server logs WHY the cache was rebuilt: "built by another server version",
+"built with another format", "belongs to another platform file". That matters if the
+cache was edited by hand — otherwise the edit looks lost with no explanation. There
+is no need to edit the cache by hand: use the overlay below.
+
+### Help overlay
+
+Some deprecated methods and type members are still executed by the platform although
+their help page is gone. Such names are described in a TOML file and applied to the
+index AFTER it is loaded — from cache or from `hbk` — so they survive both a cache
+rebuild and a server upgrade:
+
+```toml
+# config.toml
+[platform_overlay]
+file = 'C:\tools\bsl-context\platform-overlay.toml'
+```
+
+```toml
+# platform-overlay.toml
+[[global_methods]]
+name = "УстановитьЗаголовокПриложения"
+description = "Deprecated method kept for compatibility"
+
+[[global_methods.signatures]]
+parameters = ["Заголовок"]   # parameter names, in order
+required = 1                 # how many leading ones are required; default is all
+
+[[type_members]]
+type_name = "ДокументОбъект.<Имя документа>"   # type name as spelled in the help
+kind = "method"                                 # method | property
+name = "ПолучитьФормуМодально"
+```
+
+What to know:
+
+- **Signatures enable arity checking.** Without `signatures` the method is merely
+  known (no finding); with them an excess argument yields `wrong_argument_count`.
+  For a method with a VARIABLE argument count, omit the signature: the file has no
+  variadic flag.
+- **A type member is added only if the type exists in the help.** A typo in
+  `type_name` never creates a ghost type: the entry is skipped and a warning with
+  the reason is logged.
+- **A name that already exists in the help is replaced** — the overlay wins for the
+  names it describes.
+- **A broken file fails startup** (missing file, unknown field). Working silently
+  without the declared additions is not an option: that is exactly how hand-editing
+  the cache looked.
+- The section is read at startup; `reload_config` does not re-read it — like
+  `platform_path`, it takes effect after a restart.
+
 ### Network deployment
 
 By default the server listens on loopback. With `host = "0.0.0.0"` you must add

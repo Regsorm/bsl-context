@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 
 use tracing::warn;
 
-use crate::entities::{Method, Property, Type};
+use crate::entities::{Method, Property, Type, TypeMember};
 
 /// Storage платформенного контекста (read-only после загрузки).
 #[derive(Debug, Default, Clone)]
@@ -104,8 +104,81 @@ impl PlatformIndex {
         })
     }
 
-    /// Имена (lowercase, русские и английские) ВСЕХ методов ВСЕХ типов платформы.
+    /// Дополнить индекс методом ГЛОБАЛЬНОГО контекста поверх справки
+    /// (issue #40, дополнение автора: часть устаревших методов платформа
+    /// исполняет, хотя страницы в справке уже нет).
     ///
+    /// Одноимённый метод ЗАМЕНЯЕТСЯ: файл дополнений — источник истины для тех
+    /// имён, которые в нём описаны. Возвращает `true`, если метод был в индексе
+    /// (замена), `false` — если добавлен.
+    pub fn add_global_method(&mut self, method: Method) -> bool {
+        let key = method.name_ru.to_lowercase();
+        match self
+            .global_methods
+            .iter_mut()
+            .find(|existing| existing.name_ru.to_lowercase() == key)
+        {
+            Some(existing) => {
+                *existing = method;
+                true
+            }
+            None => {
+                self.global_methods.push(method);
+                false
+            }
+        }
+    }
+
+    /// Дополнить ТИП членом (методом или свойством) поверх справки.
+    ///
+    /// `None` — типа с таким именем в индексе нет: создавать типы дополнением
+    /// нельзя, иначе опечатка в имени типа молча завела бы в индексе призрак.
+    /// `Some(true)` — член был и заменён, `Some(false)` — добавлен.
+    /// Ленивый кэш имён методов сбрасывается: он считается по `types`.
+    pub fn add_type_member(&mut self, type_name: &str, member: TypeMember) -> Option<bool> {
+        let key = type_name.to_lowercase();
+        let ty = self.types.get_mut(&key)?;
+        let member_key = member.name_ru().to_lowercase();
+        let replaced = match member {
+            TypeMember::Method(method) => {
+                match ty
+                    .methods
+                    .iter_mut()
+                    .find(|existing| existing.name_ru.to_lowercase() == member_key)
+                {
+                    Some(existing) => {
+                        *existing = method;
+                        true
+                    }
+                    None => {
+                        ty.methods.push(method);
+                        false
+                    }
+                }
+            }
+            TypeMember::Property(property) => {
+                match ty
+                    .properties
+                    .iter_mut()
+                    .find(|existing| existing.name_ru.to_lowercase() == member_key)
+                {
+                    Some(existing) => {
+                        *existing = property;
+                        true
+                    }
+                    None => {
+                        ty.properties.push(property);
+                        false
+                    }
+                }
+            }
+        };
+        // Производный кэш имён методов больше не соответствует составу типов.
+        self.type_method_names = OnceLock::new();
+        Some(replaced)
+    }
+
+    /// Имена (lowercase, русские и английские) ВСЕХ методов ВСЕХ типов платформы.    ///
     /// Нужны строгой проверке модуля: внутри собственного модуля объекта или
     /// формы её методы зовутся без префикса — `Закрыть()`, `ЭтоНовый()`,
     /// `РеквизитФормыВЗначение(...)`. Это не глобальные методы, поэтому
