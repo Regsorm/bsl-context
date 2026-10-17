@@ -55,7 +55,9 @@ impl SymbolSource for StubSource {
                 attributes: vec![field("Сторно", false)],
                 dimensions: vec![field("Номенклатура", false), field("Склад", false)],
                 resources: vec![field("ВНаличии", false)],
+                tabular_sections: Vec::new(),
                 register_type: Some("Balance".to_string()),
+                enum_values: Vec::new(),
             }),
             ("AccumulationRegisters", "продажи") => Some(ObjectSchema {
                 dimensions: vec![field("Номенклатура", false)],

@@ -22,7 +22,29 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OpenFlags};
 use serde_json::Value;
 
-use bsl_validator::{ObjectField, ObjectSchema, SymbolSource};
+use bsl_validator::{ObjectField, ObjectSchema, SourceStats, SymbolSource};
+
+/// Порог «неправдоподобно пустого» состава имён (issue #46).
+///
+/// У реальных выгрузок имён десятки тысяч (в УТ — 139 853 имени при 25 606
+/// объектах), поэтому тысяча имён — заведомо нерабочий индекс: не собранный,
+/// пустой или собранный по пустой выгрузке. Порог намеренно низкий: ошибочное
+/// «источник тонкий» только понижает уверенность находок, а не скрывает их.
+const THIN_NAMES: usize = 1_000;
+
+/// Состав источника неправдоподобно мал (issue #46)?
+///
+/// Считается по снимку: объектов не знает никто либо имён меньше порога.
+fn is_thin_composition(objects: Option<&HashMap<String, HashSet<String>>>, names: usize) -> bool {
+    objects.is_some_and(|by_collection| by_collection.is_empty()) || names < THIN_NAMES
+}
+
+/// Сколько объектов конфигурации в наборе «коллекция → имена».
+fn count_objects(objects: Option<&HashMap<String, HashSet<String>>>) -> usize {
+    objects
+        .map(|by_collection| by_collection.values().map(HashSet::len).sum())
+        .unwrap_or(0)
+}
 
 // ── LiteSource ──────────────────────────────────────────────────────────────
 
@@ -165,6 +187,20 @@ impl SymbolSource for LiteSource {
 
     fn global_variables(&self) -> Option<HashSet<String>> {
         self.global_vars.clone()
+    }
+
+    /// Счётчики состава — для `symbol_sources_status` (issue #46).
+    fn stats(&self) -> Option<SourceStats> {
+        Some(SourceStats {
+            objects: count_objects(self.objects.as_ref()),
+            names: self.all_names.len(),
+        })
+    }
+
+    /// См. `SymbolSource::is_thin`: пустой или почти пустой lite-индекс
+    /// отвечает «такого объекта нет» так же уверенно, как полный.
+    fn is_thin(&self) -> bool {
+        is_thin_composition(self.objects.as_ref(), self.all_names.len())
     }
 
     fn describe(&self) -> String {
@@ -669,6 +705,24 @@ impl SymbolSource for CodeIndexDbSource {
     fn global_variables(&self) -> Option<HashSet<String>> {
         self.refresh_if_stale();
         self.snapshot.lock().unwrap().global_vars.clone()
+    }
+
+    /// Счётчики состава снимка — для `symbol_sources_status` (issue #46).
+    fn stats(&self) -> Option<SourceStats> {
+        self.refresh_if_stale();
+        let snapshot = self.snapshot.lock().unwrap();
+        Some(SourceStats {
+            objects: count_objects(snapshot.objects.as_ref()),
+            names: snapshot.names.len(),
+        })
+    }
+
+    /// См. `SymbolSource::is_thin` (issue #46): пустая или почти пустая база не
+    /// основание выносить `high` по ответу «такого объекта нет».
+    fn is_thin(&self) -> bool {
+        self.refresh_if_stale();
+        let snapshot = self.snapshot.lock().unwrap();
+        is_thin_composition(snapshot.objects.as_ref(), snapshot.names.len())
     }
 
     fn describe(&self) -> String {
@@ -1361,6 +1415,13 @@ impl SymbolSource for CodeIndexMcpSource {
         self.healthy.load(Ordering::Relaxed)
     }
 
+    /// Счётчики состава у сетевого источника не собираются: их пришлось бы
+    /// тянуть отдельными запросами к code-index. `None` — в статусе их не будет,
+    /// и «тонким» такой источник не объявляется.
+    fn stats(&self) -> Option<SourceStats> {
+        None
+    }
+
     fn describe(&self) -> String {
         format!(
             "code-index mcp: {} repo={}",
@@ -1468,10 +1529,15 @@ fn meta_type_for_collection(collection: &str) -> Option<&'static str> {
 /// Разобрать `metadata_objects.attributes_json` в состав объекта.
 ///
 /// Формат задаёт code-index (`bsl-extension/src/xml/object_attributes.rs`):
-/// секции `attributes` / `dimensions` / `resources`, у поля — `name` и
-/// необязательное `indexing`; `DontIndex` в выгрузку не пишется, поэтому
+/// секции `attributes` / `dimensions` / `resources` / `tabular_sections`, у поля —
+/// `name` и необязательное `indexing`; `DontIndex` в выгрузку не пишется, поэтому
 /// отсутствие ключа означает «поле не индексировано». Вид регистра лежит в
 /// `properties.RegisterType`.
+///
+/// Табличные части читаются с issue #42: их имена видны в модуле объекта без
+/// префикса (`Товары.Очистить()`), а в справке платформы их нет — без этой секции
+/// правило голов принимало законную табличную часть за опечатку глобального
+/// свойства (`Заказы` → «возможно, вы имели в виду Задачи»).
 fn object_schema_from_json(text: &str) -> Option<ObjectSchema> {
     let value: Value = serde_json::from_str(text).ok()?;
     let section = |key: &str| -> Vec<ObjectField> {
@@ -1498,6 +1564,16 @@ fn object_schema_from_json(text: &str) -> Option<ObjectSchema> {
         attributes: section("attributes"),
         dimensions: section("dimensions"),
         resources: section("resources"),
+        tabular_sections: section("tabular_sections"),
+        enum_values: value
+            .get("enum_values")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|item| Some(item.as_str()?.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default(),
         register_type: value
             .pointer("/properties/RegisterType")
             .and_then(|v| v.as_str())
@@ -2288,6 +2364,81 @@ data: {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabili
         assert_eq!(meta_type_for_collection("Catalogs"), Some("Catalog"));
         assert_eq!(meta_type_for_collection("Enums"), Some("Enum"));
         assert_eq!(meta_type_for_collection("НеизвестнаяКоллекция"), None);
+    }
+
+    /// Табличные части объекта читаются из `attributes_json` (issue #42): без них
+    /// правило голов принимало законную ТЧ за опечатку глобального свойства
+    /// (`Заказы` → «возможно, вы имели в виду Задачи») и валило корректный модуль
+    /// объекта с `valid: false`. Секция в индексе есть — проверяем, что она
+    /// доезжает до состава.
+    #[test]
+    fn tabular_sections_are_read_from_attributes_json() {
+        let json = r#"{
+            "attributes": [{"name": "Организация"}],
+            "dimensions": [],
+            "resources": [],
+            "tabular_sections": [
+                {"name": "Заказы", "attributes": [{"name": "Номенклатура"}]},
+                {"name": "Запасы"}
+            ],
+            "properties": {"RegisterType": "Balance"}
+        }"#;
+        let schema = object_schema_from_json(json).expect("состав должен разобраться");
+        let names: Vec<&str> = schema
+            .tabular_sections
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
+        assert_eq!(names, ["Заказы", "Запасы"]);
+        assert!(schema.implicit_name("заказы"));
+        assert!(schema.implicit_name("Организация"));
+        assert!(!schema.implicit_name("Задачи"));
+        // Табличная часть — не поле запроса: `field` её не видит.
+        assert!(schema.field("заказы").is_none());
+    }
+
+    /// Индекс без секции `tabular_sections` (сборка старой версии) — состав пуст,
+    /// правило голов работает как раньше, без ложного молчания.
+    #[test]
+    fn missing_tabular_section_is_not_an_error() {
+        let schema = object_schema_from_json(r#"{"attributes": [{"name": "Организация"}]}"#)
+            .expect("состав должен разобраться");
+        assert!(schema.tabular_sections.is_empty());
+        assert!(schema.implicit_name("Организация"));
+    }
+
+    /// Значения прикладного перечисления читаются из `attributes_json`
+    /// (issue #41): без них правило `Перечисления.<Имя>.<Значение>` молчало бы
+    /// всегда, а с пустым списком — ещё и неотличимо от «состав не отдан».
+    ///
+    /// Те же секции, что в реальной выгрузке УТ (проверено запросом к индексу
+    /// по `Перечисления.ВариантыОкругления`).
+    #[test]
+    fn enum_values_are_read_from_attributes_json() {
+        let json = r#"{
+            "attributes": [],
+            "dimensions": [],
+            "resources": [],
+            "tabular_sections": [],
+            "enum_synonyms": {"ПоАрифметическимПравилам": "По арифметическим правилам"},
+            "enum_values": ["ПоАрифметическимПравилам", "ВсегдаВПользуКлиента"]
+        }"#;
+        let schema = object_schema_from_json(json).expect("состав должен разобраться");
+        assert_eq!(
+            schema.enum_values,
+            ["ПоАрифметическимПравилам", "ВсегдаВПользуКлиента"]
+        );
+        assert!(schema.has_enum_value("поАрифметическимПравилам"));
+        assert!(!schema.has_enum_value("ВсегдаВПользуПредприятия"));
+    }
+
+    /// Перечисление без значений в индексе — состав НЕ отдан: список пуст, и
+    /// правило обязано молчать, а не считать все значения несуществующими.
+    #[test]
+    fn enum_without_values_is_empty_not_forbidden() {
+        let schema = object_schema_from_json(r#"{"attributes": []}"#).expect("состав");
+        assert!(schema.enum_values.is_empty());
+        assert!(!schema.has_enum_value("ЧтоУгодно"));
     }
 
     /// Три плана — исключение из правила «meta_type в единственном числе».

@@ -97,6 +97,28 @@ pub(crate) const MANAGER_COLLECTIONS: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// Идентификатор коллекции для источника имён по русскому имени коллекции
+/// метаданных (`Справочники` → `Catalogs`) — для ветки `Метаданные.<Коллекция>`
+/// (issue #43). `None` — коллекция вне таблицы менеджеров (`ОбщиеМодули`,
+/// `Языки`, …): источник имён её не знает, проверять нечего.
+pub(crate) fn collection_id_for_metadata(collection: &str) -> Option<&'static str> {
+    let needle = collection.to_lowercase();
+    MANAGER_COLLECTIONS
+        .iter()
+        .find(|(name, _, _)| name.to_lowercase() == needle)
+        .map(|(_, id, _)| *id)
+}
+
+/// Имя вида объекта метаданных в единственном числе (`Справочники` → `Справочник`):
+/// из него собирается имя типа справки `ОбъектМетаданных: Справочник`.
+pub(crate) fn metadata_singular_for(collection: &str) -> Option<&'static str> {
+    let needle = collection.to_lowercase();
+    MANAGER_COLLECTIONS
+        .iter()
+        .find(|(name, _, _)| name.to_lowercase() == needle)
+        .and_then(|(_, _, prefix)| prefix.strip_suffix("Менеджер"))
+}
+
 /// Имена контекста, которых нет в справке платформы, но которые реальны в коде:
 /// основной реквизит формы и сам объект. Через них идёт обращение к реквизитам
 /// (`Объект.Товары`), головой общего модуля они не бывают.
@@ -172,14 +194,16 @@ pub(crate) fn check_config_objects(
             }
             let member_lower = dot.member.to_lowercase();
             if symbols.object_exists(collection, &member_lower) == Some(false) {
-                emit(
-                    errors,
-                    src,
-                    dot.member_byte,
+                let (line, col) = pos_at(src, dot.member_byte);
+                errors.push(ExprError::new_with_confidence(
+                    line,
+                    col,
                     ExprErrorKind::UnknownMetadataObject,
                     format!("Объект '{}' не существует в '{}'.", dot.member, dot.head),
+                    source_confidence(Some(symbols)),
                     suggestion_for(symbols, collection, &dot.member),
-                );
+                    Vec::new(),
+                ));
             }
             continue;
         }
@@ -233,14 +257,16 @@ pub(crate) fn check_config_objects(
             if closest_global_property(index, &dot.head).is_some() {
                 continue;
             }
-            emit(
-                errors,
-                src,
-                dot.head_byte,
+            let (line, col) = pos_at(src, dot.head_byte);
+            errors.push(ExprError::new_with_confidence(
+                line,
+                col,
                 ExprErrorKind::UnknownCommonModule,
                 format!("Общий модуль '{}' не существует в конфигурации.", dot.head),
+                source_confidence(Some(symbols)),
                 suggestion_for(symbols, "CommonModules", &dot.head),
-            );
+                Vec::new(),
+            ));
         }
     }
 
@@ -336,6 +362,7 @@ pub(crate) fn check_global_property_heads(
     index: &PlatformIndex,
     src: &str,
     facts: &AstFacts,
+    module_path: Option<&str>,
     form_module: bool,
     form_attributes: Option<&HashSet<String>>,
     symbols: Option<&dyn SymbolSource>,
@@ -351,6 +378,18 @@ pub(crate) fn check_global_property_heads(
     let bound = locally_bound_names(facts);
     let managed_form = form_module && facts.has_directives;
 
+    // Имена, видимые в модуле ВЛАДЕЛЬЦА без префикса: реквизиты и табличные
+    // части объекта, измерения и ресурсы регистра. В справке платформы их нет —
+    // состав знает только источник имён. Без этой сверки табличная часть
+    // `Заказы` (обработка `ФормированиеЗаказовПоставщикам`) получала подсказку
+    // «возможно, вы имели в виду Задачи» и `valid: false` на корректном коде
+    // (issue #42, п. 2). `None` — состава нет: правило работает как раньше.
+    let owner_schema = if form_module {
+        None
+    } else {
+        owner_schema(symbols, module_path)
+    };
+
     for dot in &facts.dots {
         let head_lower = dot.head.to_lowercase();
 
@@ -358,6 +397,13 @@ pub(crate) fn check_global_property_heads(
             continue;
         }
         if form_attributes.is_some_and(|a| a.contains(&head_lower)) {
+            continue;
+        }
+        // Реквизит или табличная часть собственного объекта — законная голова.
+        if owner_schema
+            .as_ref()
+            .is_some_and(|schema| schema.implicit_name(&head_lower))
+        {
             continue;
         }
         // Мусор восстановления дерева после ошибки разбора — головой может
@@ -384,24 +430,102 @@ pub(crate) fn check_global_property_heads(
             continue;
         }
 
-        let Some((suggestion, confidence)) = closest_global_property(index, &dot.head) else {
+        if let Some((suggestion, confidence)) = closest_global_property(index, &dot.head) {
+            let (line, col) = pos_at(src, dot.head_byte);
+            errors.push(ExprError::new_with_confidence(
+                line,
+                col,
+                ExprErrorKind::UnknownGlobalProperty,
+                format!(
+                    "'{}' не найдено в глобальном контексте платформы. \
+                     Возможно, вы имели в виду '{}'.",
+                    dot.head, suggestion
+                ),
+                confidence,
+                Some(suggestion),
+                Vec::new(),
+            ));
             continue;
-        };
-        let (line, col) = pos_at(src, dot.head_byte);
-        errors.push(ExprError::new_with_confidence(
-            line,
-            col,
-            ExprErrorKind::UnknownGlobalProperty,
-            format!(
-                "'{}' не найдено в глобальном контексте платформы. \
-                 Возможно, вы имели в виду '{}'.",
-                dot.head, suggestion
-            ),
-            confidence,
-            Some(suggestion),
-            Vec::new(),
-        ));
+        }
+
+        // Опечатки глобального имени нет. В модуле ОБЪЕКТА и НАБОРА ЗАПИСЕЙ
+        // сверим голову ещё и с составом собственного объекта (issue #42, п. 1):
+        // `НетТакойТЧ1.Итог("Сумма")` — не опечатка платформенного имени, но и не
+        // имя из состава. Состав берём из источника имён, а стандартные реквизиты
+        // (`Ссылка`, `Номер`, `Проведен`, …) и методы объекта — из шаблонного типа
+        // справки `ДокументОбъект.<Имя документа>`. Нет ни того, ни другого —
+        // находка с пониженной уверенностью: состав мог быть неполон.
+        if let (Some(schema), Some(path)) = (owner_schema.as_ref(), module_path) {
+            if let Some(context) = crate::module_context::context_type(index, path, false, None) {
+                if !context_has_member(context, &head_lower) {
+                    let owner = crate::module_context::owner_of_anywhere(path)
+                        .map(|(_, name)| name)
+                        .unwrap_or_default();
+                    let suggestion = closest_object_member(schema, &dot.head);
+                    let message = match &suggestion {
+                        Some(member) => format!(
+                            "'{}' не найдено ни в составе объекта '{}', ни в глобальном \
+                             контексте платформы. Возможно, вы имели в виду '{}'.",
+                            dot.head, owner, member
+                        ),
+                        None => format!(
+                            "'{}' не найдено ни в составе объекта '{}', ни в глобальном \
+                             контексте платформы.",
+                            dot.head, owner
+                        ),
+                    };
+                    let (line, col) = pos_at(src, dot.head_byte);
+                    errors.push(ExprError::new_with_confidence(
+                        line,
+                        col,
+                        ExprErrorKind::UnknownGlobalProperty,
+                        message,
+                        Confidence::Low,
+                        suggestion,
+                        Vec::new(),
+                    ));
+                }
+            }
+        }
     }
+}
+
+/// Имя — свойство или метод типа контекста владельца (`ДокументОбъект.<Имя>`,
+/// `РегистрНакопленияНаборЗаписей.<Имя>`)? Так в модуле объекта законны
+/// стандартные реквизиты (`Ссылка`, `Номер`, `Дата`, `Проведен`, `Регистратор`, …)
+/// и методы объекта (`Записать`, `Прочитать`, …), которых нет ни в справке как
+/// отдельных имён, ни в составе из источника.
+fn context_has_member(ty: &Type, name_lower: &str) -> bool {
+    ty.properties
+        .iter()
+        .any(|p| p.name_ru.to_lowercase() == name_lower)
+        || ty
+            .methods
+            .iter()
+            .any(|m| m.name_ru.to_lowercase() == name_lower)
+}
+
+/// Ближайшее по написанию имя из состава объекта — но только когда это
+/// правдоподобная опечатка (та же двухпороговая эвристика, что у глобальных имён).
+fn closest_object_member(schema: &crate::symbols::ObjectSchema, head: &str) -> Option<String> {
+    let head_lc = head.to_lowercase();
+    let mut best: Option<(String, usize)> = None;
+    for name in schema
+        .attributes
+        .iter()
+        .chain(schema.tabular_sections.iter())
+        .chain(schema.dimensions.iter())
+        .chain(schema.resources.iter())
+        .map(|field| field.name.as_str())
+    {
+        let distance = lev(&head_lc, &name.to_lowercase());
+        match &best {
+            Some((_, best_distance)) if distance >= *best_distance => {}
+            _ => best = Some((name.to_string(), distance)),
+        }
+    }
+    let (suggestion, distance) = best?;
+    fuzzy_confidence_for(head, &suggestion, distance).map(|_| suggestion)
 }
 
 /// Ближайшее по написанию свойство глобального контекста — но только когда это
@@ -432,6 +556,37 @@ fn closest_global_property(index: &PlatformIndex, head: &str) -> Option<(String,
     Some((suggestion, confidence))
 }
 
+/// Состав объекта-владельца модуля из источника имён.
+///
+/// `None` — состава нет, и правило голов не меняется: путь не передан, модуль не
+/// объектный (в модуле менеджера реквизиты объекта без префикса НЕ видны, и
+/// молчание по составу скрыло бы настоящую опечатку), папка не из выгрузки,
+/// коллекция источнику неизвестна или он не знает такой объект. Молчание здесь
+/// было бы сильнее, но и дороже: под него попал бы и настоящий вызов с опечаткой
+/// в имени глобального свойства (`Метаданны.Справочники`).
+fn owner_schema(
+    symbols: Option<&dyn SymbolSource>,
+    module_path: Option<&str>,
+) -> Option<crate::symbols::ObjectSchema> {
+    let symbols = symbols?;
+    let path = module_path?;
+    // Неявный контекст объекта есть только у модуля объекта и набора записей.
+    if !matches!(
+        crate::module_context::module_kind(path),
+        crate::module_context::ModuleKind::Object | crate::module_context::ModuleKind::RecordSet
+    ) {
+        return None;
+    }
+    let (folder, name) = crate::module_context::owner_of_anywhere(path)?;
+    // Идентификатор коллекции для источника — второй столбец таблицы менеджеров
+    // (`Catalogs`, `Documents`, `DataProcessors`, …); папка выгрузки пишется так
+    // же, но сверяем без учёта регистра, как и остальной разбор путей.
+    let (_, collection, _) = MANAGER_COLLECTIONS
+        .iter()
+        .find(|(_, folder_in_table, _)| folder_in_table.eq_ignore_ascii_case(folder))?;
+    symbols.object_schema(collection, &name.to_lowercase())
+}
+
 /// Имена, связанные локально ГДЕ-ЛИБО в модуле: любое присваивание простому
 /// идентификатору (`Перем Х` — `declaration=true`, и обычное `Х = ...` —
 /// `declaration=false`, оно тоже связывает имя, даже без предшествующего
@@ -443,7 +598,7 @@ fn closest_global_property(index: &PlatformIndex, head: &str) -> Option<(String,
 /// Переменные циклов — самый массовый источник: замер на УТ без них дал 39431
 /// ложную находку (`Для Каждого КлючЗначение Из ... Цикл КлючЗначение.Ключ`),
 /// потому что цикл связывает имя, не порождая присваивания в дереве.
-fn locally_bound_names(facts: &AstFacts) -> HashSet<String> {
+pub(crate) fn locally_bound_names(facts: &AstFacts) -> HashSet<String> {
     let mut names: HashSet<String> = facts
         .assigns
         .iter()
@@ -633,6 +788,17 @@ fn form_type_has_member(index: &PlatformIndex, name: &str) -> bool {
             .any(|m| m.name_ru.to_lowercase() == name_lower)
 }
 
+/// Уверенность находки по ответу ИСТОЧНИКА имён: у «тонкого» источника (пустой
+/// или почти пустой индекс, issue #46) ответ «не найдено» — не доказательство.
+/// Транспорт при этом исправен, и отличить «объекта нет» от «источник ничего не
+/// знает» было нечем: такие находки понижаются до `Low`.
+fn source_confidence(symbols: Option<&dyn SymbolSource>) -> Confidence {
+    match symbols {
+        Some(source) if source.is_thin() => Confidence::Low,
+        _ => Confidence::High,
+    }
+}
+
 /// Ближайшее имя из коллекции по расстоянию Левенштейна — но только когда это
 /// правдоподобная опечатка (двухпороговая эвристика `fuzzy_confidence_for`,
 /// та же, что у `UnknownGlobalMethod`).
@@ -641,7 +807,11 @@ fn form_type_has_member(index: &PlatformIndex, name: &str) -> bool {
 /// `fuzzy_confidence_for` в этом случае вернёт `None`, и подсказки не будет.
 /// Это правильно: ложная подсказка хуже её отсутствия, слабая модель воспримет
 /// её как подтверждённый факт.
-fn suggestion_for(symbols: &dyn SymbolSource, collection: &str, name: &str) -> Option<String> {
+pub(crate) fn suggestion_for(
+    symbols: &dyn SymbolSource,
+    collection: &str,
+    name: &str,
+) -> Option<String> {
     let names = symbols.collection_names(collection)?;
     let name_lower = name.to_lowercase();
     let mut best: Option<(String, usize)> = None;
@@ -662,37 +832,6 @@ fn suggestion_for(symbols: &dyn SymbolSource, collection: &str, name: &str) -> O
     let (candidate, distance) = best?;
     fuzzy_confidence_for(name, &candidate, distance)?;
     Some(candidate)
-}
-
-/// Собрать сообщение с хвостом-подсказкой (если она есть) и добавить находку.
-/// Формат хвоста — тот же, что у `check_type_dot_members` в `expression.rs`:
-/// единообразный вид сообщений для потребителя. `Confidence` берётся явно из
-/// `kind.confidence()` (единый источник истины), а не через `ExprError::new`:
-/// конструктор модуль-приватный (виден только внутри `expression.rs`), менять
-/// его видимость правкой не предусмотрено — расширять список публичных
-/// точек входа сверх заказанного (`lev`) нежелательно.
-fn emit(
-    errors: &mut Vec<ExprError>,
-    src: &str,
-    byte: usize,
-    kind: ExprErrorKind,
-    message: String,
-    suggestion: Option<String>,
-) {
-    let (line, col) = pos_at(src, byte);
-    let tail = suggestion
-        .as_ref()
-        .map(|s| format!(" Возможно, вы имели в виду '{s}'."))
-        .unwrap_or_default();
-    errors.push(ExprError::new_with_confidence(
-        line,
-        col,
-        kind,
-        format!("{message}{tail}"),
-        kind.confidence(),
-        suggestion,
-        Vec::new(),
-    ));
 }
 
 #[cfg(test)]

@@ -87,36 +87,83 @@ pub fn path_in_source_message(text: &str) -> String {
 
 /// Прочитать модуль по пути внутри корня выгрузки конфигурации.
 ///
-/// `raw` — абсолютный путь или путь относительно `root`. Файл обязан после
-/// разрешения символических ссылок и junction'ов остаться внутри корня: иначе
-/// инструмент стал бы средством чтения любых файлов машины.
+/// Обёртка над [`read_module_in`] для одного корня: так вызывают тесты и код,
+/// которому дополнительные корни не нужны.
 pub fn read_module(root: &Path, raw: &str) -> Result<ModuleFile, String> {
+    let roots = [root.to_path_buf()];
+    read_module_in(&roots, raw)
+}
+
+/// Прочитать модуль по пути внутри ОДНОГО из корней выгрузки (issue #45).
+///
+/// `raw` — абсолютный путь или путь относительно корня. Корни перебираются по
+/// порядку: сначала основной (`root`), затем дополнительные (`extra_roots`).
+/// Файл обязан после разрешения символических ссылок и junction'ов остаться
+/// внутри ТОГО корня, из которого он прочитан: иначе инструмент стал бы средством
+/// чтения любых файлов машины. `module_path` считается от этого же корня, поэтому
+/// раскладка выгрузки в нём сохраняется и эвристики вида модуля продолжают
+/// работать.
+pub fn read_module_in(roots: &[PathBuf], raw: &str) -> Result<ModuleFile, String> {
     let raw = raw.trim();
     if raw.is_empty() {
         return Err("параметр path пуст".to_string());
     }
-    let root_canon = root
-        .canonicalize()
-        .map_err(|e| format!("корень выгрузки {} недоступен: {e}", root.display()))?;
-
-    let candidate = Path::new(raw);
-    let joined = if candidate.is_absolute() {
-        candidate.to_path_buf()
-    } else {
-        root_canon.join(candidate)
-    };
-    let file = joined
-        .canonicalize()
-        .map_err(|e| format!("файл не найден: {} ({e})", joined.display()))?;
-    if !file.starts_with(&root_canon) {
-        return Err(format!(
-            "путь выходит за корень выгрузки {}: {}",
-            root_canon.display(),
-            file.display()
-        ));
+    if roots.is_empty() {
+        return Err(
+            "у источника имён не задан корень выгрузки (root): читать модуль \
+                    по пути не из чего"
+                .to_string(),
+        );
     }
 
-    let meta = std::fs::metadata(&file).map_err(|e| {
+    let candidate = Path::new(raw);
+    let mut not_found: Vec<String> = Vec::new();
+    for root in roots {
+        let root_canon = root
+            .canonicalize()
+            .map_err(|e| format!("корень выгрузки {} недоступен: {e}", root.display()))?;
+        let joined = if candidate.is_absolute() {
+            candidate.to_path_buf()
+        } else {
+            root_canon.join(candidate)
+        };
+        let Ok(file) = joined.canonicalize() else {
+            not_found.push(joined.display().to_string());
+            continue;
+        };
+        if !file.starts_with(&root_canon) {
+            // Файл есть, но вне ЭТОГО корня: возможно, он в дополнительном.
+            continue;
+        }
+        return finish_module(&file, &root_canon);
+    }
+
+    // Ни один корень не подошёл: файл либо вне всех корней, либо его нет.
+    if candidate.is_absolute() && candidate.exists() {
+        return Err(match roots {
+            [only] => format!(
+                "путь выходит за корень выгрузки {}: {}",
+                only.display(),
+                candidate.display()
+            ),
+            _ => format!(
+                "путь выходит за корни выгрузки ({}): {}",
+                roots
+                    .iter()
+                    .map(|root| root.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                candidate.display()
+            ),
+        });
+    }
+    Err(format!("файл не найден: {}", not_found.join(" или ")))
+}
+
+/// Дочитать найденный файл: проверки вида и размера, текст без BOM, `module_path`
+/// от корня, внутри которого файл лежит.
+fn finish_module(file: &Path, root_canon: &Path) -> Result<ModuleFile, String> {
+    let meta = std::fs::metadata(file).map_err(|e| {
         format!(
             "не удалось прочитать свойства файла {}: {e}",
             file.display()
@@ -143,7 +190,7 @@ pub fn read_module(root: &Path, raw: &str) -> Result<ModuleFile, String> {
         ));
     }
 
-    let bytes = std::fs::read(&file)
+    let bytes = std::fs::read(file)
         .map_err(|e| format!("не удалось прочитать файл {}: {e}", file.display()))?;
     let text = String::from_utf8(bytes)
         .map_err(|_| format!("файл не читается как UTF-8: {}", file.display()))?;
@@ -151,14 +198,14 @@ pub fn read_module(root: &Path, raw: &str) -> Result<ModuleFile, String> {
     let text = text.strip_prefix('\u{feff}').unwrap_or(&text).to_string();
 
     let module_path = file
-        .strip_prefix(&root_canon)
-        .unwrap_or(&file)
+        .strip_prefix(root_canon)
+        .unwrap_or(file)
         .to_string_lossy()
         .replace('\\', "/");
 
     Ok(ModuleFile {
         text,
-        path: file,
+        path: file.to_path_buf(),
         module_path,
         bytes: meta.len(),
         modified: meta.modified().ok().map(|t| {
@@ -273,5 +320,54 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = read_module(&dir.path().join("нет-такого-корня"), "Module.bsl").unwrap_err();
         assert!(err.contains("корень выгрузки"), "{err}");
+    }
+
+    /// Issue #45: модуль внешней обработки лежит ВНЕ корня выгрузки конфигурации.
+    #[test]
+    fn extra_root_is_searched_after_the_main_one() {
+        let main = tempfile::tempdir().unwrap();
+        let extra = tempfile::tempdir().unwrap();
+        let nested = extra
+            .path()
+            .join("Form")
+            .join("ВнешняяОбработка")
+            .join("Ext")
+            .join("Form");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("Module.bsl"), "Процедура Т()\nКонецПроцедуры\n").unwrap();
+
+        let roots = vec![main.path().to_path_buf(), extra.path().to_path_buf()];
+        let module = read_module_in(&roots, "Form/ВнешняяОбработка/Ext/Form/Module.bsl").unwrap();
+        // `module_path` считается от того корня, где файл нашёлся: раскладка
+        // выгрузки в нём сохраняется, и эвристики вида модуля работают.
+        assert_eq!(
+            module.module_path,
+            "Form/ВнешняяОбработка/Ext/Form/Module.bsl"
+        );
+        assert!(module.text.contains("Процедура Т"));
+
+        // Основной корень ищется первым: файл с тем же относительным путём
+        // берётся из него, а не из дополнительного.
+        let main_file = main
+            .path()
+            .join("Form")
+            .join("ВнешняяОбработка")
+            .join("Ext")
+            .join("Form");
+        std::fs::create_dir_all(&main_file).unwrap();
+        std::fs::write(main_file.join("Module.bsl"), "// из основного корня\n").unwrap();
+        let module = read_module_in(&roots, "Form/ВнешняяОбработка/Ext/Form/Module.bsl").unwrap();
+        assert!(module.text.contains("основного корня"));
+
+        // Абсолютный путь вне ВСЕХ корней по-прежнему отвергается.
+        let alien = tempfile::tempdir().unwrap();
+        let alien_file = alien.path().join("Чужой.bsl");
+        std::fs::write(&alien_file, "Процедура Т()\nКонецПроцедуры\n").unwrap();
+        let err = read_module_in(&roots, &alien_file.to_string_lossy()).unwrap_err();
+        assert!(err.contains("выходит за корни"), "{err}");
+
+        // Без единого корня читать нечего — понятный отказ, а не паника.
+        let err = read_module_in(&[], "Module.bsl").unwrap_err();
+        assert!(err.contains("не задан корень"), "{err}");
     }
 }

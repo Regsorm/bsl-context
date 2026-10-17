@@ -35,9 +35,33 @@ pub struct ObjectSchema {
     pub attributes: Vec<ObjectField>,
     pub dimensions: Vec<ObjectField>,
     pub resources: Vec<ObjectField>,
+    /// Табличные части объекта. В модуле объекта их имена видны без префикса
+    /// (`Товары.Очистить()`), но в справке платформы их нет — состав знает
+    /// только источник имён (issue #42).
+    pub tabular_sections: Vec<ObjectField>,
     /// Вид регистра накопления: `Balance` (остатки) или `Turnovers` (обороты).
     /// Только для регистров накопления; у прочих объектов `None`.
     pub register_type: Option<String>,
+    /// Значения перечисления — только у объектов коллекции `Enums`
+    /// (`enum_values` из `attributes_json`). Пустой список означает «источник
+    /// значений не отдал»: правило по `Перечисления.<Имя>.<Значение>` обязано в
+    /// этом случае молчать целиком, иначе выдуманное значение неотличимо от
+    /// законного (issue #41).
+    pub enum_values: Vec<String>,
+}
+
+/// Счётчики состава источника имён — для `symbol_sources_status` (issue #46).
+///
+/// Ответ «объект не существует» убедителен ровно настолько, насколько полон
+/// источник. Пустой или почти пустой индекс отвечает так же уверенно, как
+/// полный, и вызывающий не может отличить одно от другого: этих чисел в статусе
+/// не было.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SourceStats {
+    /// Сколько объектов конфигурации знает источник.
+    pub objects: usize,
+    /// Сколько имён (объектов вместе с методами и переменными) в индексе.
+    pub names: usize,
 }
 
 impl ObjectSchema {
@@ -59,6 +83,33 @@ impl ObjectSchema {
             .chain(self.dimensions.iter())
             .chain(self.resources.iter())
             .find(|f| f.name.to_lowercase() == key)
+    }
+
+    /// Имя видно в модуле ВЛАДЕЛЬЦА без префикса: реквизит объекта, измерение,
+    /// ресурс или табличная часть? В модуле объекта такие имена законны
+    /// (`Товары.Очистить()`), хотя в справке платформы их нет вовсе — правило
+    /// голов обязано их пропускать (issue #42, п. 2).
+    ///
+    /// От [`Self::field`] отличается составом: табличные части входят, а логика
+    /// «поля запроса» на них не распространяется.
+    pub fn implicit_name(&self, name_lower: &str) -> bool {
+        let key = name_lower.to_lowercase();
+        self.attributes
+            .iter()
+            .chain(self.dimensions.iter())
+            .chain(self.resources.iter())
+            .chain(self.tabular_sections.iter())
+            .any(|f| f.name.to_lowercase() == key)
+    }
+
+    /// Значение перечисления с таким именем есть в составе? `enum_values` пуст —
+    /// состав не отдан, и вопрос некорректен: вызывающий обязан проверить
+    /// [`Self::enum_values`] сам (issue #41).
+    pub fn has_enum_value(&self, name_lower: &str) -> bool {
+        let key = name_lower.to_lowercase();
+        self.enum_values
+            .iter()
+            .any(|value| value.to_lowercase() == key)
     }
 }
 
@@ -150,6 +201,23 @@ pub trait SymbolSource: Send + Sync {
     /// «метод не объявлен» на каждый вызов. Локальные источники всегда исправны.
     fn is_healthy(&self) -> bool {
         true
+    }
+
+    /// Счётчики состава: сколько объектов и имён знает источник. `None` —
+    /// источник их не считает; тогда в `symbol_sources_status` их не будет.
+    fn stats(&self) -> Option<SourceStats> {
+        None
+    }
+
+    /// Состав источника НЕПРАВДОПОДОБНО мал — индекс пуст или почти пуст
+    /// (issue #46).
+    ///
+    /// Транспорт при этом исправен: `is_healthy` остаётся `true`, и отличить
+    /// «нет такого объекта» от «источник ничего не знает» было нечем. По такому
+    /// источнику находки о несуществующих объектах и общих модулях понижаются до
+    /// `Low`: ответ «не найдено» не доказательство, а следствие пустоты.
+    fn is_thin(&self) -> bool {
+        false
     }
 
     /// Человекочитаемое имя источника (для /health и логов).

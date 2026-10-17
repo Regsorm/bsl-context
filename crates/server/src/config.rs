@@ -104,6 +104,18 @@ pub struct SymbolSourceConfig {
     /// `validate_module` с параметром `path`: модуль читается только внутри этого
     /// корня. Проверка по тексту (`source`) файловую систему не трогает.
     pub root: Option<PathBuf>,
+    /// Дополнительные корни, внутри которых тоже можно читать модули
+    /// (`validate_module` с параметром `path`).
+    ///
+    /// Нужны для модулей ВНЕ выгрузки конфигурации: распакованная внешняя
+    /// обработка, отдельный каталог сборки, чужой репозиторий. Проверка «файл
+    /// внутри корня» выполняется по каждому корню отдельно и после разрешения
+    /// символических ссылок; `module_path` считается от того корня, внутри
+    /// которого файл нашёлся (issue #45).
+    ///
+    /// Основной `root` при этом остаётся: он же корень для
+    /// `rebuild_symbol_index` и для вывода пути модуля-владельца.
+    pub extra_roots: Vec<PathBuf>,
     /// URL MCP-сервера code-index, например http://127.0.0.1:8011/mcp
     pub url: Option<String>,
     /// Алиас конфигурации: это значение параметра `repo` у `validate_module` и
@@ -136,6 +148,7 @@ impl Default for SymbolSourceConfig {
             kind: "none".to_string(),
             db_path: None,
             root: None,
+            extra_roots: Vec::new(),
             url: None,
             repo: None,
             code_index_repo: None,
@@ -156,6 +169,10 @@ impl SymbolSourceConfig {
     fn resolve_paths(&mut self, base: &Path) {
         self.db_path = self.db_path.take().map(|p| resolve_relative(base, p));
         self.root = self.root.take().map(|p| resolve_relative(base, p));
+        self.extra_roots = std::mem::take(&mut self.extra_roots)
+            .into_iter()
+            .map(|p| resolve_relative(base, p))
+            .collect();
     }
 
     /// Проверка обязательных полей по `kind`. Понятная ошибка на загрузке
@@ -167,13 +184,14 @@ impl SymbolSourceConfig {
                 // игнорировались бы — предупреждаем (в списке это ошибка).
                 if self.db_path.is_some()
                     || self.root.is_some()
+                    || !self.extra_roots.is_empty()
                     || self.url.is_some()
                     || self.repo.is_some()
                     || self.code_index_repo.is_some()
                 {
                     tracing::warn!(
                         "symbol_source.kind = \"none\": поля \
-                         db_path/root/url/repo/code_index_repo заданы, но не используются — \
+                         db_path/root/extra_roots/url/repo/code_index_repo заданы, но не используются — \
                          укажите kind источника"
                     );
                 }

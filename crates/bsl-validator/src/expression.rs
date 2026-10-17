@@ -28,7 +28,8 @@ use platform_index::{PlatformIndex, Type};
 
 use bsl_parse::{collect_facts, CallFact, DotFact, NewFact};
 
-use crate::check::{validate_method_call, SimilarValue};
+use crate::check::{check_constructor_arguments, validate_method_call, SimilarValue};
+use crate::legacy_globals::is_legacy_global_method;
 use crate::locals::LocalNames;
 use crate::scope::{extract_scope_map, extract_type_annotations, ScopeMap};
 use crate::symbols::SymbolSource;
@@ -84,7 +85,7 @@ pub struct ExprError {
 impl ExprError {
     /// Сконструировать ошибку, проставив `confidence` из `kind` (единый источник
     /// истины — [`ExprErrorKind::confidence`]).
-    fn new(
+    pub(crate) fn new(
         line: u32,
         col: u32,
         kind: ExprErrorKind,
@@ -801,7 +802,7 @@ pub(crate) fn check_new_expressions(
     errors: &mut Vec<ExprError>,
 ) {
     for n in news {
-        if index.find_type(&n.type_name).is_none() {
+        let Some(ty) = index.find_type(&n.type_name) else {
             let (line, col) = pos_at(src, n.byte);
             // Сортировка — детерминированный порядок кандидатов при равном
             // сходстве (обход HashMap случаен; подсказка плавала между запусками).
@@ -822,6 +823,22 @@ pub(crate) fn check_new_expressions(
                         .unwrap_or_default()
                 ),
                 suggestion,
+                Vec::new(),
+            ));
+            continue;
+        };
+        // Число аргументов конструктора (issue #44): справка описывает параметры
+        // и их обязательность, поэтому «слишком много аргументов» проверяется так
+        // же, как у глобальных методов. Раньше не считалось вовсе —
+        // `Новый Файл("a", "b", "c")` проходил молча.
+        if let Some(message) = check_constructor_arguments(ty, n.arg_count) {
+            let (line, col) = pos_at(src, n.byte);
+            errors.push(ExprError::new(
+                line,
+                col,
+                ExprErrorKind::WrongArgumentCount,
+                message,
+                None,
                 Vec::new(),
             ));
         }
@@ -881,6 +898,13 @@ pub(crate) fn check_global_calls(
 
         // Если имя — известный глобальный метод, попытаемся посчитать аргументы.
         let Some(_method) = index.find_global_method(&call.name) else {
+            // Устаревшие, но живые глобальные методы (issue #40): справка их уже
+            // не описывает, а платформа исполняет. Сигнатуры в индексе нет, так
+            // что проверять нечего; без этой ветки вызов рабочего метода получал
+            // `undeclared_method` с `confidence: high` — см. `legacy_globals`.
+            if is_legacy_global_method(&call.name) {
+                continue;
+            }
             // Метод платформенного типа, вызванный без префикса из собственного
             // модуля. Это ни неизвестный глобальный метод, ни описка: fuzzy тут
             // выдавал уверенную чушь (`ПустаяСсылка()` в модуле менеджера →

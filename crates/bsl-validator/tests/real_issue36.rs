@@ -83,7 +83,9 @@ impl SymbolSource for Stub {
                 })
                 .collect(),
             resources: Vec::new(),
+            tabular_sections: Vec::new(),
             register_type: Some("Balance".to_string()),
+            enum_values: Vec::new(),
         })
     }
 

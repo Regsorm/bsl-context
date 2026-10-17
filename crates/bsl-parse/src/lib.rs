@@ -30,11 +30,34 @@ pub struct DotFact {
     pub member_is_call: bool,
 }
 
-/// Конструктор `Новый ИмяТипа`.
+/// Конструктор `Новый ИмяТипа(...)`.
 pub struct NewFact {
     pub type_name: String,
+    /// Число аргументов в скобках; `0` — скобок нет (`Новый Массив`). Считается
+    /// тем же текстовым счётчиком, что у [`CallFact`]: запятые внутри строковых
+    /// литералов, комментариев и вложенных скобок аргументами не считаются.
+    pub arg_count: usize,
     pub byte: usize,
 }
+
+/// Цепочка `Имя.Имя.Имя…` без вызовов и индексации, разобранная ЦЕЛИКОМ.
+///
+/// Обычного [`DotFact`] мало там, где важны сегменты глубже первого звена: он
+/// описывает только `Голова.Член`, а `Метаданные.Справочники.Номенклатура.
+/// ПредопределенныеЗначения` (issue #43) и `Перечисления.ВидыЗадач.Значение`
+/// (issue #41) — цепочки из трёх и четырёх сегментов. Собираются только головы из
+/// [`CHAIN_HEADS`]: разбирать все цепочки подряд незачем, а фактов стало бы
+/// столько же, сколько обращений через точку в модуле.
+pub struct ChainFact {
+    /// Голова цепочки (первый сегмент) как написана в коде.
+    pub head: String,
+    pub head_byte: usize,
+    /// Остальные сегменты с их байтовыми смещениями, в порядке текста.
+    pub segments: Vec<(String, usize)>,
+}
+
+/// Головы цепочек, которые разбираются целиком (см. [`ChainFact`]).
+const CHAIN_HEADS: &[&str] = &["Метаданные", "Перечисления"];
 
 /// Вызов метода у менеджера объекта конфигурации:
 /// `Справочники.Сотрудники.НайтиПоРеквизиту(...)`. Получатель метода —
@@ -118,6 +141,8 @@ pub struct AstFacts {
     pub calls: Vec<CallFact>,
     pub dots: Vec<DotFact>,
     pub news: Vec<NewFact>,
+    /// Цепочки с головами из [`CHAIN_HEADS`], разобранные целиком. См. [`ChainFact`].
+    pub chains: Vec<ChainFact>,
     /// Вызовы методов у менеджеров объектов конфигурации
     /// (`Справочники.Сотрудники.НайтиПоРеквизиту(...)`). См. [`ManagerCallFact`].
     pub manager_calls: Vec<ManagerCallFact>,
@@ -709,6 +734,7 @@ pub fn collect_facts(source: &str) -> AstFacts {
                     if let Ok(text) = ident.utf8_text(src) {
                         facts.news.push(NewFact {
                             type_name: text.to_string(),
+                            arg_count: count_arguments(node, src),
                             byte: ident.start_byte(),
                         });
                     }
@@ -750,6 +776,25 @@ pub fn collect_facts(source: &str) -> AstFacts {
                                 head_byte,
                                 member_byte: member_node.start_byte(),
                                 member_is_call,
+                            });
+                        }
+                    }
+                }
+                // Цепочки целиком — для голов из `CHAIN_HEADS` (issue #41, #43).
+                // Берём только САМЫЙ ВНЕШНИЙ узел цепочки: внутренние звенья
+                // обходятся тем же циклом, и признак «родитель — тоже обращение»
+                // отсекает по факту на каждый сегмент.
+                if is_outermost_chain_node(node) {
+                    if let Some(chain) = simple_chain(node, src) {
+                        let wanted = chain.len() >= 2
+                            && CHAIN_HEADS
+                                .iter()
+                                .any(|head| head.to_lowercase() == chain[0].0.to_lowercase());
+                        if wanted {
+                            facts.chains.push(ChainFact {
+                                head: chain[0].0.clone(),
+                                head_byte: chain[0].1,
+                                segments: chain[1..].to_vec(),
                             });
                         }
                     }
@@ -957,6 +1002,47 @@ pub fn collect_facts(source: &str) -> AstFacts {
     }
 
     facts
+}
+
+/// Узел — начало (самый внешний) своей цепочки обращений?
+///
+/// Внутренние звенья `Метаданные.Справочники.Номенклатура` обходятся тем же
+/// циклом, что и внешнее, и без этой проверки цепочка дала бы столько фактов,
+/// сколько в ней сегментов.
+fn is_outermost_chain_node(node: tree_sitter::Node) -> bool {
+    match node.parent() {
+        Some(parent) => !matches!(parent.kind(), "property_access" | "access"),
+        None => true,
+    }
+}
+
+/// Цепочка `Имя.Имя.Имя…` без вызовов, индексации и скобок — сегменты по порядку
+/// с их байтовыми смещениями. `None` — в цепочке есть что-то ещё (`A[0].B`,
+/// `A.Метод().B`), и читать её как путь нельзя.
+fn simple_chain(node: tree_sitter::Node, src: &[u8]) -> Option<Vec<(String, usize)>> {
+    match node.kind() {
+        "identifier" => Some(vec![(
+            node.utf8_text(src).ok()?.to_string(),
+            node.start_byte(),
+        )]),
+        "property_access" | "access" => {
+            let mut cursor = node.walk();
+            let children: Vec<tree_sitter::Node> = node.named_children(&mut cursor).collect();
+            match children.as_slice() {
+                // Самое внутреннее звено цепочки — обёртка вокруг одного имени:
+                // `access(identifier)`. Без этой ветки разбор обрывался на ней, и
+                // цепочка целиком не собиралась.
+                [only] if only.kind() == "identifier" => simple_chain(*only, src),
+                [head, member] if matches!(member.kind(), "property" | "identifier") => {
+                    let mut chain = simple_chain(*head, src)?;
+                    chain.push((member.utf8_text(src).ok()?.to_string(), member.start_byte()));
+                    Some(chain)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Голова обращения через точку: узел `access`, состоящий ровно из одного

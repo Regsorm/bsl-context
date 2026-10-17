@@ -260,6 +260,7 @@ fn validate_module_at_level_inner_ext(
             index,
             source,
             &facts,
+            module_path,
             form_module,
             form_attributes,
             symbols,
@@ -282,6 +283,11 @@ fn validate_module_at_level_inner_ext(
     // в `cleaned` от запроса остались одни пробелы. Метаданные конфигурации
     // этим правилам не нужны.
     crate::query_rules::check_query_rules(source, symbols, &mut errors);
+    // Цепочки, у которых важен сегмент глубже первого звена (issue #41, #43):
+    // `Метаданные.<Коллекция>.<Объект>[.<Член>]` — сверка коллекции со справкой,
+    // объекта с источником имён, члена описания с типом `ОбъектМетаданных: <Вид>`;
+    // `Перечисления.<Имя>.<Значение>` — сверка значения с составом перечисления.
+    crate::chains::check_chains(index, source, &facts, symbols, &mut errors);
     errors.sort_by_key(|e| (e.line, e.col));
 
     ExpressionValidation {

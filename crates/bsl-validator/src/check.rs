@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 use regex::Regex;
 use serde::Serialize;
 
-use platform_index::{PlatformIndex, Signature};
+use platform_index::{Constructor, PlatformIndex, Signature, Type};
 
 /// Подсказка похожего значения. Сортируется по убыванию `score`
 /// (расстояние Левенштейна, инвертированное в [0..1]).
@@ -286,19 +286,7 @@ pub fn validate_method_call(
             ),
         }
     } else {
-        let allowed_ranges = signatures
-            .iter()
-            .map(|s| {
-                if s.variadic {
-                    format!("{}+", s.min_args)
-                } else if s.min_args == s.max_args {
-                    format!("{}", s.min_args)
-                } else {
-                    format!("{}..{}", s.min_args, s.max_args)
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" / ");
+        let allowed_ranges = allowed_ranges(&signatures);
         MethodCallValidation {
             valid: false,
             method_name: method.name_ru.clone(),
@@ -313,6 +301,131 @@ pub fn validate_method_call(
             ),
         }
     }
+}
+
+/// Число аргументов КОНСТРУКТОРА `Новый <Тип>(...)`: `Some(текст находки)`, если
+/// аргументов БОЛЬШЕ, чем принимает любой конструктор типа; `None` — всё в порядке
+/// или проверять нечего.
+///
+/// Справка даёт по каждому конструктору список параметров, поэтому «слишком много
+/// аргументов» ловится статически — как у глобальных методов
+/// ([`validate_method_call`]). До проверки аргументы конструктора вообще не
+/// считались: `Новый Файл("a", "b", "c")` и
+/// `Новый ОписаниеТипов("Строка", , , , , , , , , )` проходили молча (issue #44).
+///
+/// Проверяется ТОЛЬКО верхняя граница. Нехватка аргументов — класс, где справка
+/// чаще расходится с платформой (часть конструкторов допускает пропуск параметров,
+/// у `Структуры` число аргументов вообще парное по смыслу), и ветка «мало» на
+/// первом заходе дала бы ложные находки. Слишком много — ошибка однозначная.
+///
+/// Два случая молчания, оба осознанные:
+/// - у типа нет описанных конструкторов (справка молчит — молчим и мы);
+/// - тип в [`is_variadic_constructor`]: `Новый Массив(1, 2, 3)` — корректный код,
+///   хотя в справке у конструктора один параметр.
+pub fn check_constructor_arguments(ty: &Type, arg_count: usize) -> Option<String> {
+    if ty.constructors.is_empty() {
+        return None;
+    }
+    let briefs: Vec<SignatureBrief> = ty
+        .constructors
+        .iter()
+        .map(|c| constructor_brief(&ty.name_ru, c))
+        .collect();
+    if briefs.iter().any(|s| s.variadic || arg_count <= s.max_args) {
+        return None;
+    }
+    Some(format!(
+        "❌ Конструктор типа '{}' не принимает {} {}. Допустимо: {}.",
+        ty.name_ru,
+        arg_count,
+        argument_forms(arg_count).1,
+        allowed_ranges(&briefs)
+    ))
+}
+
+/// Границы аргументов одного конструктора — теми же правилами, что у сигнатур
+/// методов: минимум задаёт позиция последнего обязательного параметра, диапазонное
+/// имя (`Значение1-Значение10`) расширяет верх, вариативность снимает верх совсем.
+fn constructor_brief(type_name: &str, c: &Constructor) -> SignatureBrief {
+    let min_args = c
+        .parameters
+        .iter()
+        .rposition(|p| p.required)
+        .map_or(0, |i| i + 1);
+    let mut max_args = c.parameters.len();
+    for p in &c.parameters {
+        if let Some((lower, upper)) = parse_range_bounds(&p.name) {
+            max_args = max_args.saturating_add(upper.saturating_sub(lower));
+        }
+    }
+    max_args = max_args.min(MAX_SIGNATURE_ARGS);
+    let formatted = c
+        .parameters
+        .iter()
+        .map(|p| {
+            format!(
+                "{}{}: {}",
+                p.name,
+                if p.required { "" } else { "?" },
+                p.type_name
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    SignatureBrief {
+        name: if c.name.is_empty() {
+            type_name.to_string()
+        } else {
+            c.name.clone()
+        },
+        min_args,
+        max_args,
+        variadic: is_variadic_constructor(type_name),
+        formatted,
+    }
+}
+
+/// Типы, конструктор которых принимает переменное число аргументов, хотя в
+/// справке показан один параметр: «по количеству элементов» у массива, «из ключей
+/// и значений» у структуры, форматированная строка из пар значение-оформление.
+/// Признака в структуре индекса нет — список фиксирован, как и у глобальных
+/// функций ([`is_variadic_global`]).
+///
+/// `ФорматированнаяСтрока` добавлена по корпусному замеру: на выгрузке УТ
+/// (14 943 модуля) правка без неё дала 12 ложных `wrong_argument_count` в 8
+/// модулях — конфигурация компилируется, а `Новый ФорматированнаяСтрока(…)`
+/// вызывается там с 5–9 аргументами против описанных в справке 1..5.
+fn is_variadic_constructor(type_name: &str) -> bool {
+    matches!(
+        type_name.to_lowercase().as_str(),
+        "массив"
+            | "array"
+            | "фиксированныймассив"
+            | "fixedarray"
+            | "структура"
+            | "structure"
+            | "фиксированнаяструктура"
+            | "fixedstructure"
+            | "форматированнаястрока"
+            | "formattedstring"
+    )
+}
+
+/// Допустимые диапазоны аргументов для сообщения: `0`, `1..7`, `2+`.
+fn allowed_ranges(signatures: &[SignatureBrief]) -> String {
+    signatures
+        .iter()
+        .map(|s| {
+            if s.variadic {
+                format!("{}+", s.min_args)
+            } else if s.min_args == s.max_args {
+                format!("{}", s.min_args)
+            } else {
+                format!("{}..{}", s.min_args, s.max_args)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" / ")
 }
 
 /// Потолок числа аргументов сигнатуры: защита от враждебного или повреждённого

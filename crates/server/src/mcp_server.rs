@@ -27,26 +27,43 @@ use serde::{Deserialize, Serialize};
 
 use crate::module_source::{self, ModuleFile};
 
+/// Корни, внутри которых разрешено читать модули по `path`: основной `root`
+/// источника и дополнительные `extra_roots` (issue #45). Основной идёт первым —
+/// при совпадении относительного пути файл берётся из него.
+fn read_roots(slot: Option<&SourceSlot>) -> Vec<PathBuf> {
+    let Some(slot) = slot else {
+        return Vec::new();
+    };
+    let mut roots: Vec<PathBuf> = slot.config.root.iter().cloned().collect();
+    roots.extend(slot.config.extra_roots.iter().cloned());
+    roots
+}
+
 /// Вид формы по файлам выгрузки: рядом с модулем формы лежит `Ext/Form.xml`
 /// (форма управляемая) или `Ext/Form.bin` (обычная).
 ///
 /// Нужен фрагментам управляемых форм (issue #32): директив компиляции в тексте
 /// фрагмента нет, и без этой подсказки он считался бы обычной формой, а её
-/// контекст — объектом-владельцем. `None` — не определили (корня нет, файлов нет,
-/// путь не модуль формы); тогда работают прежние признаки, директивы.
-fn form_kind_from_dump(root: Option<&Path>, module_path: Option<&str>) -> Option<FormKind> {
-    let root = root?;
+/// контекст — объектом-владельцем. `None` — не определили (корней нет, файлов нет,
+/// путь не модуль формы); тогда работают прежние признаки, директивы. Корни
+/// перебираются по порядку — модуль мог прийти из дополнительного (issue #45).
+fn form_kind_from_dump(roots: &[PathBuf], module_path: Option<&str>) -> Option<FormKind> {
+    if roots.is_empty() {
+        return None;
+    }
     let path = module_path?.replace('\\', "/");
     // `Catalogs/X/Forms/Ф/Ext/Form/Module.bsl` → `<root>/Catalogs/X/Forms/Ф/Ext/`
     let dir = path.strip_suffix("Form/Module.bsl")?;
-    let base = root.join(dir);
-    if base.join("Form.xml").is_file() {
-        Some(FormKind::Managed)
-    } else if base.join("Form.bin").is_file() {
-        Some(FormKind::Ordinary)
-    } else {
-        None
+    for root in roots {
+        let base = root.join(dir);
+        if base.join("Form.xml").is_file() {
+            return Some(FormKind::Managed);
+        }
+        if base.join("Form.bin").is_file() {
+            return Some(FormKind::Ordinary);
+        }
     }
+    None
 }
 
 /// Слот одного источника имён: конфиг, сам источник (пересборка подменяет его на
@@ -790,6 +807,11 @@ async fn slot_state_json(repo: &str, slot: &SourceSlot) -> serde_json::Value {
         Some(source) => (true, source.is_healthy(), Some(source.describe())),
         None => (false, false, None),
     };
+    // Issue #46: `healthy` описывает ТРАНСПОРТ, а не содержимое — пустой индекс
+    // отвечает «такого объекта нет» так же уверенно, как полный. Счётчики и
+    // признак «состав неправдоподобно мал» показывают это вызывающему.
+    let stats = guard.as_ref().and_then(|source| source.stats());
+    let thin = guard.as_ref().is_some_and(|source| source.is_thin());
     let state = match (connected, healthy) {
         (true, true) => "ok",
         (true, false) => "unhealthy",
@@ -801,12 +823,27 @@ async fn slot_state_json(repo: &str, slot: &SourceSlot) -> serde_json::Value {
         "connected": connected,
         "healthy": healthy,
         "state": state,
+        "thin": thin,
+        "stats": stats.map(|s| serde_json::json!({"objects": s.objects, "names": s.names})),
+        // Снимок индекса: время изменения файла базы. По нему видно, насколько
+        // ответы источника свежие относительно правок выгрузки.
+        "snapshot": source_snapshot_time(&slot.config),
         // Для нездорового источника причина — в его собственном описании
         // (что именно ответил code-index), для неподнятого — в слоте.
         "last_error": describe
             .filter(|_| !healthy)
             .or_else(|| slot.last_error()),
     })
+}
+
+/// Время последнего изменения файла базы источника — «снимок» его содержимого.
+///
+/// `None` — источника с файлом нет (сетевой `code_index_mcp`) либо файла уже нет.
+fn source_snapshot_time(config: &crate::config::SymbolSourceConfig) -> Option<String> {
+    let path = config.db_path.as_deref()?;
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    let dt: chrono::DateTime<chrono::Utc> = modified.into();
+    Some(dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
 }
 
 /// Отказ инструмента: не паника и не пустой ответ, а внятная причина.
@@ -1166,7 +1203,8 @@ impl BslContextServer {
         description = "Валидация BSL-кода против платформенного контекста. Принимает и целый модуль, \
                        и отдельный фрагмент. Ловит: несуществующие значения системных перечислений; \
                        неизвестные платформенные типы в 'Новый ТипX'; неверное число аргументов \
-                       глобальных функций; опечатки платформенных методов и директив (fuzzy-сходство). \
+                       глобальных функций и конструкторов («Новый ТипX(…)»); опечатки платформенных \
+                       методов и директив (fuzzy-сходство). \
                        Объявленные в самом тексте Процедура/Функция извлекаются через tree-sitter, их \
                        вызовы не считаются опечатками. У каждой находки есть поле confidence (high/low). \
                        Источник модуля — ровно один: source (текст BSL) или path (файл .bsl внутри корня \
@@ -1254,20 +1292,21 @@ impl BslContextServer {
                 Err(msg) => return err_json(&msg),
             }
         };
-        // Модуль можно прочитать с диска: файл обязан лежать ВНУТРИ корня выгрузки
-        // конфигурации (поле `root` источника имён) — иначе инструмент стал бы
-        // средством чтения любых файлов машины.
+        // Модуль можно прочитать с диска: файл обязан лежать ВНУТРИ одного из
+        // корней выгрузки конфигурации (поле `root` источника имён и, если заданы,
+        // дополнительные корни `extra_roots`, issue #45) — иначе инструмент стал
+        // бы средством чтения любых файлов машины.
+        let roots = read_roots(slot.as_deref());
         let from_file: Option<ModuleFile> = match p.path.as_deref() {
             Some(raw) => {
-                let root = slot.as_ref().and_then(|s| s.config.root.as_deref());
-                let Some(root) = root else {
+                if roots.is_empty() {
                     return err_json(
                         "параметр path требует источника имён с полем root — корнем выгрузки \
                          конфигурации: добавьте root в секцию [symbol_source] или \
                          [[symbol_sources]] для нужного repo.",
                     );
-                };
-                match module_source::read_module(root, raw) {
+                }
+                match module_source::read_module_in(&roots, raw) {
                     Ok(module) => Some(module),
                     Err(message) => return err_json(&message),
                 }
@@ -1381,7 +1420,11 @@ impl BslContextServer {
         // директив компиляции в тексте нет, и без подсказки он считался бы обычной
         // формой, а её контекст — объектом-владельцем. Директивы остаются запасным
         // признаком, когда корня выгрузки нет.
-        let form_kind = form_kind_from_dump(slot.config.root.as_deref(), module_path.as_deref());
+        // Вид формы по файлам выгрузки (issue #32): у фрагмента управляемой формы
+        // директив компиляции в тексте нет, и без подсказки он считался бы обычной
+        // формой, а её контекст — объектом-владельцем. Директивы остаются запасным
+        // признаком, когда корня выгрузки нет.
+        let form_kind = form_kind_from_dump(&roots, module_path.as_deref());
         let result = validate_module_with_symbols_and_form_kind(
             &self.index,
             source_text,
@@ -1487,13 +1530,19 @@ impl BslContextServer {
 
     #[tool(
         description = "Состояние источников имён конфигураций: по каждому настроенному repo — \
-                       подключён ли он сейчас, здоров ли, и текст последней ошибки подключения. \
+                       подключён ли он сейчас, здоров ли, сколько объектов и имён знает, когда \
+                       менялся файл его базы и не подозрительно ли пуст состав. \
                        Нужен перед началом работы с конкретной конфигурацией: если источник не \
                        поднят, validate_module проверит модуль только против платформенного \
                        контекста (ответ с symbols_available: false), и имена прикладных объектов \
                        проверены не будут. Параметров нет. Возвращает JSON \
-                       {ok, sources:[{repo, kind, connected, healthy, state, last_error}]}, где \
-                       state — 'ok' | 'not_connected' | 'unhealthy'."
+                       {ok, sources:[{repo, kind, connected, healthy, state, thin, stats, \
+                       snapshot, last_error}]}, где state — 'ok' | 'not_connected' | 'unhealthy', \
+                       stats — {objects, names} (null, если источник их не считает), snapshot — \
+                       время изменения файла базы, thin — состав источника неправдоподобно мал: \
+                       находки по его ответам ('объект не существует', 'общий модуль не \
+                       существует', 'значения нет у перечисления') выносятся с уверенностью low, \
+                       а не high."
     )]
     pub async fn symbol_sources_status(&self) -> String {
         let sources = self.sources_snapshot();

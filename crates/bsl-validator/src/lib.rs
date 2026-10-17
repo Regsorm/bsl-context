@@ -6,6 +6,7 @@
 //! Разбор BSL вынесен в крейт `bsl-parse`.
 
 pub mod blocks;
+pub mod chains;
 pub mod check;
 pub mod config_objects;
 pub mod context_names;
@@ -14,6 +15,7 @@ pub mod directives;
 pub mod enum_values;
 pub mod expression;
 pub mod homoglyphs;
+pub mod legacy_globals;
 pub(crate) mod locals;
 pub mod module;
 pub mod module_context;
@@ -42,4 +44,4 @@ pub use module::{
     validate_module_with_symbols_and_form_kind,
 };
 pub use scope::{extract_scope_map, extract_type_annotations, Scope, ScopeMap, VarBinding};
-pub use symbols::{ObjectField, ObjectSchema, SymbolSource};
+pub use symbols::{ObjectField, ObjectSchema, SourceStats, SymbolSource};
