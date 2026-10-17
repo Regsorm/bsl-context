@@ -14,6 +14,7 @@ pub mod declarations;
 pub mod directives;
 pub mod enum_values;
 pub mod expression;
+pub mod form_elements;
 pub mod homoglyphs;
 pub mod legacy_globals;
 pub(crate) mod locals;

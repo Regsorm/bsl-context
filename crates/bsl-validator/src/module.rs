@@ -125,11 +125,16 @@ fn validate_module_at_level_inner(
         owner_unknown,
         symbols_degraded,
         None,
+        None,
     )
 }
 
 /// `form_kind` — вид формы, снятый С ФАЙЛОВ ВЫГРУЗКИ (`Ext/Form.xml` —
 /// управляемая, `Ext/Form.bin` — обычная), когда корень выгрузки известен.
+///
+/// `form_elements` — имена элементов формы из того же `Form.xml` (issue #43,
+/// вторая половина): по ним проверяется `Элементы.<Имя>` в модуле формы
+/// (`crate::form_elements`). `None` — состава нет, проверка молчит.
 ///
 /// Нужен фрагментам управляемых форм: директив компиляции в тексте фрагмента нет,
 /// и без подсказки он считался бы обычной формой, а её контекст — объект-владелец
@@ -147,6 +152,7 @@ fn validate_module_at_level_inner_ext(
     owner_unknown: bool,
     symbols_degraded: bool,
     form_kind: Option<crate::module_context::FormKind>,
+    form_elements: Option<&HashSet<String>>,
 ) -> ExpressionValidation {
     // Модуль расширения: блоки `#Удаление … #КонецУдаления` в скомпилированный
     // модуль не попадают, но могут обрывать строковый литерал на середине —
@@ -288,6 +294,9 @@ fn validate_module_at_level_inner_ext(
     // объекта с источником имён, члена описания с типом `ОбъектМетаданных: <Вид>`;
     // `Перечисления.<Имя>.<Значение>` — сверка значения с составом перечисления.
     crate::chains::check_chains(index, source, &facts, symbols, &mut errors);
+    // Имена элементов формы (issue #43, вторая половина): `Элементы.<Имя>`
+    // сверяется с составом из `Form.xml`, который передал вызывающий.
+    crate::form_elements::check_form_elements(source, &facts, form_elements, &mut errors);
     errors.sort_by_key(|e| (e.line, e.col));
 
     ExpressionValidation {
@@ -403,6 +412,7 @@ pub fn validate_module_with_symbols_and_form_kind(
     form_attributes: Option<&HashSet<String>>,
     symbols: Option<&dyn SymbolSource>,
     form_kind: Option<crate::module_context::FormKind>,
+    form_elements: Option<&HashSet<String>>,
 ) -> ExpressionValidation {
     let effective_level = if profile == Profile::Strict { 1 } else { level };
     // Владелец формы есть, но его модуль не попал в источник имён — см.
@@ -427,6 +437,7 @@ pub fn validate_module_with_symbols_and_form_kind(
         owner_unknown,
         false,
         form_kind,
+        form_elements,
     );
 
     if profile == Profile::Strict {

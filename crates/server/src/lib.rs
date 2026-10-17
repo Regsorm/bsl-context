@@ -9,6 +9,7 @@
 //! ```
 
 pub mod config;
+pub mod form_dump;
 pub mod http;
 pub mod mcp_server;
 pub mod module_source;
