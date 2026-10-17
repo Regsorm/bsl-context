@@ -550,12 +550,27 @@ impl CodeIndexDbSource {
     /// ноль строк, и на каждый вызов процедуры глобального общего модуля
     /// появлялась находка «метод не объявлен».
     fn try_collect_global_exports(conn: &Connection) -> Result<HashSet<String>> {
-        let mut stmt = conn.prepare(
+        // Колонка `file_contents.oversize` появилась в code-index позже. На
+        // индексе, собранном до неё, запрос с фильтром падал ЦЕЛИКОМ
+        // («no such column: fc.oversize»), и экспорты глобальных общих модулей
+        // не собирались вовсе — при живом источнике и без единого признака в
+        // ответе: `is_global_export` просто всегда отвечал `false`.
+        let oversize_filter = if has_oversize_column(conn) {
+            " AND fc.oversize = 0"
+        } else {
+            tracing::info!(
+                "code-index база: в file_contents нет колонки oversize (индекс собран \
+                 старой версией) — читаю содержимое без фильтра"
+            );
+            ""
+        };
+        let sql = format!(
             "SELECT f.path, fc.content_blob FROM files f \
              JOIN file_contents fc ON fc.file_id = f.id \
              WHERE (f.path LIKE '%/CommonModules/%.xml' \
-                    OR f.path LIKE 'CommonModules/%.xml') AND fc.oversize = 0",
-        )?;
+                    OR f.path LIKE 'CommonModules/%.xml'){oversize_filter}"
+        );
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
         })?;
@@ -1480,6 +1495,24 @@ pub fn parse_sse_json(body: &str) -> Option<Value> {
     serde_json::from_str(body.trim()).ok()
 }
 
+/// Есть ли у `file_contents` колонка `oversize`?
+///
+/// Проверка схемы, а не попытка запроса: на индексе без колонки запрос с
+/// `fc.oversize = 0` падал целиком, и экспорты глобальных общих модулей молча
+/// оставались пустыми (issue #46-соседнее: «источник жив, а данных нет»).
+fn has_oversize_column(conn: &Connection) -> bool {
+    let Ok(mut stmt) = conn.prepare("PRAGMA table_info(file_contents)") else {
+        return false;
+    };
+    let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(1)) else {
+        return false;
+    };
+    let names: Vec<String> = rows.flatten().collect();
+    names
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case("oversize"))
+}
+
 /// `<...>/CommonModules/<Имя>.xml` → `<...>/CommonModules/<Имя>/Ext/Module.bsl`.
 fn module_path_from_xml(xml_path: &str) -> Option<String> {
     let base = xml_path.strip_suffix(".xml")?;
@@ -2245,6 +2278,67 @@ data: {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabili
             repo_check_from_get_stats(&v, "ut"),
             RepoCheck::Unrecognized
         ));
+    }
+
+    #[test]
+    fn global_exports_are_collected_from_index_without_oversize_column() {
+        // Индекс, собранный code-index ДО появления `file_contents.oversize`:
+        // запрос с фильтром падал целиком, и экспорты глобальных общих модулей
+        // не собирались вовсе — при живом источнике и без признака в ответе.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conn = Connection::open(dir.path().join("index.db")).expect("база");
+        conn.execute_batch(
+            "CREATE TABLE files (id INTEGER PRIMARY KEY, path TEXT);
+             CREATE TABLE file_contents (file_id INTEGER, content_blob BLOB);
+             CREATE TABLE functions (id INTEGER PRIMARY KEY, file_id INTEGER, name TEXT, args TEXT);",
+        )
+        .expect("схема старого индекса");
+        let xml = "<?xml version=\"1.0\"?><MetaDataObject><CommonModule>\
+                   <Properties><Global>true</Global></Properties></CommonModule></MetaDataObject>";
+        let blob = zstd::stream::encode_all(xml.as_bytes(), 3).expect("zstd");
+        conn.execute(
+            "INSERT INTO files (id, path) VALUES (1, 'base/CommonModules/Глобальный.xml')",
+            [],
+        )
+        .expect("XML модуля");
+        conn.execute(
+            "INSERT INTO files (id, path) VALUES (2, 'base/CommonModules/Глобальный/Ext/Module.bsl')",
+            [],
+        )
+        .expect("модуль");
+        conn.execute(
+            "INSERT INTO file_contents (file_id, content_blob) VALUES (1, ?1)",
+            params![blob],
+        )
+        .expect("содержимое XML");
+        conn.execute(
+            "INSERT INTO functions (file_id, name, args) VALUES (2, 'ЭкспортныйМетод', '() Экспорт')",
+            [],
+        )
+        .expect("функция модуля");
+
+        let collected = CodeIndexDbSource::try_collect_global_exports(&conn)
+            .expect("на индексе без oversize запрос не должен падать");
+        assert!(
+            collected.contains("экспортныйметод"),
+            "экспорт глобального модуля должен собраться: {collected:?}"
+        );
+    }
+
+    #[test]
+    fn oversize_column_is_detected_when_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conn = Connection::open(dir.path().join("index.db")).expect("база");
+        conn.execute_batch(
+            "CREATE TABLE file_contents (file_id INTEGER, content_blob BLOB, oversize INTEGER);",
+        )
+        .expect("схема");
+        assert!(has_oversize_column(&conn));
+        conn.execute_batch(
+            "DROP TABLE file_contents; CREATE TABLE file_contents (file_id INTEGER);",
+        )
+        .expect("схема без колонки");
+        assert!(!has_oversize_column(&conn));
     }
 
     #[test]
