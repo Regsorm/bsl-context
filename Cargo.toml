@@ -52,7 +52,11 @@ thiserror = "2"
 # HBK-парсинг (Phase 1+)
 byteorder = "1"
 flate2 = "1"
-zip = "2"
+# 9.0.0 — граница исправлений RUSTSEC-2026-0367/0368/0369 (распаковка zip:
+# SUID/SGID и симлинки за пределами каталога). Мы только ЧИТАЕМ архивы
+# (`ZipArchive::by_name`, `read_zipfile_from_stream`), `extract()` не зовём, но
+# `cargo deny` в CI справедливо валит сборку на уязвимой версии.
+zip = "9"
 encoding_rs = "0.8"
 
 # HTML-парсинг (Phase 2)

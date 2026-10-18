@@ -108,6 +108,7 @@ fn closest_element(known: &[&str], member: &str) -> Option<String> {
         let distance = lev(&member_lower, &name.to_lowercase());
         let better = match best {
             Some((best_name, best_distance)) => {
+                // Оба имени — `&str`: сравнение не должно зависеть от тулчейна.
                 distance < best_distance || (distance == best_distance && *name < best_name)
             }
             None => true,

@@ -262,7 +262,10 @@ fn closest_name<'a>(names: impl Iterator<Item = &'a str>, needle: &str) -> Optio
             // Тай-брейк по имени: обход недетерминированного набора не должен
             // менять подсказку между запусками.
             Some((best_name, best_distance)) => {
-                distance < *best_distance || (distance == *best_distance && name < best_name)
+                // Сравниваем как `&str` с `&str`: `&str < &String` принимает не
+                // всякий тулчейн (на 1.94 компилируется, на 1.98 — уже нет).
+                distance < *best_distance
+                    || (distance == *best_distance && name < best_name.as_str())
             }
             None => true,
         };

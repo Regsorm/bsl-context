@@ -10,6 +10,11 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "BSD-3-Clause",
     "BSL-1.0",
+    # bzip2/libbzip2 License v1.0.6 — пермиссивная (BSD-подобная), приходит с
+    # бэкендом bzip2 в zip 9 (`bzip2` → `libbz2-rs-sys`). Декомпрессоры zip
+    # включены целиком: сужать набор методов ради одной лицензии значило бы
+    # рисковать чтением настоящих hbk-страниц.
+    "bzip2-1.0.6",
     "CC0-1.0",
     "CDLA-Permissive-2.0",
     "ISC",
