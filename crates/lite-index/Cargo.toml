@@ -11,6 +11,8 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 rayon = "1"
 anyhow = { workspace = true }
 walkdir = { workspace = true }
+# Имена файлов на macOS могут быть в NFD, а имена в BSL/XML — в NFC.
+unicode-normalization = "0.1.25"
 # Разбор XML выгрузки: состав объекта (реквизиты, измерения, ресурсы) и вид
 # регистра. Поиском подстрок это не берётся — `<Name>` встречается и во
 # вложенных элементах, имя поля обязано читаться у прямого потомка.
