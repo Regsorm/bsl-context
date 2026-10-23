@@ -23,6 +23,7 @@ use anyhow::{Context, Result};
 use bsl_parse::MethodDecl;
 use rayon::prelude::*;
 use rusqlite::{params, Connection, OptionalExtension};
+use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
 
 /// Схема облегчённого индекса: PRAGMA и таблицы. B-tree индексы — отдельным
@@ -665,7 +666,9 @@ fn parse_xml_fact(path: &Path) -> Option<(bool, XmlObject)> {
     let collection: &'static str = KNOWN_COLLECTIONS
         .iter()
         .find(|k| k.eq_ignore_ascii_case(parent_name))?;
-    let name = path.file_stem().and_then(|s| s.to_str())?.to_string();
+    // Нормализуем логическое имя, сохраняя путь на диске как есть: на macOS
+    // «й» в имени файла может быть записана как «и» + U+0306 (issue #47).
+    let name = path.file_stem().and_then(|s| s.to_str())?.nfc().collect();
 
     let mut is_global = false;
     let mut register_type = None;
@@ -958,7 +961,7 @@ fn parse_path(rel_path: &str) -> ParsedPath {
     });
     let object_name = collection_idx
         .and_then(|i| segments.get(i + 1))
-        .map(|s| s.to_string());
+        .map(|s| s.nfc().collect());
 
     let file_name = segments.last().copied().unwrap_or("");
 

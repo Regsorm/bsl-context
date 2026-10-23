@@ -341,6 +341,11 @@ the config. While it runs, validation keeps using the previous database; if the 
 fails, the previous database stays intact. The same can be done from the command line:
 `bsl-lite-index build --root <dump> --db <file.db>` (the directory must already exist).
 
+Object names taken from paths are normalized to Unicode NFC, so dumps with NFD
+file and directory names (for example, on macOS) match names in BSL and XML.
+After upgrading from version 0.23.0 or earlier, rebuild the lite index if your
+dump contains such names. File paths themselves are preserved.
+
 ```toml
 # 2. Reading the code-index database directly (same machine only).
 [symbol_source]
