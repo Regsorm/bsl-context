@@ -6,9 +6,9 @@ license.workspace = true
 description = "Валидатор BSL-выражений: tree-sitter → извлечение Идентификатор.Член → проверка через PlatformIndex"
 
 [dependencies]
-platform-index = { path = "../platform-index", version = "0.24.0" }
-bsl-parse = { path = "../bsl-parse", version = "0.24.0" }
-sdbl-parse = { path = "../sdbl-parse", version = "0.24.0" }
+platform-index = { path = "../platform-index", version = "0.24.1" }
+bsl-parse = { path = "../bsl-parse", version = "0.24.1" }
+sdbl-parse = { path = "../sdbl-parse", version = "0.24.1" }
 tree-sitter = { workspace = true }
 tree-sitter-bsl = { workspace = true }
 serde = { workspace = true }
