@@ -83,6 +83,7 @@ fn index() -> PlatformIndex {
         type_name: "ЗадачиМенеджер".into(),
         readonly: true,
         note: None,
+        availability: None,
     });
     index
 }

@@ -12,6 +12,7 @@ use std::path::PathBuf;
 
 use hbk_parser::{
     parse_constructor_page, parse_method_page, parse_object_page, parse_property_page,
+    AvailabilityInfo,
 };
 use hbk_reader::{HbkContent, Page};
 
@@ -172,6 +173,29 @@ fn find_in_toc(pages: &[Page], target_ru: &str) -> Option<String> {
     None
 }
 
+/// Страница по фрагменту html_path; запасной путь — русское имя из TOC.
+///
+/// html_path нумерованный (`/ValueTable/methods/Find602.html`) и меняется от
+/// версии к версии, поэтому по имени ищем, только если фрагмент не совпал.
+fn find_page(pages: &[Page], html_pattern: &str, title_ru: &str) -> Option<String> {
+    find_with_html_pattern(pages, html_pattern)
+        .map(|page| page.html_path.clone())
+        .or_else(|| find_in_toc(pages, title_ru))
+}
+
+/// Html страницы по фрагменту html_path (с запасным поиском по имени в TOC).
+fn page_html(content: &mut HbkContent, html_pattern: &str, title_ru: &str) -> String {
+    let path = find_page(&content.toc.pages, html_pattern, title_ru)
+        .unwrap_or_else(|| panic!("страница '{title_ru}' не найдена в TOC"));
+    content.get_entry_text(&path).expect("чтение страницы")
+}
+
+/// Есть ли метка в списке доступности. Справка пишет первую метку с заглавной,
+/// остальные — строчными, поэтому сверка без учёта регистра.
+fn has_label(info: &AvailabilityInfo, label: &str) -> bool {
+    info.labels.iter().any(|item| item.to_lowercase() == label)
+}
+
 #[test]
 fn parse_real_constructor() {
     let Some(path) = hbk_path() else {
@@ -193,4 +217,174 @@ fn parse_real_constructor() {
         info.parameters.len()
     );
     assert!(!info.name.is_empty(), "у конструктора должно быть имя");
+}
+
+// ── Глава «Доступность:» на реальном hbk (TZ, §7.1) ─────────────────────────
+
+#[test]
+fn availability_of_global_method_lists_all_contexts() {
+    // `СтрНайти` доступен везде: 10 меток, включая сервер и тонкий клиент.
+    let Some(path) = hbk_path() else {
+        eprintln!("skip: BSL_CONTEXT_PLATFORM_PATH не задан");
+        return;
+    };
+    let mut content = HbkContent::read(&path).expect("hbk open");
+
+    let html = page_html(&mut content, "StrFind", "СтрНайти");
+    let info = parse_method_page(&html);
+    let availability = info
+        .availability
+        .expect("у СтрНайти должна быть глава «Доступность:»");
+
+    println!("СтрНайти: {:?}", availability);
+    assert_eq!(availability.labels.len(), 10, "{availability:?}");
+    assert!(has_label(&availability, "сервер"), "{availability:?}");
+    assert!(
+        has_label(&availability, "тонкий клиент"),
+        "{availability:?}"
+    );
+    assert!(
+        has_label(&availability, "внешнее соединение"),
+        "{availability:?}"
+    );
+    assert!(
+        !availability.has_unknown,
+        "на 8.3.27 все метки обязаны быть известны: {availability:?}"
+    );
+    assert!(availability.note.is_none(), "{:?}", availability.note);
+}
+
+#[test]
+fn client_only_global_method_has_no_server() {
+    // `ПоказатьВопрос` — клиентский метод: сервера в списке нет.
+    let Some(path) = hbk_path() else {
+        eprintln!("skip: BSL_CONTEXT_PLATFORM_PATH не задан");
+        return;
+    };
+    let mut content = HbkContent::read(&path).expect("hbk open");
+
+    let html = page_html(&mut content, "ShowQueryBox", "ПоказатьВопрос");
+    let info = parse_method_page(&html);
+    let availability = info
+        .availability
+        .expect("у ПоказатьВопрос должна быть глава «Доступность:»");
+
+    println!("ПоказатьВопрос: {:?}", availability);
+    assert!(!has_label(&availability, "сервер"), "{availability:?}");
+    assert!(
+        !has_label(&availability, "внешнее соединение"),
+        "{availability:?}"
+    );
+    assert!(
+        has_label(&availability, "тонкий клиент"),
+        "{availability:?}"
+    );
+    assert!(
+        has_label(&availability, "толстый клиент"),
+        "{availability:?}"
+    );
+    assert!(
+        has_label(&availability, "мобильное приложение (клиент)"),
+        "{availability:?}"
+    );
+    assert!(!availability.has_unknown, "{availability:?}");
+}
+
+#[test]
+fn server_only_method_and_property_of_value_table() {
+    // `ТаблицаЗначений.Найти` и `.Колонки` — серверный список: клиентских меток нет.
+    let Some(path) = hbk_path() else {
+        eprintln!("skip: BSL_CONTEXT_PLATFORM_PATH не задан");
+        return;
+    };
+    let mut content = HbkContent::read(&path).expect("hbk open");
+
+    let method_html = page_html(&mut content, "/ValueTable/methods/Find", "Найти");
+    let method = parse_method_page(&method_html);
+    let method_availability = method
+        .availability
+        .expect("у метода ТаблицаЗначений.Найти должна быть глава «Доступность:»");
+
+    let property_html = page_html(&mut content, "/ValueTable/properties/Columns", "Колонки");
+    let property = parse_property_page(&property_html);
+    let property_availability = property
+        .availability
+        .expect("у свойства ТаблицаЗначений.Колонки должна быть глава «Доступность:»");
+
+    println!("Найти: {method_availability:?}");
+    println!("Колонки: {property_availability:?}");
+    for availability in [&method_availability, &property_availability] {
+        assert!(has_label(availability, "сервер"), "{availability:?}");
+        assert!(
+            has_label(availability, "внешнее соединение"),
+            "{availability:?}"
+        );
+        assert!(
+            has_label(availability, "мобильный автономный сервер"),
+            "{availability:?}"
+        );
+        assert!(
+            !has_label(availability, "тонкий клиент"),
+            "{availability:?}"
+        );
+        assert!(!has_label(availability, "веб-клиент"), "{availability:?}");
+        assert!(
+            !has_label(availability, "мобильный клиент"),
+            "{availability:?}"
+        );
+        assert!(!availability.has_unknown, "{availability:?}");
+    }
+}
+
+#[test]
+fn server_only_type_availability_is_the_source_for_new() {
+    // `Новый Запрос` берёт доступность у ТИПА: страница типа серверная.
+    let Some(path) = hbk_path() else {
+        eprintln!("skip: BSL_CONTEXT_PLATFORM_PATH не задан");
+        return;
+    };
+    let mut content = HbkContent::read(&path).expect("hbk open");
+
+    let html = page_html(&mut content, "/Query.html", "Запрос");
+    let info = parse_object_page(&html);
+    let availability = info
+        .availability
+        .expect("у типа Запрос должна быть глава «Доступность:»");
+
+    println!("Запрос: {:?}", availability);
+    assert!(has_label(&availability, "сервер"), "{availability:?}");
+    assert!(
+        has_label(&availability, "внешнее соединение"),
+        "{availability:?}"
+    );
+    assert!(
+        !has_label(&availability, "тонкий клиент"),
+        "{availability:?}"
+    );
+    assert!(!availability.has_unknown, "{availability:?}");
+}
+
+#[test]
+fn constructor_page_has_no_availability_chapter() {
+    // Своей главы «Доступность:» у страницы конструктора нет — фиксируем
+    // отсутствие данных: источник доступности конструктора — страница типа.
+    let Some(path) = hbk_path() else {
+        eprintln!("skip: BSL_CONTEXT_PLATFORM_PATH не задан");
+        return;
+    };
+    let mut content = HbkContent::read(&path).expect("hbk open");
+
+    let (_type_path, ctor_path) = find_type_with_constructor(&content.toc.pages)
+        .expect("должен быть хотя бы один тип с конструктором в TOC");
+    let ctor_html = content.get_entry_text(&ctor_path).expect("read");
+    let ctor = parse_constructor_page(&ctor_html);
+    println!("Конструктор: {:?}", ctor.name);
+    // Именно ГЛАВА, а не слово в тексте: у конструкторов
+    // `WindowsClientCertificate`/`MacOSClientCertificate` «Доступность:» стоит
+    // прямо в описании (`<br>Доступность: Толстый клиент, тонкий клиент.`), и
+    // проверка по подстроке там дала бы ложное срабатывание.
+    assert!(
+        !ctor_html.contains("V8SH_chapter\">Доступность:"),
+        "у страницы конструктора не должно быть главы «Доступность:»"
+    );
 }

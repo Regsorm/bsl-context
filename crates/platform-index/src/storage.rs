@@ -253,6 +253,7 @@ mod tests {
             return_type: String::new(),
             signatures: Vec::new(),
             note: None,
+            availability: None,
         }
     }
 

@@ -93,6 +93,7 @@ fn index() -> PlatformIndex {
         note: None,
         type_name: String::new(),
         readonly: false,
+        availability: None,
     };
     let method = |name: &str| Method {
         name_ru: name.into(),
@@ -101,6 +102,7 @@ fn index() -> PlatformIndex {
         return_type: String::new(),
         signatures: Vec::new(),
         note: None,
+        availability: None,
     };
     let ty = |name: &str, props: Vec<Property>, methods: Vec<Method>| Type {
         name_ru: name.into(),
@@ -111,6 +113,7 @@ fn index() -> PlatformIndex {
         properties: props,
         constructors: Vec::new(),
         enum_values: Vec::new(),
+        availability: None,
     };
 
     let mut index = PlatformIndex::new();

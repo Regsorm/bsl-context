@@ -14,12 +14,13 @@
 //! Глобальные главы (применяются ко всему методу): «Описание:», «Пример:»,
 //! «См. также:», «Примечание:».
 
+use crate::availability::parse_availability;
 use crate::blocks::{
     non_empty, parse_description, parse_example, parse_head_name, parse_note, parse_parameters,
     parse_related_objects, parse_syntax, parse_value_info,
 };
 use crate::html::split_chapters;
-use crate::models::{MethodInfo, MethodSignatureInfo};
+use crate::models::{AvailabilityInfo, MethodInfo, MethodSignatureInfo};
 
 pub fn parse_method_page(html: &str) -> MethodInfo {
     let chapters = split_chapters(html);
@@ -33,6 +34,7 @@ pub fn parse_method_page(html: &str) -> MethodInfo {
     let mut note: Option<String> = None;
     let mut related = Vec::new();
     let mut return_value = None;
+    let mut availability: Option<AvailabilityInfo> = None;
 
     for ch in chapters.iter().skip(1) {
         let title = ch.title.as_str();
@@ -68,7 +70,8 @@ pub fn parse_method_page(html: &str) -> MethodInfo {
             "Пример:" => example = non_empty(parse_example(&ch.body_html)),
             "См. также:" => related = parse_related_objects(&ch.body_html),
             "Примечание:" => note = non_empty(parse_note(&ch.body_html)),
-            "Доступность:" | "Использование в версии:" | "Использование в интерфейсе:" =>
+            "Доступность:" => availability = parse_availability(&ch.body_html),
+            "Использование в версии:" | "Использование в интерфейсе:" =>
             {
                 // Известные главы, ничего не дающие правилам.
             }
@@ -91,6 +94,7 @@ pub fn parse_method_page(html: &str) -> MethodInfo {
         example,
         note,
         related_objects: related,
+        availability,
     }
 }
 

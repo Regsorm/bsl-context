@@ -625,6 +625,7 @@ mod tests {
             return_type: return_type.to_string(),
             signatures: Vec::new(),
             note: None,
+            availability: None,
         }
     }
 
@@ -636,6 +637,7 @@ mod tests {
             type_name: type_name.to_string(),
             readonly: false,
             note: None,
+            availability: None,
         }
     }
 
@@ -649,6 +651,7 @@ mod tests {
             constructors: Vec::new(),
             enum_values: Vec::new(),
             note: None,
+            availability: None,
         }
     }
 

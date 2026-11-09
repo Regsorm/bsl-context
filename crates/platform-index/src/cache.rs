@@ -51,7 +51,11 @@ pub const DEFAULT_CACHE_FILE_NAME: &str = "platform-index.cache";
 ///
 /// 3 — `note` у типов, методов, свойств и значений перечислений плюс `name_en`
 /// у конструкторов: без подъёма версии старый кэш отдал бы пустые примечания.
-const FORMAT_VERSION: u32 = 3;
+///
+/// 4 — `availability` (доступность по контексту выполнения) у методов, свойств и
+/// типов: без подъёма версии старый кэш отдал бы её пустой, и правило молчало бы
+/// там, где данные есть.
+const FORMAT_VERSION: u32 = 4;
 
 /// Предел на строку заголовка кэша: файл без переводов строк иначе вычитал бы
 /// в память гигабайты (путь кэша приходит из конфига).
@@ -485,7 +489,9 @@ impl<'a> SnapshotRef<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entities::{Constructor, EnumValue, Parameter, Signature};
+    use crate::entities::{
+        Availability, AvailabilityMark, Constructor, EnumValue, Parameter, Signature,
+    };
 
     fn fake_hbk(dir: &Path) -> PathBuf {
         let path = dir.join("shcntx_ru.hbk");
@@ -521,6 +527,11 @@ mod tests {
                 }],
             }],
             note: Some("Примечание метода".to_string()),
+            availability: Some(availability(&[
+                "Сервер",
+                "толстый клиент",
+                "внешнее соединение",
+            ])),
         });
         index.global_properties.push(Property {
             name_ru: "Справочники".to_string(),
@@ -529,6 +540,7 @@ mod tests {
             type_name: "СправочникиМенеджер".to_string(),
             readonly: true,
             note: Some("Примечание свойства".to_string()),
+            availability: Some(availability(&["Сервер", "внешнее соединение"])),
         });
         index.insert_type(Type {
             name_ru: "Массив".to_string(),
@@ -551,6 +563,12 @@ mod tests {
                     }],
                 }],
                 note: None,
+                availability: Some(availability(&[
+                    "Тонкий клиент",
+                    "веб-клиент",
+                    "сервер",
+                    "толстый клиент",
+                ])),
             }],
             properties: vec![Property {
                 name_ru: "Количество".to_string(),
@@ -559,6 +577,7 @@ mod tests {
                 type_name: "Число".to_string(),
                 readonly: true,
                 note: None,
+                availability: Some(availability(&["Сервер", "толстый клиент"])),
             }],
             constructors: vec![Constructor {
                 name: "Массив".to_string(),
@@ -575,6 +594,11 @@ mod tests {
             }],
             enum_values: Vec::new(),
             note: Some("Примечание типа".to_string()),
+            availability: Some(availability(&[
+                "Сервер",
+                "внешнее соединение",
+                "мобильный автономный сервер",
+            ])),
         });
         index.insert_type(Type {
             name_ru: "Цвет".to_string(),
@@ -590,8 +614,19 @@ mod tests {
                 note: Some("Примечание значения".to_string()),
             }],
             note: None,
+            availability: None,
         });
         index
+    }
+
+    /// Доступность в домене из меток справки — как её собрал бы `mapper`.
+    fn availability(labels: &[&str]) -> Availability {
+        Availability::new(
+            labels
+                .iter()
+                .map(|label| AvailabilityMark::from_label(label))
+                .collect(),
+        )
     }
 
     #[test]

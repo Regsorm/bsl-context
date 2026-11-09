@@ -7,7 +7,9 @@
 
 use std::fmt::Write;
 
-use crate::entities::{Constructor, Definition, EnumValue, Method, Property, Signature, Type};
+use crate::entities::{
+    Availability, Constructor, Definition, EnumValue, Method, Property, Signature, Type,
+};
 
 /// Тип (в т.ч. составной `A,B`) → markdown-code-span по каждому компоненту.
 fn render_type(type_name: &str) -> String {
@@ -40,6 +42,17 @@ fn note_block(note: Option<&str>) -> String {
     match note.map(str::trim).filter(|n| !n.is_empty()) {
         Some(note) => format!("**Примечание:** {}\n\n", inline_line(note)),
         None => String::new(),
+    }
+}
+
+/// Абзац «**Доступность:** …» — контексты выполнения из справки.
+///
+/// Пустого абзаца нет: у конструкторов и значений перечислений главы
+/// «Доступность:» не бывает, а у части страниц свойств она не заполнена.
+fn availability_block(availability: Option<&Availability>) -> String {
+    match availability.map(Availability::labels) {
+        Some(labels) if !labels.is_empty() => format!("**Доступность:** {labels}\n\n"),
+        _ => String::new(),
     }
 }
 
@@ -86,6 +99,7 @@ pub fn format_type(t: &Type) -> String {
         let _ = writeln!(out, "{}\n", t.description);
     }
     out.push_str(&note_block(t.note.as_deref()));
+    out.push_str(&availability_block(t.availability.as_ref()));
 
     if t.has_methods() {
         out.push_str("## Методы\n\n");
@@ -125,6 +139,7 @@ pub fn format_method(m: &Method) -> String {
         let _ = writeln!(out, "{}\n", m.description);
     }
     out.push_str(&note_block(m.note.as_deref()));
+    out.push_str(&availability_block(m.availability.as_ref()));
     out.push_str(&format_signatures(&m.signatures, &m.name_ru));
     if !m.return_type.is_empty() {
         let _ = writeln!(
@@ -143,6 +158,7 @@ pub fn format_property(p: &Property) -> String {
         let _ = writeln!(out, "{}\n", p.description);
     }
     out.push_str(&note_block(p.note.as_deref()));
+    out.push_str(&availability_block(p.availability.as_ref()));
     let _ = writeln!(out, "**Тип:** {}", render_type(&p.type_name));
     let _ = writeln!(
         out,
@@ -346,7 +362,16 @@ fn format_enum_value_summary(v: &EnumValue) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entities::Parameter;
+    use crate::entities::{AvailabilityMark, Parameter};
+
+    fn availability(labels: &[&str]) -> Availability {
+        Availability::new(
+            labels
+                .iter()
+                .map(|label| AvailabilityMark::from_label(label))
+                .collect(),
+        )
+    }
 
     fn parameter() -> Parameter {
         Parameter {
@@ -370,6 +395,7 @@ mod tests {
                 description: String::new(),
                 parameters: vec![parameter()],
             }],
+            availability: None,
         }
     }
 
@@ -381,6 +407,7 @@ mod tests {
             note: note.map(str::to_string),
             type_name: "Число".to_string(),
             readonly: true,
+            availability: None,
         }
     }
 
@@ -414,6 +441,7 @@ mod tests {
             properties: vec![property(note)],
             constructors: vec![constructor(note)],
             enum_values: vec![enum_value(note)],
+            availability: None,
         }
     }
 
@@ -497,5 +525,35 @@ mod tests {
         let text = format_type(&t);
         assert!(!text.contains("**Примечание:**"), "{text}");
         assert!(text.contains("# Массив\n"), "{text}");
+    }
+
+    #[test]
+    fn availability_line_appears_for_every_entity_kind() {
+        let mut m = method(None);
+        m.availability = Some(availability(&["Тонкий клиент", "веб-клиент"]));
+        let method_text = format_member(&Definition::Method(m));
+        assert!(
+            method_text.contains("**Доступность:** тонкий клиент, веб-клиент"),
+            "{method_text}"
+        );
+
+        let mut p = property(None);
+        p.availability = Some(availability(&["Сервер"]));
+        let property_text = format_member(&Definition::Property(p));
+        assert!(
+            property_text.contains("**Доступность:** сервер"),
+            "{property_text}"
+        );
+
+        let mut t = ty(None);
+        t.availability = Some(availability(&["Сервер", "внешнее соединение"]));
+        let type_text = format_type(&t);
+        assert!(
+            type_text.contains("**Доступность:** сервер, внешнее соединение"),
+            "{type_text}"
+        );
+
+        // Без данных о доступности строки нет вовсе — не пустой заголовок.
+        assert!(!format_type(&ty(None)).contains("**Доступность:**"));
     }
 }

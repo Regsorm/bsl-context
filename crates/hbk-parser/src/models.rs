@@ -10,6 +10,26 @@
 
 use serde::Serialize;
 
+/// Доступность метода/свойства/типа по контексту выполнения — глава
+/// «Доступность:» страницы справки.
+///
+/// Страницы конструкторов, значений перечислений и типов-перечислений такой
+/// главы не имеют (см. `TZ-dostupnost-metodov-kontekst.md`, §2), поэтому поле
+/// `availability` у соответствующих Info отсутствует, а не пустое.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AvailabilityInfo {
+    /// Метки ровно в том написании, в каком они стоят в справке
+    /// («Тонкий клиент» первой, «сервер» дальше).
+    pub labels: Vec<String>,
+    /// Хвост главы после списка: абзацы после `<br>` и текст вида
+    /// «Внимание: не поддерживается при работе через COM-соединение».
+    pub note: Option<String>,
+    /// В главе есть текст, который не является меткой доступности: справка
+    /// новее словаря либо схема страницы изменилась. Потребитель обязан
+    /// молчать, а не делать вывод из неполного списка.
+    pub has_unknown: bool,
+}
+
 /// Глобальный/локальный метод платформы.
 #[derive(Debug, Clone, Serialize)]
 pub struct MethodInfo {
@@ -22,6 +42,7 @@ pub struct MethodInfo {
     pub example: Option<String>,
     pub note: Option<String>,
     pub related_objects: Vec<RelatedObject>,
+    pub availability: Option<AvailabilityInfo>,
 }
 
 /// Одна перегрузка метода (синтаксис + параметры + описание).
@@ -52,6 +73,7 @@ pub struct PropertyInfo {
     pub readonly: bool,
     pub note: Option<String>,
     pub related_objects: Vec<RelatedObject>,
+    pub availability: Option<AvailabilityInfo>,
 }
 
 /// Тип платформы (объект, не системное перечисление).
@@ -70,6 +92,9 @@ pub struct ObjectInfo {
     pub properties: Vec<PropertyInfo>,
     pub methods: Vec<MethodInfo>,
     pub constructors: Vec<ConstructorInfo>,
+    /// Доступность ТИПА — источник для `Новый Тип(...)`: у страницы конструктора
+    /// своей главы «Доступность:» нет.
+    pub availability: Option<AvailabilityInfo>,
 }
 
 /// Конструктор объекта (`Новый ТипX(...)`).

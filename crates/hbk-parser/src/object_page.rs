@@ -9,11 +9,12 @@
 //!
 //! Порт `ObjectPageParser.kt`.
 
+use crate::availability::parse_availability;
 use crate::blocks::{
     non_empty, parse_description, parse_example, parse_head_name, parse_note, parse_related_objects,
 };
 use crate::html::split_chapters;
-use crate::models::ObjectInfo;
+use crate::models::{AvailabilityInfo, ObjectInfo};
 
 pub fn parse_object_page(html: &str) -> ObjectInfo {
     let chapters = split_chapters(html);
@@ -25,6 +26,7 @@ pub fn parse_object_page(html: &str) -> ObjectInfo {
     let mut example: Option<String> = None;
     let mut note: Option<String> = None;
     let mut related = Vec::new();
+    let mut availability: Option<AvailabilityInfo> = None;
 
     for ch in chapters.iter().skip(1) {
         match ch.title.as_str() {
@@ -32,6 +34,9 @@ pub fn parse_object_page(html: &str) -> ObjectInfo {
             "Пример:" => example = non_empty(parse_example(&ch.body_html)),
             "См. также:" => related = parse_related_objects(&ch.body_html),
             "Примечание:" => note = non_empty(parse_note(&ch.body_html)),
+            // Доступность ТИПА — источник для `Новый Тип(...)`: у страницы
+            // конструктора своей главы «Доступность:» нет.
+            "Доступность:" => availability = parse_availability(&ch.body_html),
             // Игнорируемые главы (как в апстриме). «Элементы коллекции:» и
             // «Параметры формы:» в модели `ObjectInfo` не представлены — в
             // апстриме они пропускаются молча, и предупреждение на каждую
@@ -40,7 +45,6 @@ pub fn parse_object_page(html: &str) -> ObjectInfo {
             | "Методы:"
             | "События:"
             | "Конструкторы:"
-            | "Доступность:"
             | "Использование в версии:"
             | "Использование в интерфейсе:"
             | "Элементы коллекции:"
@@ -63,5 +67,6 @@ pub fn parse_object_page(html: &str) -> ObjectInfo {
         properties: Vec::new(),
         methods: Vec::new(),
         constructors: Vec::new(),
+        availability,
     }
 }

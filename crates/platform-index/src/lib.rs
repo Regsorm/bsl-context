@@ -20,7 +20,8 @@ pub mod visitor;
 
 pub use cache::{load_cached, LoadSource, DEFAULT_CACHE_FILE_NAME};
 pub use entities::{
-    Constructor, Definition, EnumValue, Method, Parameter, Property, Signature, Type, TypeMember,
+    Availability, AvailabilityMark, Constructor, Definition, EnumValue, Method, Parameter,
+    Property, Signature, Type, TypeMember,
 };
 pub use loader::{build_index, load_from_hbk};
 pub use search::SearchEngine;

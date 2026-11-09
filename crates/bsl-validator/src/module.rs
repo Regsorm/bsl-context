@@ -215,6 +215,18 @@ fn validate_module_at_level_inner_ext(
         }
     });
     let locals = LocalNames::new(&facts);
+    // Контекст выполнения для правила доступности платформенных методов: вид
+    // модуля — из пути выгрузки, вид формы — из файлов выгрузки (`Ext/Form.xml`
+    // или `.bin`). Директива процедуры и попадание в `#Если` зависят от места
+    // вызова, поэтому дальше передаётся вычислитель, а не одно значение на
+    // модуль: в форме процедуры бывают и клиентские, и серверные.
+    let availability_context = module_path.map(|path| {
+        crate::availability::ContextLocator::new(
+            crate::module_context::module_kind(path),
+            form_kind,
+            &facts,
+        )
+    });
     check_type_dot_members(
         index,
         source,
@@ -222,11 +234,19 @@ fn validate_module_at_level_inner_ext(
         scope_map.as_ref(),
         Some(&locals),
         form_module,
+        form_attributes,
         symbols,
         record_set,
+        availability_context.as_ref(),
         &mut errors,
     );
-    check_new_expressions(index, source, &facts.news, &mut errors);
+    check_new_expressions(
+        index,
+        source,
+        &facts.news,
+        availability_context.as_ref(),
+        &mut errors,
+    );
     // Контекст модуля (issue #19): в модуле менеджера, объекта, набора записей и
     // обычной формы неквалифицированный вызов разрешается методом самого объекта,
     // а не глобальной функцией. Тип выводится из пути выгрузки; для формы ещё и
@@ -246,6 +266,7 @@ fn validate_module_at_level_inner_ext(
         owner_unknown,
         symbols_degraded,
         module_context,
+        availability_context.as_ref(),
         &mut errors,
     );
     check_shadowed_context_names(
@@ -965,6 +986,7 @@ EndFunction
                         .collect(),
                 }],
                 note: None,
+                availability: None,
             }
         }
 
@@ -979,6 +1001,7 @@ EndFunction
             constructors: Vec::new(),
             enum_values: Vec::new(),
             note: None,
+            availability: None,
         });
         // Глобальная функция того же имени — с ДВУМЯ параметрами.
         index
@@ -1043,6 +1066,7 @@ EndFunction
                         .collect(),
                 }],
                 note: None,
+                availability: None,
             }
         }
 
@@ -1057,6 +1081,7 @@ EndFunction
             constructors: Vec::new(),
             enum_values: Vec::new(),
             note: None,
+            availability: None,
         });
         // Глобальная функция того же имени — с ШЕСТЬЮ параметрами.
         index

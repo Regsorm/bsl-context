@@ -22,6 +22,7 @@ fn index() -> PlatformIndex {
         return_type: String::new(),
         signatures: Vec::new(),
         note: None,
+        availability: None,
     });
     index
 }

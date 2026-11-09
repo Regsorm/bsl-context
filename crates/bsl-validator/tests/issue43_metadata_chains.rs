@@ -54,6 +54,7 @@ fn prop(name: &str) -> Property {
         note: None,
         type_name: String::new(),
         readonly: false,
+        availability: None,
     }
 }
 
@@ -65,6 +66,7 @@ fn method(name: &str) -> Method {
         return_type: String::new(),
         signatures: Vec::new(),
         note: None,
+        availability: None,
     }
 }
 
@@ -78,6 +80,7 @@ fn ty(name: &str, props: Vec<Property>, methods: Vec<Method>) -> Type {
         properties: props,
         constructors: Vec::new(),
         enum_values: Vec::new(),
+        availability: None,
     }
 }
 

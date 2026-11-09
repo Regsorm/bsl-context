@@ -11,11 +11,14 @@
 //! - `EnumInfo → Type` переносит `enum_values` (у апстрима этого пути нет — `EnumInfo` теряется).
 
 use hbk_parser::{
-    ConstructorInfo, EnumInfo, EnumValueInfo, MethodInfo, MethodParameterInfo, MethodSignatureInfo,
-    ObjectInfo, PropertyInfo,
+    AvailabilityInfo, ConstructorInfo, EnumInfo, EnumValueInfo, MethodInfo, MethodParameterInfo,
+    MethodSignatureInfo, ObjectInfo, PropertyInfo,
 };
 
-use crate::entities::{Constructor, EnumValue, Method, Parameter, Property, Signature, Type};
+use crate::entities::{
+    Availability, AvailabilityMark, Constructor, EnumValue, Method, Parameter, Property, Signature,
+    Type,
+};
 
 pub fn method_from(info: &MethodInfo) -> Method {
     Method {
@@ -29,6 +32,7 @@ pub fn method_from(info: &MethodInfo) -> Method {
             .map(|v| v.type_name.clone())
             .unwrap_or_default(),
         signatures: info.signatures.iter().map(signature_from).collect(),
+        availability: info.availability.as_ref().map(availability_from),
     }
 }
 
@@ -40,6 +44,7 @@ pub fn property_from(info: &PropertyInfo) -> Property {
         note: info.note.clone(),
         type_name: info.type_name.clone(),
         readonly: info.readonly,
+        availability: info.availability.as_ref().map(availability_from),
     }
 }
 
@@ -92,10 +97,14 @@ pub fn type_from_object(info: &ObjectInfo) -> Type {
         properties: info.properties.iter().map(property_from).collect(),
         constructors: info.constructors.iter().map(constructor_from).collect(),
         enum_values: Vec::new(),
+        availability: info.availability.as_ref().map(availability_from),
     }
 }
 
 /// Тип-перечисление: `enum_values` заполнен, остальные коллекции пусты.
+///
+/// Главы «Доступность:» у страниц типов-перечислений не проверяли — данных о
+/// доступности нет (см. §10.4 плана).
 pub fn type_from_enum(info: &EnumInfo) -> Type {
     Type {
         name_ru: info.name_ru.clone(),
@@ -106,5 +115,90 @@ pub fn type_from_enum(info: &EnumInfo) -> Type {
         properties: Vec::new(),
         constructors: Vec::new(),
         enum_values: info.values.iter().map(enum_value_from).collect(),
+        availability: None,
+    }
+}
+
+/// Глава «Доступность:» → домен.
+///
+/// Неполный список (`has_unknown`: в главе есть текст, который меткой не
+/// является) даёт [`AvailabilityMark::Unknown`]: правило проверки по такому
+/// набору обязано молчать, а не считать «доступно везде».
+fn availability_from(info: &AvailabilityInfo) -> Availability {
+    let mut marks: Vec<AvailabilityMark> = info
+        .labels
+        .iter()
+        .map(|label| AvailabilityMark::from_label(label))
+        .collect();
+    if info.has_unknown {
+        marks.push(AvailabilityMark::Unknown(
+            info.note.clone().unwrap_or_default(),
+        ));
+    }
+    Availability::new(marks)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn method_info(availability: Option<AvailabilityInfo>) -> MethodInfo {
+        MethodInfo {
+            name_ru: "Найти".to_string(),
+            name_en: "Find".to_string(),
+            description: String::new(),
+            signatures: Vec::new(),
+            return_value: None,
+            example: None,
+            note: None,
+            related_objects: Vec::new(),
+            availability,
+        }
+    }
+
+    #[test]
+    fn method_from_keeps_availability() {
+        // Глава «Доступность:» обязана доехать до домена: правило проверяет
+        // именно `Method::availability`.
+        let info = method_info(Some(AvailabilityInfo {
+            labels: vec!["Сервер".to_string(), "толстый клиент".to_string()],
+            note: None,
+            has_unknown: false,
+        }));
+        let method = method_from(&info);
+
+        let availability = method
+            .availability
+            .expect("доступность обязана перенестись");
+        assert!(availability.server_side());
+        assert!(availability.ordinary_client_side());
+        assert!(!availability.managed_client_side());
+        assert!(!availability.has_unknown());
+        assert_eq!(availability.labels(), "сервер, толстый клиент");
+    }
+
+    #[test]
+    fn unknown_tail_is_not_lost_in_mapping() {
+        // Неполный список превращается в `Unknown`: молчать обязано правило,
+        // а не маппер.
+        let info = method_info(Some(AvailabilityInfo {
+            labels: vec!["Сервер".to_string()],
+            note: Some("неведомая метка".to_string()),
+            has_unknown: true,
+        }));
+        let availability = availability_from(
+            info.availability
+                .as_ref()
+                .expect("доступность в тестовой модели"),
+        );
+
+        assert!(availability.has_unknown());
+        assert!(availability.server_side());
+        assert_eq!(availability.labels(), "сервер, неведомая метка");
+    }
+
+    #[test]
+    fn page_without_chapter_has_no_availability() {
+        assert!(method_from(&method_info(None)).availability.is_none());
     }
 }

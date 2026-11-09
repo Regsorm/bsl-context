@@ -74,6 +74,7 @@ parsed as BSL and returned `valid: true` without a single check.
 | `unknown_common_module` | high / low | `ModuleName.Method(...)` — no common module with that name exists in the configuration. Requires an external name source; a source with a suspiciously empty index lowers confidence to low |
 | `unknown_metadata_object` | high / low | `Справочники.Name`, `Документы.Name`, and also `Метаданные.<Collection>.<Object>` — no object with that name exists in the collection (nor the collection itself in `Метаданные`). Requires an external name source; a source with a suspiciously empty index lowers confidence to low |
 | `unknown_form_element` | low | `Элементы.<Name>` in a managed form module — the form has no element with that name. The composition is read from `Form.xml` next to the module (`validate_module` with the `path` argument). An element created at runtime (`Элементы.Добавить(...)`) disables the check entirely |
+| `unavailable_in_context` | high / medium | A platform method, a type method, or a type constructor is called where the help does not list it: a client-only method in a server module (`&НаСервере`), a server-only method in `&НаКлиенте`, a type constructor whose type the help lists only for the other side (constructors are checked in the client context only: the platform accepts a client-only type such as `Новый СочетаниеКлавиш` on the server). The context comes from the module path and the procedure directive; calls inside `#Если`, in common modules, in extensions, or in a directive-less procedure of a managed form are left alone. `medium` marks a verdict that depends on reading «толстый клиент» as an ordinary-application client only |
 | `unknown_global_property` | high / low | The head of an `Name.Member` access is neither declared in the module nor a global context property, yet it is spelled close to a real one: `Справочник.Номенклатура` instead of `Справочники.Номенклатура` (the query language names a table in the singular, the code names the manager in the plural). A head that resembles nothing is passed over silently — otherwise every common-module call would be flagged. In an object or record-set module the owner's composition is checked as well: `НетТакойТЧ1.Итог(...)` yields low, and without a name source the rule stays silent. The external name source is needed only for that second check |
 | `unknown_manager_method` | high / low | `Справочники.Name.Method(...)` — the object manager has no such method, and the name is close to a real help method (a typo like `НайтиПоРеквизитам` → `НайтиПоРеквизиту`). A method declared in the manager module is left alone. Requires an external name source |
 | `reserved_procedure_name` | high | The procedure name is a language keyword (`Выполнить`) or a name the platform rejects (`Найти`). The module does not compile: "Ожидается имя процедуры" |
@@ -86,8 +87,10 @@ parsed as BSL and returned `valid: true` without a single check.
 | `virtual_table_without_filter` | low | A virtual table is called without a filter on its dimensions. Requires an external name source |
 | `join_on_unindexed_field` | low | The joined table has neither a standard index nor «Индексировать» on the join field. Requires an external name source |
 
-high-confidence findings have a false-positive rate near zero; low-confidence ones
-depend on the accuracy of type inference and the completeness of the `hbk`.
+high-confidence findings have a false-positive rate near zero; `medium` ones depend
+on the reading of the «толстый клиент» marker (ordinary-application client only);
+low-confidence ones depend on the accuracy of type inference and the completeness
+of the `hbk`.
 
 ### Module structure
 

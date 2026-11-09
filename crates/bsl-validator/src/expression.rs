@@ -249,6 +249,14 @@ pub enum ExprErrorKind {
     /// компилируется. Текстовая проверка `crate::blocks`, только из
     /// `validate_module`.
     MemberAccessOnExpression,
+    /// Метод платформы вызван в контексте выполнения, в котором справка его не
+    /// описывает: `ПоказатьВопрос` (только клиент) на сервере,
+    /// `ТаблицаЗначений.Найти` (только сервер) в клиенте управляемого приложения,
+    /// конструктор серверного типа в клиенте. Источник — глава «Доступность:»
+    /// страницы справки (`crate::availability`). Confidence ставится явно:
+    /// `High`, когда решение следует из состава меток, и `Medium`, когда оно
+    /// опирается на трактовку «толстый клиент» = клиент ОБЫЧНОГО приложения.
+    UnavailableInContext,
 }
 
 impl ExprErrorKind {
@@ -300,7 +308,12 @@ impl ExprErrorKind {
             // обращение к члену у выражения. Тоже не эвристика — платформа такой
             // модуль не компилирует.
             | ExprErrorKind::UnbalancedCodeBlock
-            | ExprErrorKind::MemberAccessOnExpression => Confidence::High,
+            | ExprErrorKind::MemberAccessOnExpression
+            // Доступность по контексту: набор меток и контекст вызова известны
+            // точно. `Medium` (решение по «толстому клиенту») проставляется явно
+            // через `ExprError::new_with_confidence`, здесь — fallback обычного
+            // случая.
+            | ExprErrorKind::UnavailableInContext => Confidence::High,
             // Соединение с подзапросом иногда оправдано (маленький набор,
             // однократное вычисление) — оставляем на усмотрение читающего.
             ExprErrorKind::UnknownTypeMember
@@ -334,6 +347,11 @@ impl ExprErrorKind {
 pub enum Confidence {
     /// Точная сверка с индексом платформы, false-positive ≈ 0.
     High,
+    /// Решение следует из данных справки, но опирается на одну трактовку,
+    /// которая экспериментально не проверена. Сейчас единственный источник —
+    /// «толстый клиент» = клиент ОБЫЧНОГО приложения: если платформа разрешает
+    /// такой метод и в управляемом толстом клиенте, находка ложная.
+    Medium,
     /// Зависит от эвристики (type inference) или полноты hbk, возможен false-positive.
     Low,
 }
@@ -419,9 +437,12 @@ pub fn validate_expression_at_level(
         false,
         None,
         None,
+        None,
+        // Контекст выполнения фрагмента неизвестен — правило доступности молчит.
+        None,
         &mut errors,
     );
-    check_new_expressions(index, source, &facts.news, &mut errors);
+    check_new_expressions(index, source, &facts.news, None, &mut errors);
     check_global_calls(
         index,
         source,
@@ -432,6 +453,7 @@ pub fn validate_expression_at_level(
         None,
         false,
         false,
+        None,
         None,
         &mut errors,
     );
@@ -486,8 +508,10 @@ pub(crate) fn check_type_dot_members(
     scope_map: Option<&ScopeMap>,
     locals: Option<&LocalNames>,
     form_module: bool,
+    form_attributes: Option<&std::collections::HashSet<String>>,
     symbols: Option<&dyn SymbolSource>,
     record_set: Option<(&str, &str)>,
+    context: Option<&crate::availability::ContextLocator>,
     errors: &mut Vec<ExprError>,
 ) {
     for dot in dots {
@@ -506,6 +530,10 @@ pub(crate) fn check_type_dot_members(
         // — свойство формы типа `УсловноеОформлениеКомпоновкиДанных`, а не
         // одноимённый платформенный тип.
         let head_is_local = locals.is_some_and(|l| l.is_local(dot.head_byte, head))
+            // Реквизит формы перекрывает одноимённый платформенный тип: в форме
+            // встречается реквизит `ТаблицаЗначений`, и `ТаблицаЗначений.НайтиСтроки`
+            // — обращение к реквизиту, а не к типу (замер на УТ: 1325 таких мест).
+            || form_attributes.is_some_and(|attrs| attrs.contains(&head.to_lowercase()))
             || crate::context_names::is_context_property_of_other_type(index, form_module, head);
 
         // Уровень 1: head — это имя платформенного типа.
@@ -607,7 +635,24 @@ pub(crate) fn check_type_dot_members(
         // Член есть хотя бы у одной альтернативы — находки нет. Имена сверяются
         // со сведением латинско-кириллических двойников: в справке платформы
         // встречаются неотличимые на экране опечатки (issue #18).
-        if types.iter().any(|ty| type_has_member(ty, member)) {
+        if let Some(found) = types.iter().find(|ty| type_has_member(ty, member)) {
+            // Найденный метод может быть недоступен в контексте вызова
+            // (`ТаблицаЗначений.Найти` в клиенте управляемого приложения).
+            // Проверяем только вызовы и только при ОДНОЗНАЧНО разрешённом типе:
+            // при объединении альтернатив метод мог прийти из другой ветви, и
+            // доступность была бы взята у чужого типа (раздел 6.5 плана).
+            if dot.member_is_call && types.len() == 1 {
+                if let Some(locator) = context {
+                    crate::availability::check_member(
+                        locator.at(dot.member_byte),
+                        src,
+                        dot.member_byte,
+                        found,
+                        member,
+                        errors,
+                    );
+                }
+            }
             continue;
         }
 
@@ -809,6 +854,7 @@ pub(crate) fn check_new_expressions(
     index: &PlatformIndex,
     src: &str,
     news: &[NewFact],
+    context: Option<&crate::availability::ContextLocator>,
     errors: &mut Vec<ExprError>,
 ) {
     for n in news {
@@ -837,6 +883,12 @@ pub(crate) fn check_new_expressions(
             ));
             continue;
         };
+        // Доступность КОНСТРУКТОРА — это доступность типа (у страницы
+        // конструктора своей главы нет): `Новый Запрос` в клиенте управляемой
+        // формы платформа не скомпилирует.
+        if let Some(locator) = context {
+            crate::availability::check_type(locator.at(n.byte), src, n.byte, ty, errors);
+        }
         // Число аргументов конструктора (issue #44): справка описывает параметры
         // и их обязательность, поэтому «слишком много аргументов» проверяется так
         // же, как у глобальных методов. Раньше не считалось вовсе —
@@ -891,6 +943,7 @@ pub(crate) fn check_global_calls(
     owner_unknown: bool,
     symbols_degraded: bool,
     module_context: Option<&Type>,
+    context: Option<&crate::availability::ContextLocator>,
     errors: &mut Vec<ExprError>,
 ) {
     // Методы собственного объекта/формы/менеджера зовутся из его модуля без
@@ -907,7 +960,7 @@ pub(crate) fn check_global_calls(
         }
 
         // Если имя — известный глобальный метод, попытаемся посчитать аргументы.
-        let Some(_method) = index.find_global_method(&call.name) else {
+        let Some(method) = index.find_global_method(&call.name) else {
             // Устаревшие, но живые глобальные методы (issue #40): справка их уже
             // не описывает, а платформа исполняет. Сигнатуры в индексе нет, так
             // что проверять нечего; без этой ветки вызов рабочего метода получал
@@ -1075,6 +1128,20 @@ pub(crate) fn check_global_calls(
                 }
                 continue;
             }
+        }
+
+        // Вызов разрешился именно как ГЛОБАЛЬНЫЙ метод платформы (метод
+        // контекста модуля выше обработан и завершил итерацию). Проверяем его
+        // доступность в контексте выполнения: `ПоказатьВопрос` (только клиент)
+        // на сервере не скомпилируется.
+        if let Some(locator) = context {
+            crate::availability::check_global_method(
+                locator.at(call.byte),
+                src,
+                call.byte,
+                method,
+                errors,
+            );
         }
 
         let result = validate_method_call(index, &call.name, call.arg_count);
@@ -1320,6 +1387,7 @@ mod tests {
                 ],
             }],
             note: None,
+            availability: None,
         });
         let src = "Текст = НСтр(\"ru = 'Неверный тип запроса.'\");";
         let res = validate_expression_at_level(&index, src, 1);
@@ -1447,6 +1515,7 @@ mod tests {
                 note: None,
             }],
             note: None,
+            availability: None,
         });
 
         index.insert_type(Type {
@@ -1460,11 +1529,13 @@ mod tests {
                 return_type: String::new(),
                 signatures: Vec::new(),
                 note: None,
+                availability: None,
             }],
             properties: Vec::new(),
             constructors: Vec::new(),
             enum_values: Vec::new(),
             note: None,
+            availability: None,
         });
 
         // Открытая коллекция: первым значением — псевдо-элемент `<...>`.
@@ -1490,6 +1561,7 @@ mod tests {
                 },
             ],
             note: None,
+            availability: None,
         });
 
         // Issue #31: `XBase` — свойства это поля конкретного DBF-файла (динамические),
@@ -1505,11 +1577,13 @@ mod tests {
                 return_type: String::new(),
                 signatures: Vec::new(),
                 note: None,
+                availability: None,
             }],
             properties: Vec::new(),
             constructors: Vec::new(),
             enum_values: Vec::new(),
             note: None,
+            availability: None,
         });
 
         index

@@ -177,6 +177,7 @@ pub fn apply(index: &mut PlatformIndex, overlay: &Overlay) -> OverlayReport {
             note: entry.note.clone(),
             return_type: entry.return_type.clone(),
             signatures: entry.signatures.iter().map(signature).collect(),
+            availability: None,
         });
         if replaced {
             report.methods_replaced += 1;
@@ -200,6 +201,7 @@ pub fn apply(index: &mut PlatformIndex, overlay: &Overlay) -> OverlayReport {
                 note: entry.note.clone(),
                 return_type: entry.return_type.clone(),
                 signatures: entry.signatures.iter().map(signature).collect(),
+                availability: None,
             }),
             MemberKind::Property => TypeMember::Property(Property {
                 name_ru: entry.name.clone(),
@@ -208,6 +210,7 @@ pub fn apply(index: &mut PlatformIndex, overlay: &Overlay) -> OverlayReport {
                 note: entry.note.clone(),
                 type_name: entry.type_name_of_value.clone(),
                 readonly: false,
+                availability: None,
             }),
         };
         match index.add_type_member(&entry.type_name, member) {
@@ -260,6 +263,7 @@ mod tests {
             properties: Vec::new(),
             constructors: Vec::new(),
             enum_values: Vec::new(),
+            availability: None,
         });
         index
     }
@@ -375,6 +379,7 @@ mod tests {
             note: None,
             return_type: String::new(),
             signatures: Vec::new(),
+            availability: None,
         });
         let overlay = overlay_from(
             r#"

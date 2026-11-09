@@ -98,6 +98,7 @@ fn index() -> PlatformIndex {
         type_name: "ПараметрыСеанса".into(),
         readonly: true,
         note: None,
+        availability: None,
     });
 
     let ty = |name: &str, methods: Vec<&str>| Type {
@@ -113,12 +114,14 @@ fn index() -> PlatformIndex {
                 return_type: String::new(),
                 signatures: Vec::new(),
                 note: None,
+                availability: None,
             })
             .collect(),
         properties: Vec::new(),
         constructors: Vec::new(),
         enum_values: Vec::new(),
         note: None,
+        availability: None,
     };
     index.insert_type(ty("ПараметрыСеанса", vec!["Очистить"]));
     index.insert_type(ty("Отбор", vec!["Добавить"]));

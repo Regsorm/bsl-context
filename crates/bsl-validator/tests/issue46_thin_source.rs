@@ -83,6 +83,7 @@ fn index() -> PlatformIndex {
         // В справке имя типа обёрнуто в обратные кавычки — так же и здесь.
         type_name: "`СправочникиМенеджер`".into(),
         readonly: true,
+        availability: None,
     });
     index.insert_type(Type {
         name_ru: "СправочникиМенеджер".into(),
@@ -93,6 +94,7 @@ fn index() -> PlatformIndex {
         properties: Vec::new(),
         constructors: Vec::new(),
         enum_values: Vec::new(),
+        availability: None,
     });
     index
 }

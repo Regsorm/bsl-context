@@ -635,6 +635,7 @@ mod tests {
             constructors: Vec::new(),
             enum_values: vec![enum_v("<Имя картинки>"), enum_v("Лупа")],
             note: None,
+            availability: None,
         });
         let r = validate_enum(&idx, "КартинкиТест", "МояКартинка");
         assert!(r.valid, "открытую коллекцию по справке не отвергаем");
@@ -663,6 +664,7 @@ mod tests {
                 enum_v("Num0...Num9"),
             ],
             note: None,
+            availability: None,
         });
         idx.insert_type(Type {
             name_ru: "ОтображениеОбычнойГруппы".into(),
@@ -673,6 +675,7 @@ mod tests {
             constructors: Vec::new(),
             enum_values: vec![enum_v("Нет"), enum_v("СлабоеВыделение")],
             note: None,
+            availability: None,
         });
 
         for value in ["A", "F5", "F12", "Num0", "Num9", "_1", "BackSpace"] {
@@ -722,6 +725,7 @@ mod tests {
                 enum_v("Независимый"),
             ],
             note: None,
+            availability: None,
         });
 
         let r = validate_enum(&idx, "РежимОткрытияОкнаФормы", "БлокироватьВесьИнтерфейс");
@@ -759,6 +763,7 @@ mod tests {
                 }],
             }],
             note: None,
+            availability: None,
         }
     }
 
@@ -805,6 +810,7 @@ mod tests {
                 ],
             }],
             note: None,
+            availability: None,
         });
         assert!(
             validate_method_call(&idx, "СтрШаблон", 3).valid,

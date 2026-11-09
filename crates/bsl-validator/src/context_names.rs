@@ -327,6 +327,7 @@ mod tests {
             type_name: String::new(),
             readonly: true,
             note: None,
+            availability: None,
         });
         index.global_properties.push(Property {
             name_ru: "РабочаяДата".into(),
@@ -335,6 +336,7 @@ mod tests {
             type_name: String::new(),
             readonly: false,
             note: None,
+            availability: None,
         });
 
         index.insert_type(Type {
@@ -348,6 +350,7 @@ mod tests {
                 return_type: String::new(),
                 signatures: Vec::new(),
                 note: None,
+                availability: None,
             }],
             properties: vec![
                 Property {
@@ -357,6 +360,7 @@ mod tests {
                     type_name: String::new(),
                     readonly: true,
                     note: None,
+                    availability: None,
                 },
                 Property {
                     name_ru: "Заголовок".into(),
@@ -365,11 +369,13 @@ mod tests {
                     type_name: String::new(),
                     readonly: false,
                     note: None,
+                    availability: None,
                 },
             ],
             constructors: Vec::new(),
             enum_values: Vec::new(),
             note: None,
+            availability: None,
         });
 
         index

@@ -5,6 +5,7 @@
 //! — объявления, директивы, теней контекста, правила запросов и выражения.
 //! Разбор BSL вынесен в крейт `bsl-parse`.
 
+pub mod availability;
 pub mod blocks;
 pub mod chains;
 pub mod check;
@@ -30,6 +31,7 @@ pub mod ast {
     //! Совместимость: разбор переехал в крейт `bsl-parse`.
     pub use bsl_parse::{collect_facts, normalize_for_parser};
 }
+pub use availability::CallContext;
 pub use check::{
     validate_enum, validate_method_call, EnumValidation, MethodCallValidation, SignatureBrief,
     SimilarValue,

@@ -18,6 +18,7 @@
 //! assert!(info.name_ru.is_empty());
 //! ```
 
+mod availability;
 mod blocks;
 mod constructor_page;
 mod enum_page;
@@ -36,6 +37,6 @@ pub use object_page::parse_object_page;
 pub use property_page::parse_property_page;
 
 pub use models::{
-    ConstructorInfo, EnumInfo, EnumValueInfo, MethodInfo, MethodParameterInfo, MethodSignatureInfo,
-    ObjectInfo, PropertyInfo, RelatedObject, ValueInfo,
+    AvailabilityInfo, ConstructorInfo, EnumInfo, EnumValueInfo, MethodInfo, MethodParameterInfo,
+    MethodSignatureInfo, ObjectInfo, PropertyInfo, RelatedObject, ValueInfo,
 };

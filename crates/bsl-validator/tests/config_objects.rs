@@ -143,6 +143,7 @@ fn manager_index() -> PlatformIndex {
             type_name: manager.into(),
             readonly: true,
             note: None,
+            availability: None,
         });
         index.insert_type(Type {
             name_ru: manager.into(),
@@ -155,11 +156,13 @@ fn manager_index() -> PlatformIndex {
                 return_type: String::new(),
                 signatures: Vec::new(),
                 note: None,
+                availability: None,
             }],
             properties: Vec::new(),
             constructors: Vec::new(),
             enum_values: Vec::new(),
             note: None,
+            availability: None,
         });
     }
     index
@@ -181,6 +184,7 @@ fn index_with_platform_context() -> PlatformIndex {
         type_name: String::new(),
         readonly: true,
         note: None,
+        availability: None,
     });
 
     index.insert_type(Type {
@@ -192,6 +196,7 @@ fn index_with_platform_context() -> PlatformIndex {
         constructors: Vec::new(),
         enum_values: Vec::new(),
         note: None,
+        availability: None,
     });
 
     index.insert_type(Type {
@@ -205,6 +210,7 @@ fn index_with_platform_context() -> PlatformIndex {
             return_type: String::new(),
             signatures: Vec::new(),
             note: None,
+            availability: None,
         }],
         properties: vec![Property {
             name_ru: "Элементы".into(),
@@ -213,10 +219,12 @@ fn index_with_platform_context() -> PlatformIndex {
             type_name: String::new(),
             readonly: true,
             note: None,
+            availability: None,
         }],
         constructors: Vec::new(),
         enum_values: Vec::new(),
         note: None,
+        availability: None,
     });
 
     index
@@ -849,6 +857,7 @@ fn index_with_catalog_manager() -> PlatformIndex {
         return_type: String::new(),
         signatures: Vec::new(),
         note: None,
+        availability: None,
     };
     index.insert_type(Type {
         name_ru: "СправочникМенеджер.<Имя справочника>".into(),
@@ -866,6 +875,7 @@ fn index_with_catalog_manager() -> PlatformIndex {
         constructors: Vec::new(),
         enum_values: Vec::new(),
         note: None,
+        availability: None,
     });
     index
 }

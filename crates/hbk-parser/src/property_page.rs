@@ -8,11 +8,12 @@
 //! дополнительно сохраняет описание на страницах без маркера «Тип:» (их
 //! тысячи: 3048 из 13665 в 8.3.27).
 
+use crate::availability::parse_availability;
 use crate::blocks::{
     non_empty, parse_head_name, parse_note, parse_readonly, parse_related_objects, parse_value_info,
 };
 use crate::html::split_chapters;
-use crate::models::PropertyInfo;
+use crate::models::{AvailabilityInfo, PropertyInfo};
 
 pub fn parse_property_page(html: &str) -> PropertyInfo {
     let chapters = split_chapters(html);
@@ -25,6 +26,7 @@ pub fn parse_property_page(html: &str) -> PropertyInfo {
     let mut readonly = false;
     let mut note: Option<String> = None;
     let mut related = Vec::new();
+    let mut availability: Option<AvailabilityInfo> = None;
 
     for ch in chapters.iter().skip(1) {
         match ch.title.as_str() {
@@ -37,7 +39,8 @@ pub fn parse_property_page(html: &str) -> PropertyInfo {
             "Использование:" => readonly = parse_readonly(&ch.body_html),
             "См. также:" => related = parse_related_objects(&ch.body_html),
             "Примечание:" => note = non_empty(parse_note(&ch.body_html)),
-            "Доступность:" | "Использование в версии:" | "Использование в интерфейсе:" =>
+            "Доступность:" => availability = parse_availability(&ch.body_html),
+            "Использование в версии:" | "Использование в интерфейсе:" =>
             {
                 // Известные главы, ничего не дающие правилам.
             }
@@ -57,5 +60,6 @@ pub fn parse_property_page(html: &str) -> PropertyInfo {
         readonly,
         note,
         related_objects: related,
+        availability,
     }
 }

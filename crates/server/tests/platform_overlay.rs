@@ -34,6 +34,7 @@ fn index() -> PlatformIndex {
         properties: Vec::new(),
         constructors: Vec::new(),
         enum_values: Vec::new(),
+        availability: None,
     });
     index
 }

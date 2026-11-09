@@ -103,6 +103,18 @@ pub struct ProcScope {
     /// Скомпилирована БЕЗ контекста формы (`&НаСервереБезКонтекста`,
     /// `&НаКлиентеНаСервереБезКонтекста`): членов формы внутри не существует.
     pub no_context: bool,
+    /// Имя директивы компиляции без амперсанда (`НаКлиенте`, `НаСервере`, …),
+    /// если она есть у процедуры. Из нескольких директив [`directive_of`]
+    /// выбирает контекстную (без параметров) — ровно ту, что решает, в какой
+    /// части модуля компилируется процедура. Нужна правилу доступности методов
+    /// платформы по контексту выполнения (`bsl_validator::availability`).
+    pub directive: Option<String>,
+    /// Процедура подключена к расширяемой (`&Перед`, `&После`, `&Вместо`,
+    /// `&ИзменениеИКонтроль`). Признак нужен ОТДЕЛЬНО от [`Self::directive`]:
+    /// та из нескольких директив возвращает контекстную (`&НаСервере`), и без
+    /// этого флага потребитель не узнает, что рядом стоит `&Вместо(…)` и
+    /// контекст приходит из расширяемого модуля.
+    pub is_extension: bool,
 }
 
 impl ProcScope {
@@ -166,6 +178,12 @@ pub struct AstFacts {
     pub if_branches: Vec<IfBranches>,
     /// Процедуры/функции модуля с их параметрами и признаком «без контекста».
     pub procs: Vec<ProcScope>,
+    /// Байтовые границы блоков препроцессора `#Если … #КонецЕсли` в исходном
+    /// тексте. Внутри такого блока состав компилируемого кода зависит от настроек
+    /// сборки, поэтому вызов там считается вызовом с НЕИЗВЕСТНЫМ контекстом
+    /// выполнения (см. `bsl_validator::availability`). Считается один раз за
+    /// разбор, [`preproc_regions`].
+    pub preproc_regions: Vec<(usize, usize)>,
     /// В модуле есть хотя бы одна директива компиляции (`&НаКлиенте`, `&НаСервере`, …).
     /// Признак УПРАВЛЯЕМОЙ формы: в модуле обычной (неуправляемой) формы директив
     /// нет вовсе, и её контекст — другой тип, с другим составом членов.
@@ -668,6 +686,81 @@ fn preceded_by_new(src: &[u8], start: usize) -> bool {
     false
 }
 
+/// Байтовые границы блоков препроцессора `#Если … #КонецЕсли` в `src`.
+///
+/// Нужны правилу доступности методов платформы по контексту выполнения: у
+/// клиентского и серверного кода наборы символов препроцессора разные, поэтому
+/// какая ветка `#Если` попадёт в сборку, по тексту модуля не видно. Вызов внутри
+/// такого блока считается вызовом с неизвестным контекстом.
+///
+/// Начало блока — байт `#` директивы `#Если`, конец — байт сразу за последней
+/// буквой `#КонецЕсли`. Вложенные блоки входят во внешний и отдельной парой не
+/// возвращаются: для вопроса «внутри ли вызова регион» этого достаточно.
+/// `#ИначеЕсли`, `#Область` и прочие директивы границей блока не являются.
+/// Незакрытый блок (обрезанный модуль) тянется до конца текста: молчать по
+/// сомнительному коду лучше, чем дать находку.
+///
+/// Директива распознаётся и в написании `# Если` — с пробелом после решётки.
+/// `tree-sitter-bsl` его не понимает, и текст перед разбором нормализуется
+/// ([`normalize_for_parser`]), а границы нужны в координатах исходного текста.
+pub fn preproc_regions(src: &str) -> Vec<(usize, usize)> {
+    let bytes = src.as_bytes();
+    let mut regions: Vec<(usize, usize)> = Vec::new();
+    let mut open: Option<usize> = None;
+    let mut depth = 0usize;
+    let mut line_start = 0;
+    while line_start < bytes.len() {
+        // Директива стоит в начале строки; отступ из пробелов и табов допускаем.
+        let mut hash = line_start;
+        while matches!(bytes.get(hash), Some(b' ') | Some(b'\t')) {
+            hash += 1;
+        }
+        if bytes.get(hash) == Some(&b'#') {
+            let mut word_start = hash + 1;
+            while matches!(bytes.get(word_start), Some(b' ') | Some(b'\t')) {
+                word_start += 1;
+            }
+            let mut word_end = word_start;
+            while bytes.get(word_end).is_some_and(|b| is_ident_byte(*b)) {
+                word_end += 1;
+            }
+            // Регистр в BSL не различается; `src.get` не режет букву: цикл выше
+            // останавливается только на ASCII-разделителе.
+            match src
+                .get(word_start..word_end)
+                .unwrap_or_default()
+                .to_lowercase()
+                .as_str()
+            {
+                "если" | "if" => {
+                    if depth == 0 {
+                        open = Some(hash);
+                    }
+                    depth += 1;
+                }
+                "конецесли" | "endif" => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        if let Some(start) = open.take() {
+                            regions.push((start, word_end));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        while line_start < bytes.len() && bytes[line_start] != b'\n' {
+            line_start += 1;
+        }
+        line_start += 1;
+    }
+    // Незакрытый блок: границы до конца текста.
+    if let Some(start) = open {
+        regions.push((start, bytes.len()));
+    }
+    regions
+}
+
 /// Разобрать `source` деревом tree-sitter-bsl и одним проходом собрать факты
 /// для всех проверок уровня 1: объявления процедур/функций, голые вызовы,
 /// обращения через точку и конструкторы `Новый`.
@@ -702,6 +795,10 @@ pub fn collect_facts(source: &str) -> AstFacts {
         parsed: true,
         ..Default::default()
     };
+    // Границы `#Если … #КонецЕсли` — по ИСХОДНОМУ тексту: нормализация ниже
+    // переставляет байты внутри директивы (`# Если`), а смещения фактов нам нужны
+    // в координатах того текста, который прислал вызывающий.
+    facts.preproc_regions = preproc_regions(source);
 
     // Итеративный обход: Vec как стек вместо рекурсии — модули конфигурации
     // достигают десятков тысяч строк, а глубина AST у них непредсказуема.
@@ -718,11 +815,14 @@ pub fn collect_facts(source: &str) -> AstFacts {
                 if directive.is_some() {
                     facts.has_directives = true;
                 }
+                let no_context = directive.as_deref().is_some_and(is_no_context);
                 facts.procs.push(ProcScope {
                     byte_start: node.start_byte(),
                     byte_end: node.end_byte(),
                     params: param_names(node, src),
-                    no_context: directive.is_some_and(|d| is_no_context(&d)),
+                    no_context,
+                    directive,
+                    is_extension: has_extension_directive(node, src),
                 });
             }
             "new_expression" => {
@@ -1129,6 +1229,48 @@ fn annotation_text(preprocessor: tree_sitter::Node, src: &[u8]) -> Option<String
         .utf8_text(src)
         .ok()
         .map(|t| t.trim_start_matches('&').to_string())
+}
+
+/// Есть ли среди директив процедуры подключающая (`&Перед`, `&После`, `&Вместо`,
+/// `&ИзменениеИКонтроль`)?
+///
+/// Отдельно от [`directive_of`]: та из нескольких директив возвращает
+/// контекстную (`&НаСервере` + `&Вместо(…)` → `НаСервере`), и признак расширения
+/// без этой функции терялся бы. Контекст в расширении наследуется от
+/// расширяемой процедуры, поэтому потребитель обязан знать о нём.
+fn has_extension_directive(node: tree_sitter::Node, src: &[u8]) -> bool {
+    let mut prev = node.prev_sibling();
+    while let Some(p) = prev {
+        match p.kind() {
+            "line_comment" | "comment" => {
+                prev = p.prev_sibling();
+            }
+            "preprocessor" => {
+                if let Some(directive) = annotation_text(p, src) {
+                    let name = directive
+                        .trim_start_matches('&')
+                        .to_lowercase()
+                        .replace('ё', "е");
+                    if matches!(
+                        name.as_str(),
+                        "перед"
+                            | "после"
+                            | "вместо"
+                            | "изменениеиконтроль"
+                            | "before"
+                            | "after"
+                            | "around"
+                            | "changeandvalidate"
+                    ) {
+                        return true;
+                    }
+                }
+                prev = p.prev_sibling();
+            }
+            _ => break,
+        }
+    }
+    false
 }
 
 /// Имена параметров процедуры/функции в нижнем регистре.
@@ -2574,6 +2716,21 @@ mod tests {
     }
 
     #[test]
+    fn proc_scope_marks_extension_behind_context_directive() {
+        // Несколько директив подряд: `directive_of` выбирает контекстную
+        // (`&НаСервере`), и без отдельного признака расширение (`&Вместо`)
+        // терялось бы — потребитель считал бы процедуру обычной серверной.
+        let src = "&НаСервере\n&Вместо(\"Х\")\nПроцедура П()\nКонецПроцедуры\n";
+        let facts = collect_facts(src);
+        assert_eq!(facts.procs.len(), 1);
+        assert_eq!(facts.procs[0].directive.as_deref(), Some("НаСервере"));
+        assert!(
+            facts.procs[0].is_extension,
+            "признак расширения обязан пережить контекстную директиву"
+        );
+    }
+
+    #[test]
     fn proc_scopes_carry_directive_and_params() {
         // Первая процедура — без контекста формы, у второй параметр `Параметры`.
         // Оба признака нужны проверке `ShadowedContextName`, чтобы не ругаться
@@ -2604,6 +2761,11 @@ mod tests {
             .find(|p| p.contains(elements.byte))
             .expect("процедура найдена по байту");
         assert!(scope.no_context, "директива БезКонтекста распознана");
+        assert_eq!(
+            scope.directive.as_deref(),
+            Some("НаКлиентеНаСервереБезКонтекста"),
+            "имя директивы сохранено без амперсанда"
+        );
 
         let params = facts
             .assigns
@@ -2616,6 +2778,7 @@ mod tests {
             .find(|p| p.contains(params.byte))
             .expect("процедура найдена по байту");
         assert!(!scope.no_context);
+        assert_eq!(scope.directive.as_deref(), Some("НаКлиенте"));
         assert!(scope.params.contains("параметры"), "{:?}", scope.params);
         assert!(scope.params.contains("результат"), "{:?}", scope.params);
     }
@@ -2759,6 +2922,82 @@ mod tests {
         assert!(
             facts.procs[0].no_context,
             "директива потеряна из-за комментария между ней и объявлением"
+        );
+    }
+
+    /// Блок `#Если … #КонецЕсли` — регион: код внутри компилируется не всегда,
+    /// поэтому валидатору нужны байтовые границы, а не признак «где-то есть».
+    #[test]
+    fn preproc_regions_bracket_if_blocks() {
+        let src = "Процедура П()\n#Если Сервер Тогда\n    ЗаписьЖурналаРегистрации();\n#КонецЕсли\nКонецПроцедуры\n";
+        let facts = collect_facts(src);
+        assert_eq!(
+            facts.preproc_regions.len(),
+            1,
+            "{:?}",
+            facts.preproc_regions
+        );
+        let (start, end) = facts.preproc_regions[0];
+        let call = src.find("ЗаписьЖурналаРегистрации").expect("вызов есть");
+        assert!(start < call && call < end, "вызов внутри региона");
+        let header = src.find("Процедура").expect("заголовок есть");
+        assert!(header < start, "заголовок процедуры вне региона");
+    }
+
+    /// `#ИначеЕсли` и `#Иначе` блок не закрывают: `#Если … #КонецЕсли` — один
+    /// регион, включая все ветви.
+    #[test]
+    fn preproc_regions_cover_all_branches() {
+        let src = "#Если Сервер Тогда\nА = 1;\n#ИначеЕсли Клиент Тогда\nБ = 2;\n#Иначе\nВ = 3;\n#КонецЕсли\n";
+        let regions = preproc_regions(src);
+        assert_eq!(regions.len(), 1, "{regions:?}");
+        let (start, end) = regions[0];
+        for needle in ["А = 1", "Б = 2", "В = 3"] {
+            let byte = src.find(needle).expect(needle);
+            assert!(start < byte && byte < end, "{needle} вне региона");
+        }
+        assert_eq!(end, src.len() - 1, "регион кончается на `#КонецЕсли`");
+    }
+
+    /// Написание `# Если` (пробел после решётки) — тоже блок: грамматика его не
+    /// понимает, текст нормализуется, а границы нужны в координатах исходника.
+    #[test]
+    fn preproc_region_with_gap_after_hash() {
+        let src = "Процедура П()\n# Если Сервер Тогда\n    Х = 1;\n# КонецЕсли\nКонецПроцедуры\n";
+        let facts = collect_facts(src);
+        assert_eq!(
+            facts.preproc_regions.len(),
+            1,
+            "{:?}",
+            facts.preproc_regions
+        );
+        let (start, end) = facts.preproc_regions[0];
+        let call = src.find("Х = 1").expect("присваивание есть");
+        assert!(start < call && call < end);
+    }
+
+    /// `#Область` регионом не является: состав компилируемого кода она не меняет.
+    #[test]
+    fn region_directive_is_not_a_region() {
+        let src = "#Область Реализация\nА = 1;\n#КонецОбласти\n";
+        assert!(preproc_regions(src).is_empty());
+    }
+
+    /// Вложенный `#Если` отдельной парой не возвращается: внешний блок его
+    /// покрывает, и вызов внутри молчит в любом случае.
+    #[test]
+    fn nested_if_blocks_collapse_into_outer() {
+        let src =
+            "#Если МобильноеПриложение Тогда\n#Если Сервер Тогда\nА = 1;\n#КонецЕсли\n#КонецЕсли\n";
+        let regions = preproc_regions(src);
+        assert_eq!(regions.len(), 1, "{regions:?}");
+        let (start, end) = regions[0];
+        let call = src.find("А = 1").expect("код есть");
+        assert!(start < call && call < end);
+        assert_eq!(
+            end,
+            src.len() - 1,
+            "внешний блок закрыт последним директивой"
         );
     }
 

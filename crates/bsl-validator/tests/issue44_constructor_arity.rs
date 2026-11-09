@@ -41,6 +41,7 @@ fn ty(name: &str, constructors: Vec<Constructor>) -> Type {
         properties: Vec::new(),
         constructors,
         enum_values: Vec::new(),
+        availability: None,
     }
 }
 
