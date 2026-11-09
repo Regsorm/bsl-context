@@ -60,6 +60,12 @@ jobs:
     name: ${{ matrix.archive }}
     needs: create-release   # релиз уже существует — сборкам остаётся только долить архивы
     runs-on: ${{ matrix.os }}
+    # Цель может быть недоступна в конкретном аккаунте (например, hosted macOS
+    # раннеры в репозитории не поддерживаются: «configuration
+    # 'macos-14-arm64-us-default' is not supported»). Такая цель не должна
+    # отменять публикацию остальных архивов: флаг в матрице делает её
+    # необязательной, релиз собирается из того, что доступно.
+    continue-on-error: ${{ matrix.experimental }}
     strategy:
       fail-fast: false   # одна упавшая цель не отменяет остальные
       matrix:
@@ -70,18 +76,22 @@ jobs:
             target: x86_64-pc-windows-msvc
             ext: .exe
             archive: bsl-context-windows-x64.zip
+            experimental: false
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             ext: ''
             archive: bsl-context-linux-x64.tar.gz
+            experimental: false
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             ext: ''
             archive: bsl-context-linux-x64-musl.tar.gz
+            experimental: false
           - os: macos-14          # Apple Silicon (покрывает Mac 2020+)
             target: aarch64-apple-darwin
             ext: ''
             archive: bsl-context-macos-arm64.tar.gz
+            experimental: true
 
     steps:
       - name: Определить тег
