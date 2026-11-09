@@ -6,8 +6,8 @@ license.workspace = true
 description = "Облегчённый индекс методов конфигурации 1С: только объявления, без графов"
 
 [dependencies]
-bsl-parse = { path = "../bsl-parse", version = "0.24.0" }
-rusqlite = { version = "0.32", features = ["bundled"] }
+bsl-parse = { path = "../bsl-parse", version = "0.24.1" }
+rusqlite = { version = "0.41", features = ["bundled"] }
 rayon = "1"
 anyhow = { workspace = true }
 walkdir = { workspace = true }

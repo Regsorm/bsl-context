@@ -2,7 +2,12 @@
 all-features = true
 
 [advisories]
-ignore = []
+# RUSTSEC-2026-0462: неограниченное чтение тела ответа в КЛИЕНТСКИХ HTTP-транспортах
+# rmcp (исправлено в 3.9.0). Проект — сервер: включены только `server`,
+# `transport-io`, `transport-streamable-http-server` и `macros`; клиентские
+# транспорты (`transport-streamable-http-client-*`) не компилируются, уязвимого
+# кода в бинарнике нет. Апгрейд 1.6 → 3.9 — мажорный скачок API, отдельная задача.
+ignore = ["RUSTSEC-2026-0462"]
 
 [licenses]
 allow = [
