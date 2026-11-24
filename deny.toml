@@ -7,7 +7,12 @@ all-features = true
 # `transport-io`, `transport-streamable-http-server` и `macros`; клиентские
 # транспорты (`transport-streamable-http-client-*`) не компилируются, уязвимого
 # кода в бинарнике нет. Апгрейд 1.6 → 3.9 — мажорный скачок API, отдельная задача.
-ignore = ["RUSTSEC-2026-0462"]
+ignore = [
+    "RUSTSEC-2026-0462",
+    # Информационное уведомление о прекращении поддержки chrono. У chrono нет
+    # исправленной версии, и его также используют rmcp и schemars.
+    { id = "RUSTSEC-2026-0543", reason = "Unmaintained notice. Chrono remains a dependency of rmcp and schemars." },
+]
 
 [licenses]
 allow = [

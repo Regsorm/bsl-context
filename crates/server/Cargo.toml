@@ -10,10 +10,10 @@ name = "bsl-context-rs"
 path = "src/main.rs"
 
 [dependencies]
-platform-index = { path = "../platform-index", version = "0.24.1" }
-bsl-validator  = { path = "../bsl-validator", version = "0.24.1" }
-symbol-source  = { path = "../symbol-source", version = "0.24.1" }
-lite-index     = { path = "../lite-index", version = "0.24.1" }
+platform-index = { path = "../platform-index", version = "0.24.2" }
+bsl-validator  = { path = "../bsl-validator", version = "0.24.2" }
+symbol-source  = { path = "../symbol-source", version = "0.24.2" }
+lite-index     = { path = "../lite-index", version = "0.24.2" }
 
 tokio = { workspace = true }
 axum = { workspace = true }
@@ -40,6 +40,7 @@ sysinfo = "0.32"
 winresource = { version = "0.1.31", default-features = false }
 
 [dev-dependencies]
+rusqlite = "0.41"
 # Обход корпуса в регресс-тесте `corpus_config_objects` (только тесты).
 walkdir = { workspace = true }
 # Изолированный каталог под PID-файл в тестах замка.
