@@ -445,6 +445,12 @@ procedure call. Hence:
   is never mistaken for a clean one. `undeclared_method` findings are **downgraded to
   `low`**: dropping them would lose the invented call this check exists for, while keeping
   them at `high` would flag every call to a global common module's procedure.
+- **A local index contains zero objects** — if its object table is present and empty,
+  `validate_module` checks against the platform alone and reports `symbols_available: false`
+  with a reason in `degraded_reason`.
+- **A `code_index_db` snapshot with at least 20 distinct method names per object** is
+  flagged as `thin` in `symbol_sources_status`. Metadata object, common module and
+  enumeration value findings from a thin source have `low` confidence.
 - **A source dies mid-flight** (network, `code-index` down) — it is marked unhealthy, the
   empty answer is not cached, and the module is re-checked against the platform alone, again
   with `symbols_available: false`.

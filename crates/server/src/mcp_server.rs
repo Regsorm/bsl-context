@@ -892,12 +892,9 @@ fn validation_json(result: &ExpressionValidation, file: Option<&ModuleFile>) -> 
     serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
 }
 
-/// Проверка модуля, когда источник имён настроен, но недоступен.
-///
-/// Собрана в одном месте, потому что случаев четыре (источник не поднят,
-/// lite-индекс не собран, источник нездоров, источник отвалился по ходу
-/// проверки), а ответ у всех один: находки против платформенного контекста
-/// плюс `symbols_available: false` и причина.
+/// Проверка модуля по платформенному контексту, когда настроенный источник
+/// имён недоступен или индекс объектов пуст. Ответ содержит находки,
+/// `symbols_available: false` и причину.
 #[allow(clippy::too_many_arguments)]
 fn degraded_json(
     index: &PlatformIndex,
@@ -1422,6 +1419,21 @@ impl BslContextServer {
                      платформенного контекста.",
                     source.describe(),
                     RECONNECT_COOLDOWN.as_secs()
+                ),
+            );
+        }
+        if source.has_empty_object_index() {
+            return degraded_json(
+                &self.index,
+                source_text,
+                level,
+                profile,
+                module_path.as_deref(),
+                form_attributes.as_ref(),
+                from_file.as_ref(),
+                format!(
+                    "источник имён конфигурации \"{repo}\" подключён, но индекс объектов пуст. \
+                     Проверка выполнена только против платформенного контекста."
                 ),
             );
         }

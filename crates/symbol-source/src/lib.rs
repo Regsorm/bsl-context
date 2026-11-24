@@ -32,6 +32,10 @@ use bsl_validator::{ObjectField, ObjectSchema, SourceStats, SymbolSource};
 /// «источник тонкий» только понижает уверенность находок, а не скрывает их.
 const THIN_NAMES: usize = 1_000;
 
+/// Двадцать и более различных имён методов на объект — эвристика для
+/// code-index: у неполного снимка из issue #50 это отношение было около 22.
+const THIN_NAMES_PER_OBJECT: usize = 20;
+
 /// Состав источника неправдоподобно мал (issue #46)?
 ///
 /// Считается по снимку: объектов не знает никто либо имён меньше порога.
@@ -195,6 +199,10 @@ impl SymbolSource for LiteSource {
             objects: count_objects(self.objects.as_ref()),
             names: self.all_names.len(),
         })
+    }
+
+    fn has_empty_object_index(&self) -> bool {
+        self.objects.as_ref().is_some_and(HashMap::is_empty)
     }
 
     /// См. `SymbolSource::is_thin`: пустой или почти пустой lite-индекс
@@ -732,12 +740,21 @@ impl SymbolSource for CodeIndexDbSource {
         })
     }
 
-    /// См. `SymbolSource::is_thin` (issue #46): пустая или почти пустая база не
-    /// основание выносить `high` по ответу «такого объекта нет».
+    fn has_empty_object_index(&self) -> bool {
+        self.refresh_if_stale();
+        let snapshot = self.snapshot.lock().unwrap();
+        snapshot.objects.as_ref().is_some_and(HashMap::is_empty)
+    }
+
     fn is_thin(&self) -> bool {
         self.refresh_if_stale();
         let snapshot = self.snapshot.lock().unwrap();
-        is_thin_composition(snapshot.objects.as_ref(), snapshot.names.len())
+        let objects = snapshot.objects.as_ref();
+        let names = snapshot.names.len();
+        is_thin_composition(objects, names)
+            || names
+                .checked_div(count_objects(objects))
+                .is_some_and(|ratio| ratio >= THIN_NAMES_PER_OBJECT)
     }
 
     fn describe(&self) -> String {
