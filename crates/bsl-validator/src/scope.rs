@@ -25,7 +25,7 @@
 //! `КонецПроцедуры`/`КонецФункции`. В BSL вложенных процедур нет — поэтому
 //! линейного сканирования достаточно.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use regex::Regex;
 use std::sync::OnceLock;
@@ -211,6 +211,26 @@ pub fn extract_scope_map(
     if_branches: &[IfBranches],
     loop_var_sites: &[NameSite],
 ) -> ScopeMap {
+    extract_scope_map_with_form(
+        index,
+        cleaned,
+        annotations,
+        level,
+        if_branches,
+        loop_var_sites,
+        None,
+    )
+}
+
+pub(crate) fn extract_scope_map_with_form(
+    index: &PlatformIndex,
+    cleaned: &str,
+    annotations: &HashMap<usize, String>,
+    level: u8,
+    if_branches: &[IfBranches],
+    loop_var_sites: &[NameSite],
+    form: Option<&crate::form_elements::FormElementContext<'_>>,
+) -> ScopeMap {
     let mut scopes = Vec::new();
     let blocks: Vec<(usize, usize)> = proc_block_re()
         .find_iter(cleaned)
@@ -228,6 +248,7 @@ pub fn extract_scope_map(
             level,
             if_branches,
             loop_var_sites,
+            form,
         );
         scopes.push(scope);
     } else {
@@ -242,6 +263,7 @@ pub fn extract_scope_map(
                 level,
                 if_branches,
                 loop_var_sites,
+                form,
             );
             scopes.push(scope);
         }
@@ -278,8 +300,10 @@ fn build_scope(
     level: u8,
     if_branches: &[IfBranches],
     loop_var_sites: &[NameSite],
+    form: Option<&crate::form_elements::FormElementContext<'_>>,
 ) -> Scope {
     let mut bindings: Vec<VarBinding> = Vec::new();
+    let mut form_bindings = HashSet::new();
     // Ветви, целиком лежащие внутри этого scope: объединение типов после
     // `КонецЕсли` считается только по своим ветвям (issue #15, класс 1).
     let own_branches: Vec<IfBranches> = if_branches
@@ -352,10 +376,24 @@ fn build_scope(
         // глобального метода (`ГлобальныйМетод()`). Опирается на привязки,
         // собранные предыдущими присваиваниями (однопроходный порядок по тексту).
         // Тип может выйти составным — храним все альтернативы (issue #15).
-        if typ.is_none() && level >= 3 {
+        let form_type = if typ.is_none() && level >= 3 {
+            form.and_then(|form| form.rhs_type(rhs, abs_start))
+                .filter(|name| index.find_type(name).is_some())
+        } else {
+            None
+        };
+        if let Some(form_type) = form_type {
+            typ = Some(vec![form_type.to_owned()]);
+        } else if typ.is_none() && level >= 3 {
             if let Some(segs) = parse_chain(rhs) {
                 if segs.len() >= 2 || (segs.len() == 1 && segs[0].is_call) {
-                    typ = resolve_chain_types(index, &bindings, abs_start, &segs);
+                    // Из XML известен тип самого элемента. Типы его данных
+                    // (например, полей текущей строки таблицы) зависят от формы.
+                    if form_bindings.is_empty()
+                        || !form_bindings.contains(&segs[0].name.to_lowercase())
+                    {
+                        typ = resolve_chain_types(index, &bindings, abs_start, &segs);
+                    }
                 }
             }
         }
@@ -371,8 +409,14 @@ fn build_scope(
         //
         // Байт привязки — КОНЕЦ оператора: см. пояснение у `VarBinding::byte`.
         let statement_end = byte_start + cap.get(0).map_or(lhs_match.end(), |m| m.end());
+        let name = lhs.to_lowercase();
+        if form_type.is_some() {
+            form_bindings.insert(name.clone());
+        } else if !form_bindings.is_empty() {
+            form_bindings.remove(&name);
+        }
         bindings.push(VarBinding {
-            name: lhs.to_lowercase(),
+            name,
             byte: statement_end,
             types: typ.unwrap_or_default(),
         });

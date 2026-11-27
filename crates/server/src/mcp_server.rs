@@ -14,7 +14,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use bsl_validator::{
     module_context::FormKind, validate_enum, validate_method_call, validate_module_degraded,
-    validate_module_with_profile, validate_module_with_symbols_and_form_kind, ExpressionValidation,
+    validate_module_with_form_elements, validate_module_with_profile, ExpressionValidation,
     Profile, SymbolSource, FORM_TYPE,
 };
 use platform_index::{format, Definition, PlatformIndex, SearchEngine};
@@ -1446,7 +1446,7 @@ impl BslContextServer {
         // половина): по ним проверяется `Элементы.<Имя>`. Файла нет или модуль не
         // формы — `None`, и проверка молчит.
         let form_elements = form_dump::form_elements_from_dump(&roots, module_path.as_deref());
-        let result = validate_module_with_symbols_and_form_kind(
+        let result = validate_module_with_form_elements(
             &self.index,
             source_text,
             level,
