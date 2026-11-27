@@ -30,6 +30,16 @@ pub struct DotFact {
     pub member_is_call: bool,
 }
 
+/// Обращение к члену элемента текущей управляемой формы.
+pub struct FormElementMember {
+    pub receiver: String,
+    pub receiver_byte: usize,
+    pub element: String,
+    pub member: String,
+    pub member_byte: usize,
+    pub member_is_call: bool,
+}
+
 /// Конструктор `Новый ИмяТипа(...)`.
 pub struct NewFact {
     pub type_name: String,
@@ -152,6 +162,7 @@ pub struct AstFacts {
     pub declarations: HashSet<String>,
     pub calls: Vec<CallFact>,
     pub dots: Vec<DotFact>,
+    pub form_element_members: Vec<FormElementMember>,
     pub news: Vec<NewFact>,
     /// Цепочки с головами из [`CHAIN_HEADS`], разобранные целиком. См. [`ChainFact`].
     pub chains: Vec<ChainFact>,
@@ -878,6 +889,10 @@ pub fn collect_facts(source: &str) -> AstFacts {
                                 member_is_call,
                             });
                         }
+                    } else if let Some(fact) =
+                        form_element_member(node.child(0), member_node, member_is_call, src)
+                    {
+                        facts.form_element_members.push(fact);
                     }
                 }
                 // Цепочки целиком — для голов из `CHAIN_HEADS` (issue #41, #43).
@@ -918,6 +933,10 @@ pub fn collect_facts(source: &str) -> AstFacts {
                                     // Ветка `call_expression`: член — всегда вызов.
                                     member_is_call: true,
                                 });
+                            } else if let Some(fact) =
+                                form_element_member(receiver, member_node, true, src)
+                            {
+                                facts.form_element_members.push(fact);
                             } else if let Some((collection, object)) =
                                 two_segment_head(receiver, src)
                             {
@@ -1159,6 +1178,57 @@ fn simple_head<'a>(node: Option<tree_sitter::Node<'a>>, src: &[u8]) -> Option<(S
     }
     let text = ident.utf8_text(src).ok()?;
     Some((text.to_string(), ident.start_byte()))
+}
+
+/// Имена коллекции элементов и указателя на текущую форму.
+pub fn is_form_items(name: &str) -> bool {
+    name.eq_ignore_ascii_case("Items") || name.to_lowercase() == "элементы"
+}
+
+pub fn is_current_form(name: &str) -> bool {
+    name.eq_ignore_ascii_case("ThisForm") || name.to_lowercase() == "этаформа"
+}
+
+fn form_element_member(
+    receiver: Option<tree_sitter::Node>,
+    member: tree_sitter::Node,
+    member_is_call: bool,
+    src: &[u8],
+) -> Option<FormElementMember> {
+    let element_access = receiver?;
+    if !matches!(element_access.kind(), "access" | "property_access") {
+        return None;
+    }
+    let collection_access = element_access.named_child(0)?;
+    let (receiver, receiver_byte) =
+        if let Some((head, byte)) = simple_head(Some(collection_access), src) {
+            if !is_form_items(&head) {
+                return None;
+            }
+            (head, byte)
+        } else {
+            let collection = collection_access.named_child(1)?;
+            if collection.kind() != "property" || !is_form_items(collection.utf8_text(src).ok()?) {
+                return None;
+            }
+            let (head, byte) = simple_head(collection_access.named_child(0), src)?;
+            if !is_current_form(&head) {
+                return None;
+            }
+            (head, byte)
+        };
+    let element = element_access.named_child(1)?;
+    if element.kind() != "property" {
+        return None;
+    }
+    Some(FormElementMember {
+        receiver,
+        receiver_byte,
+        element: element.utf8_text(src).ok()?.to_string(),
+        member: member.utf8_text(src).ok()?.to_string(),
+        member_byte: member.start_byte(),
+        member_is_call,
+    })
 }
 
 /// Двухсегментная голова обращения `<Идентификатор1>.<Идентификатор2>`

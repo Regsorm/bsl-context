@@ -440,6 +440,7 @@ pub fn validate_expression_at_level(
         None,
         // Контекст выполнения фрагмента неизвестен — правило доступности молчит.
         None,
+        None,
         &mut errors,
     );
     check_new_expressions(index, source, &facts.news, None, &mut errors);
@@ -512,6 +513,7 @@ pub(crate) fn check_type_dot_members(
     symbols: Option<&dyn SymbolSource>,
     record_set: Option<(&str, &str)>,
     context: Option<&crate::availability::ContextLocator>,
+    form: Option<&crate::form_elements::FormElementContext<'_>>,
     errors: &mut Vec<ExprError>,
 ) {
     for dot in dots {
@@ -656,6 +658,14 @@ pub(crate) fn check_type_dot_members(
             continue;
         }
 
+        if form.is_some_and(|form| {
+            types
+                .iter()
+                .any(|ty| form.member_may_be_defined_by_extension(ty, member))
+        }) {
+            continue;
+        }
+
         let (line, col) = pos_at(src, dot.member_byte);
         let allowed: Vec<String> = types.iter().flat_map(|ty| type_member_names(ty)).collect();
         let suggestion = closest_str(member, &allowed);
@@ -726,7 +736,7 @@ fn type_member_names(ty: &Type) -> Vec<String> {
 /// разворачиваются, а значения, которые платформа принимает ради совместимости,
 /// берутся из точечного словаря — иначе `Клавиша.A` и
 /// `ОтображениеОбычнойГруппы.Линия` дают ложную находку `high` (issue #22).
-fn type_has_member(ty: &Type, member: &str) -> bool {
+pub(crate) fn type_has_member(ty: &Type, member: &str) -> bool {
     if ty.is_enum() {
         return crate::enum_values::has_value(&ty.enum_values, member)
             || crate::enum_values::is_deprecated_value(&ty.name_ru, member);

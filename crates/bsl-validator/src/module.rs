@@ -48,7 +48,7 @@ use crate::expression::{
     ExpressionValidation, Profile,
 };
 use crate::locals::LocalNames;
-use crate::scope::{extract_scope_map, extract_type_annotations};
+use crate::scope::extract_type_annotations;
 use crate::symbols::SymbolSource;
 
 /// Главный API: проверить целый BSL-модуль. Дефолтный уровень — 1.
@@ -126,6 +126,7 @@ fn validate_module_at_level_inner(
         symbols_degraded,
         None,
         None,
+        None,
     )
 }
 
@@ -153,6 +154,7 @@ fn validate_module_at_level_inner_ext(
     symbols_degraded: bool,
     form_kind: Option<crate::module_context::FormKind>,
     form_elements: Option<&HashSet<String>>,
+    typed_form: Option<&crate::form_elements::FormElements>,
 ) -> ExpressionValidation {
     // Модуль расширения: блоки `#Удаление … #КонецУдаления` в скомпилированный
     // модуль не попадают, но могут обрывать строковый литерал на середине —
@@ -161,16 +163,21 @@ fn validate_module_at_level_inner_ext(
     let source = &strip_extension_directives(source);
     let cleaned = mask_strings_and_comments(source);
     let facts = collect_facts(source);
+    let locals = LocalNames::new(&facts);
+    let form = typed_form.filter(|_| level >= 3).and_then(|form| {
+        crate::form_elements::FormElementContext::new(index, form, &locals, form_attributes, &facts)
+    });
 
     let scope_map = if level >= 2 {
         let annotations = extract_type_annotations(source);
-        Some(extract_scope_map(
+        Some(crate::scope::extract_scope_map_with_form(
             index,
             &cleaned,
             &annotations,
             level,
             &facts.if_branches,
             &facts.loop_var_sites,
+            form.as_ref(),
         ))
     } else {
         None
@@ -214,7 +221,6 @@ fn validate_module_at_level_inner_ext(
             None
         }
     });
-    let locals = LocalNames::new(&facts);
     // Контекст выполнения для правила доступности платформенных методов: вид
     // модуля — из пути выгрузки, вид формы — из файлов выгрузки (`Ext/Form.xml`
     // или `.bin`). Директива процедуры и попадание в `#Если` зависят от места
@@ -238,6 +244,7 @@ fn validate_module_at_level_inner_ext(
         symbols,
         record_set,
         availability_context.as_ref(),
+        form.as_ref(),
         &mut errors,
     );
     check_new_expressions(
@@ -318,6 +325,9 @@ fn validate_module_at_level_inner_ext(
     // Имена элементов формы (issue #43, вторая половина): `Элементы.<Имя>`
     // сверяется с составом из `Form.xml`, который передал вызывающий.
     crate::form_elements::check_form_elements(source, &facts, form_elements, &mut errors);
+    if let Some(form) = form {
+        form.check_members(index, source, &facts, &mut errors);
+    }
     errors.sort_by_key(|e| (e.line, e.col));
 
     ExpressionValidation {
@@ -435,6 +445,60 @@ pub fn validate_module_with_symbols_and_form_kind(
     form_kind: Option<crate::module_context::FormKind>,
     form_elements: Option<&HashSet<String>>,
 ) -> ExpressionValidation {
+    validate_module_with_form_data(
+        index,
+        source,
+        level,
+        profile,
+        module_path,
+        form_attributes,
+        symbols,
+        form_kind,
+        form_elements,
+        None,
+    )
+}
+
+/// Проверка модуля с именами и типами элементов из XML управляемой формы.
+#[allow(clippy::too_many_arguments)]
+pub fn validate_module_with_form_elements(
+    index: &PlatformIndex,
+    source: &str,
+    level: u8,
+    profile: Profile,
+    module_path: Option<&str>,
+    form_attributes: Option<&HashSet<String>>,
+    symbols: Option<&dyn SymbolSource>,
+    form_kind: Option<crate::module_context::FormKind>,
+    form: Option<&crate::form_elements::FormElements>,
+) -> ExpressionValidation {
+    validate_module_with_form_data(
+        index,
+        source,
+        level,
+        profile,
+        module_path,
+        form_attributes,
+        symbols,
+        form_kind,
+        form.map(|form| &form.names),
+        form,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_module_with_form_data(
+    index: &PlatformIndex,
+    source: &str,
+    level: u8,
+    profile: Profile,
+    module_path: Option<&str>,
+    form_attributes: Option<&HashSet<String>>,
+    symbols: Option<&dyn SymbolSource>,
+    form_kind: Option<crate::module_context::FormKind>,
+    form_elements: Option<&HashSet<String>>,
+    typed_form: Option<&crate::form_elements::FormElements>,
+) -> ExpressionValidation {
     let effective_level = if profile == Profile::Strict { 1 } else { level };
     // Владелец формы есть, но его модуль не попал в источник имён — см.
     // `validate_module_with_symbols`.
@@ -459,6 +523,7 @@ pub fn validate_module_with_symbols_and_form_kind(
         false,
         form_kind,
         form_elements,
+        typed_form,
     );
 
     if profile == Profile::Strict {

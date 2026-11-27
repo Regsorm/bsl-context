@@ -17,6 +17,7 @@
 //! Зависимостей не добавляем: разбор — один проход по тексту, а XML выгрузки
 //! машиночитаемый и простой (CDATA и сущности в именах не встречаются).
 
+use bsl_validator::form_elements::FormElements;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -27,14 +28,25 @@ pub const MAX_FORM_XML_BYTES: u64 = 8 * 1024 * 1024;
 /// Секции logform, `name` внутри которых — имя, доступное из модуля формы.
 const NAME_SECTIONS: [&str; 4] = ["ChildItems", "Attributes", "Commands", "Parameters"];
 
-/// Имена элементов, реквизитов и команд формы из текста `Form.xml`.
-pub fn element_names(xml: &str) -> HashSet<String> {
-    let mut names = HashSet::new();
+/// Имена формы и типы элементов из секций ChildItems.
+fn parse_form_elements(xml: &str) -> FormElements {
+    let mut form = FormElements::default();
     let mut sections: Vec<String> = Vec::new();
     let mut rest = xml;
 
     while let Some(start) = rest.find('<') {
         let after = &rest[start + 1..];
+        if let Some((content, delimiter)) = after
+            .strip_prefix("!--")
+            .map(|text| (text, "-->"))
+            .or_else(|| after.strip_prefix("![CDATA[").map(|text| (text, "]]>")))
+        {
+            let Some(end) = content.find(delimiter) else {
+                break;
+            };
+            rest = &content[end + delimiter.len()..];
+            continue;
+        }
         let Some(end) = after.find('>') else {
             break;
         };
@@ -64,18 +76,58 @@ pub fn element_names(xml: &str) -> HashSet<String> {
         if !sections.is_empty() {
             if let Some(value) = attribute(tag, "name") {
                 if !value.is_empty() {
-                    names.insert(value.to_string());
+                    form.names.insert(value.to_string());
+                    if sections
+                        .last()
+                        .is_some_and(|section| section.eq_ignore_ascii_case("ChildItems"))
+                    {
+                        form.record_type(value, element_type(name));
+                    }
                 }
             }
         }
     }
 
-    if names.is_empty() {
-        // Секций не нашлось (другой формат, обрезанный файл) — берём все `name`
-        // документа: лучше пропустить находку, чем выдать ложную.
-        return all_name_attributes(xml);
+    if form.names.is_empty() {
+        form.names = all_name_attributes(xml);
     }
-    names
+    form
+}
+
+fn element_type(tag: &str) -> Option<&'static str> {
+    Some(match tag {
+        "Button" => "КнопкаФормы",
+        "InputField"
+        | "CheckBoxField"
+        | "LabelField"
+        | "PictureField"
+        | "RadioButtonField"
+        | "TextDocumentField"
+        | "SpreadSheetDocumentField"
+        | "SpreadsheetDocumentField"
+        | "PDFDocumentField"
+        | "FormattedDocumentField"
+        | "HTMLDocumentField"
+        | "CalendarField"
+        | "TrackBarField"
+        | "ProgressBarField"
+        | "ChartField"
+        | "GanttChartField"
+        | "DendrogramField"
+        | "GeographicalSchemaField"
+        | "GraphicalSchemaField"
+        | "PeriodField"
+        | "PlannerField" => "ПолеФормы",
+        "Table" => "ТаблицаФормы",
+        "UsualGroup" | "Pages" | "Page" => "ГруппаФормы",
+        "LabelDecoration" | "PictureDecoration" => "ДекорацияФормы",
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+fn element_names(xml: &str) -> HashSet<String> {
+    parse_form_elements(xml).names
 }
 
 /// Имя тега: до пробела, слэша или конца.
@@ -148,7 +200,7 @@ fn all_name_attributes(xml: &str) -> HashSet<String> {
 pub fn form_elements_from_dump(
     roots: &[PathBuf],
     module_path: Option<&str>,
-) -> Option<HashSet<String>> {
+) -> Option<FormElements> {
     let module_path = module_path?.replace('\\', "/");
     // `…/Ext/Form/Module.bsl` → `…/Ext/` — рядом лежит `Form.xml`.
     let dir = module_path.strip_suffix("Form/Module.bsl")?;
@@ -162,17 +214,14 @@ pub fn form_elements_from_dump(
 }
 
 /// Прочитать и разобрать один `Form.xml`.
-fn read_form_xml(path: &Path) -> Option<HashSet<String>> {
+fn read_form_xml(path: &Path) -> Option<FormElements> {
     let meta = std::fs::metadata(path).ok()?;
     if !meta.is_file() || meta.len() > MAX_FORM_XML_BYTES {
         return None;
     }
     let text = std::fs::read_to_string(path).ok()?;
-    let names = element_names(&text);
-    if names.is_empty() {
-        return None;
-    }
-    Some(names)
+    let form = parse_form_elements(&text);
+    (!form.names.is_empty()).then_some(form)
 }
 
 #[cfg(test)]
@@ -266,6 +315,41 @@ mod tests {
     }
 
     #[test]
+    fn types_come_from_static_child_items_only() {
+        let form = parse_form_elements(
+            r#"<Form>
+            <Attributes><Button name="Реквизит"/></Attributes>
+            <ChildItems>
+                <Button name="Кнопка"/>
+                <InputField name="Поле"/>
+                <SpreadSheetDocumentField name="ТабличноеПоле"/>
+                <Button name="Дубликат"/>
+                <InputField name="дубликат"/>
+                <Button name="Неоднозначный"/>
+                <FutureField name="Неоднозначный"/>
+                <FutureField name="Неизвестный"/>
+                <!-- <Button name="Комментарий"/> -->
+                <![CDATA[<Button name="Текст"/>]]>
+            </ChildItems>
+        </Form>"#,
+        );
+        assert_eq!(form.element_type("кНоПкА"), Some("КнопкаФормы"));
+        assert_eq!(form.element_type("поле"), Some("ПолеФормы"));
+        assert_eq!(form.element_type("ТабличноеПоле"), Some("ПолеФормы"));
+        for name in [
+            "Реквизит",
+            "Дубликат",
+            "Неоднозначный",
+            "Неизвестный",
+            "Комментарий",
+            "Текст",
+        ] {
+            assert_eq!(form.element_type(name), None, "{name}");
+        }
+        assert!(form.names.contains("Неизвестный"));
+    }
+
+    #[test]
     fn missing_file_is_not_an_error() {
         let dir = tempfile::tempdir().expect("tempdir");
         let roots = vec![dir.path().to_path_buf()];
@@ -291,8 +375,9 @@ mod tests {
         std::fs::create_dir_all(&nested).expect("каталоги");
         std::fs::write(nested.join("Form.xml"), FORM).expect("Form.xml");
         let roots = vec![dir.path().to_path_buf()];
-        let names = form_elements_from_dump(&roots, Some("Catalogs/Х/Forms/Ф/Ext/Form/Module.bsl"))
+        let form = form_elements_from_dump(&roots, Some("Catalogs/Х/Forms/Ф/Ext/Form/Module.bsl"))
             .expect("имена должны собраться");
-        assert!(names.contains("Список"), "{names:?}");
+        assert!(form.names.contains("Список"), "{:?}", form.names);
+        assert_eq!(form.element_type("список"), Some("ТаблицаФормы"));
     }
 }

@@ -192,6 +192,11 @@ impl<'a> LocalNames<'a> {
         Some(types)
     }
 
+    pub(crate) fn has_form_context(&self, byte: usize) -> bool {
+        self.proc_index(byte)
+            .is_none_or(|index| !self.procs_sorted[index].no_context)
+    }
+
     /// Имя в этой точке — локальная переменная, а не имя типа?
     ///
     /// Да, если это параметр объемлющей процедуры, либо имя ей присваивается

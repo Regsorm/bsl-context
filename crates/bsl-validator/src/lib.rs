@@ -43,7 +43,7 @@ pub use expression::{
 };
 pub use module::{
     validate_module, validate_module_at_level, validate_module_degraded,
-    validate_module_with_profile, validate_module_with_symbols,
+    validate_module_with_form_elements, validate_module_with_profile, validate_module_with_symbols,
     validate_module_with_symbols_and_form_kind,
 };
 pub use scope::{extract_scope_map, extract_type_annotations, Scope, ScopeMap, VarBinding};
